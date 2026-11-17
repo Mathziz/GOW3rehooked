@@ -1,0 +1,535 @@
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <thread>
+#include <vector>
+
+#include "orbis/common/assert.h"
+#include "orbis/common/debug.h"
+#include "orbis/common/elf_info.h"
+#include "orbis/logging/log.h"
+#include "orbis/common/polyfill_thread.h"
+#include "orbis/common/thread.h"
+#include "orbis/common/va_ctx.h"
+#include "orbis/core/file_sys/fs.h"
+#include "orbis/internals/error_codes.h"
+#include "orbis/internals/kernel/coredump/coredump.h"
+#include "orbis/internals/kernel/debug.h"
+#include "orbis/internals/kernel/equeue.h"
+#include "orbis/internals/kernel/file_system.h"
+#include "orbis/internals/kernel/kernel.h"
+#include "orbis/internals/kernel/memory.h"
+#include "orbis/internals/kernel/orbis_error.h"
+#include "orbis/internals/kernel/posix_error.h"
+#include "orbis/internals/kernel/process.h"
+#include "orbis/internals/kernel/threads.h"
+#include "orbis/internals/kernel/threads/exception.h"
+#include "orbis/internals/kernel/threads/pthread.h"
+#include "orbis/internals/kernel/time.h"
+#include "orbis/internals/libs.h"
+
+#ifdef _WIN64
+#include <Rpc.h>
+#else
+#include <uuid/uuid.h>
+#endif
+#include "orbis/common/util.h"
+#include "orbis/core/linker.h"
+
+namespace Libraries::Kernel {
+
+static u64 g_stack_chk_guard = 0xDEADBEEF54321ABC; // dummy return
+char const* g_environment[64];
+static const char* g_progname = "eboot.bin";
+
+struct ScheduledTimer {
+    KernelTimer::TimePoint expiry;
+    u64 sequence;
+    std::shared_ptr<KernelTimer::WaitToken> token;
+    std::move_only_function<void()> callback;
+
+    bool operator<(const ScheduledTimer& other) const noexcept {
+        if (expiry != other.expiry) {
+            return expiry > other.expiry;
+        }
+        return sequence > other.sequence;
+    }
+};
+
+static std::mutex g_timer_mutex;
+static std::condition_variable_any g_timer_cv;
+static std::vector<ScheduledTimer> g_timer_heap;
+static u64 g_timer_seq = 0;
+static std::jthread service_thread;
+
+Core::EntryParams entry_params{};
+
+void KernelTimer::AsyncWait(std::move_only_function<void()> callback) {
+    Cancel();
+    m_token = std::make_shared<WaitToken>();
+    {
+        std::unique_lock lock{g_timer_mutex};
+        g_timer_heap.push_back(ScheduledTimer{
+            .expiry = m_expiry,
+            .sequence = ++g_timer_seq,
+            .token = m_token,
+            .callback = std::move(callback),
+        });
+        std::push_heap(g_timer_heap.begin(), g_timer_heap.end());
+    }
+    g_timer_cv.notify_one();
+}
+
+static void KernelServiceThread(const std::stop_token& stoken) {
+    Common::SetCurrentThreadName("shadPS4:KernelServiceThread");
+
+    std::unique_lock lock{g_timer_mutex};
+    while (!stoken.stop_requested()) {
+        HLE_TRACE;
+
+        while (!g_timer_heap.empty() &&
+               g_timer_heap.front().token->cancelled.load(std::memory_order_acquire)) {
+            std::pop_heap(g_timer_heap.begin(), g_timer_heap.end());
+            g_timer_heap.pop_back();
+        }
+
+        if (g_timer_heap.empty()) {
+            Common::CondvarWait(g_timer_cv, lock, stoken, [] { return !g_timer_heap.empty(); });
+            continue;
+        }
+
+        const auto now = KernelTimer::Clock::now();
+        const auto next_expiry = g_timer_heap.front().expiry;
+        if (now >= next_expiry) {
+            std::pop_heap(g_timer_heap.begin(), g_timer_heap.end());
+            ScheduledTimer ready = std::move(g_timer_heap.back());
+            g_timer_heap.pop_back();
+
+            if (!ready.token->cancelled.load(std::memory_order_acquire)) {
+                lock.unlock();
+                ready.callback();
+                lock.lock();
+            }
+            continue;
+        }
+
+        g_timer_cv.wait_until(lock, stoken, next_expiry, [&] {
+            return !g_timer_heap.empty() &&
+                   (g_timer_heap.front().expiry < next_expiry ||
+                    g_timer_heap.front().token->cancelled.load(std::memory_order_acquire));
+        });
+    }
+}
+
+static PS4_SYSV_ABI void stack_chk_fail() {
+    UNREACHABLE();
+}
+
+static thread_local s32 g_posix_errno = 0;
+
+s32* PS4_SYSV_ABI __Error() {
+    return &g_posix_errno;
+}
+
+void ErrSceToPosix(s32 error) {
+    g_posix_errno = error - ORBIS_KERNEL_ERROR_UNKNOWN;
+}
+
+s32 ErrnoToSceKernelError(s32 error) {
+    return error + ORBIS_KERNEL_ERROR_UNKNOWN;
+}
+
+s32 PS4_SYSV_ABI sceKernelError(s32 posix_error) {
+    if (posix_error == 0) {
+        return 0;
+    }
+    return posix_error + ORBIS_KERNEL_ERROR_UNKNOWN;
+}
+
+s32 NativeToPosixErrno(s32 const e) {
+    // Some error numbers are different between supported OSes
+    switch (e) {
+    case 0:
+        return 0;
+    case EPERM:
+        return POSIX_EPERM;
+        break;
+    case ENOENT:
+        return POSIX_ENOENT;
+        break;
+    case EINTR:
+        return POSIX_EINTR;
+        break;
+    case EDEADLK:
+        return POSIX_EDEADLK;
+        break;
+    case ENOMEM:
+        return POSIX_ENOMEM;
+        break;
+    case EACCES:
+        return POSIX_EACCES;
+        break;
+    case EFAULT:
+        return POSIX_EFAULT;
+        break;
+    case EINVAL:
+        return POSIX_EINVAL;
+        break;
+    case ENOSPC:
+        return POSIX_ENOSPC;
+        break;
+    case ERANGE:
+        return POSIX_ERANGE;
+        break;
+    case EAGAIN:
+        return POSIX_EAGAIN;
+        break;
+    case ETIMEDOUT:
+        return POSIX_ETIMEDOUT;
+        break;
+    default:
+        LOG_WARNING(Kernel, "Unhandled errno {}", e);
+        return e;
+    }
+}
+
+void SetPosixErrno(s32 e) {
+    g_posix_errno = NativeToPosixErrno(e);
+}
+
+struct OrbisKernelUuid {
+    u32 timeLow;
+    u16 timeMid;
+    u16 timeHiAndVersion;
+    u8 clockSeqHiAndReserved;
+    u8 clockSeqLow;
+    u8 node[6];
+};
+static_assert(sizeof(OrbisKernelUuid) == 0x10);
+
+s32 PS4_SYSV_ABI sceKernelUuidCreate(OrbisKernelUuid* orbisUuid) {
+    if (!orbisUuid) {
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+#ifdef _WIN64
+    UUID uuid;
+    if (UuidCreate(&uuid) != RPC_S_OK) {
+        return ORBIS_KERNEL_ERROR_EFAULT;
+    }
+#else
+    uuid_t uuid;
+    uuid_generate(uuid);
+#endif
+    std::memcpy(orbisUuid, &uuid, sizeof(OrbisKernelUuid));
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI kernel_ioctl(s32 fd, u64 cmd, VA_ARGS) {
+    auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
+    auto* file = h->GetFile(fd);
+    if (file == nullptr) {
+        LOG_INFO(Lib_Kernel, "ioctl: fd = {:X} cmd = {:X} file == nullptr", fd, cmd);
+        g_posix_errno = POSIX_EBADF;
+        return -1;
+    }
+    if (file->type != Core::FileSys::FileType::Device) {
+        LOG_WARNING(Lib_Kernel, "ioctl: fd = {:X} cmd = {:X} file->type != Device", fd, cmd);
+        g_posix_errno = ENOTTY;
+        return -1;
+    }
+    VA_CTX(ctx);
+    s32 result = file->device->ioctl(cmd, &ctx);
+    LOG_TRACE(Lib_Kernel, "ioctl: fd = {:X} cmd = {:X} result = {}", fd, cmd, result);
+    if (result < 0) {
+        ErrSceToPosix(result);
+        return -1;
+    }
+    return result;
+}
+
+const char* PS4_SYSV_ABI sceKernelGetFsSandboxRandomWord() {
+    const char* path = "sys";
+    return path;
+}
+
+s32 PS4_SYSV_ABI _sigprocmask() {
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI posix_getpagesize() {
+    return 16_KB;
+}
+
+// stubbed on non-devkit consoles
+s32 PS4_SYSV_ABI sceKernelGetGPI() {
+    LOG_DEBUG(Kernel, "called");
+    return ORBIS_OK;
+}
+
+// stubbed on non-devkit consoles
+s32 PS4_SYSV_ABI sceKernelSetGPO() {
+    LOG_DEBUG(Kernel, "called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceKernelGetAllowedSdkVersionOnSystem(s32* ver) {
+    if (ver == nullptr) {
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+    // Returns the highest game SDK version this PS4 allows.
+    *ver = CURRENT_FIRMWARE_VERSION | 0xfff;
+    LOG_INFO(Lib_Kernel, "called, returned sw version: {}", *ver);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceKernelGetSystemSwVersion(SwVersionStruct* ret) {
+    if (ret == nullptr) {
+        return ORBIS_OK;
+    }
+    u32 fake_fw = CURRENT_FIRMWARE_VERSION;
+    ret->hex_representation = fake_fw;
+    std::snprintf(ret->text_representation, 28, "%2x.%03x.%03x", fake_fw >> 0x18,
+                  fake_fw >> 0xc & 0xfff, fake_fw & 0xfff);
+    LOG_INFO(Lib_Kernel, "called, returned sw version: {}", ret->text_representation);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI getargc() {
+    return entry_params.argc;
+}
+
+const char** PS4_SYSV_ABI getargv() {
+    return entry_params.argv;
+}
+
+s32 PS4_SYSV_ABI get_authinfo(s32 pid, AuthInfoData* p2) {
+    LOG_WARNING(Lib_Kernel, "(STUBBED) called, pid: {}", pid);
+    if (p2 == nullptr) {
+        *Kernel::__Error() = POSIX_EPERM;
+        return -1;
+    }
+    if (pid != 0 && pid != GLOBAL_PID) {
+        *Kernel::__Error() = POSIX_ESRCH;
+        return -1;
+    }
+
+    *p2 = {};
+    p2->caps[0] = 0x2000000000000000;
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceKernelGetAppInfo(s32 pid, OrbisKernelAppInfo* app_info) {
+    LOG_WARNING(Lib_Kernel, "(STUBBED) called, pid: {}", pid);
+    if (pid != GLOBAL_PID) {
+        return ORBIS_KERNEL_ERROR_EPERM;
+    }
+    if (app_info == nullptr) {
+        return ORBIS_OK;
+    }
+
+    auto& game_info = Common::ElfInfo::Instance();
+    *app_info = {};
+    app_info->has_param_sfo = 1;
+    strncpy(app_info->cusa_name, game_info.GameSerial().data(), 10);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceKernelTitleWorkaroundIsEnabled(OrbisKernelTitleWorkaround* tw, s32 bit,
+                                                   s32* result) {
+    LOG_ERROR(Lib_Kernel, "(STUBBED) called, bit {:#x}", bit);
+    if (!tw || !result) {
+        return ORBIS_KERNEL_ERROR_EFAULT;
+    }
+
+    // Maximum bit value is known to change with new firmwares.
+    if (bit >= 0x3a) {
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
+
+    // Straight from decompilation, most uses rely on workaround data from sceKernelGetAppInfo.
+    *result = ((tw->ids[bit >> 6] >> (bit & 0x3f)) & 1);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceKernelGetProcessType(s32 pid) {
+    LOG_DEBUG(Lib_Kernel, "called, pid: {}", pid);
+    if (pid != GLOBAL_PID && pid != -1 && pid != 0) {
+        return ORBIS_KERNEL_ERROR_ESRCH;
+    }
+    return ORBIS_KERNEL_PROCESS_TYPE_BIG_APP;
+}
+
+s32 PS4_SYSV_ABI __sys_regmgr_call(u32 op, u32 key, void* /*result*/, void* /*value*/, u64 len) {
+    LOG_ERROR(Lib_Kernel, "(STUBBED) called, op: {:#x}, key: {}, len: {}", op, key, len);
+    return ORBIS_OK;
+}
+
+// Nominally: long sysconf(int name);
+u64 PS4_SYSV_ABI posix_sysconf(s32 name) {
+    switch (name) {
+    case 0:
+        return 0x20000;
+    case POSIX_SC_ARG_MAX:
+        return 0x588bc000;
+    case POSIX_SC_CHILD_MAX:
+        return 0x64;
+    case POSIX_SC_CLK_TCK:
+        return 0x20;
+    case POSIX_SC_NGROUPS_MAX:
+        return 0x644;
+    case POSIX_SC_OPEN_MAX:
+        return -0x1;
+    case POSIX_SC_JOB_CONTROL:
+        return 0x6;
+    case POSIX_SC_SAVED_IDS:
+        return 0x1;
+    case POSIX_SC_VERSION:
+        return 0x1;
+    case POSIX_SC_BC_BASE_MAX:
+        return 0x31069;
+    case POSIX_SC_BC_DIM_MAX:
+        return -0x1;
+    case POSIX_SC_BC_SCALE_MAX:
+        return 0x31069;
+    case POSIX_SC_BC_STRING_MAX:
+        return 0x31069;
+    case POSIX_SC_COLL_WEIGHTS_MAX:
+        return -0x1;
+    case POSIX_SC_EXPR_NEST_MAX:
+        return -0x1;
+    case POSIX_SC_LINE_MAX:
+        return 0x31069;
+    case POSIX_SC_RE_DUP_MAX:
+        return 0x31069;
+    case POSIX_SC_2_VERSION:
+        return 0x31069;
+    case POSIX_SC_2_C_BIND:
+        return 0x31069;
+    case POSIX_SC_2_C_DEV:
+        return 0x31069;
+    case POSIX_SC_2_CHAR_TERM:
+        return 0x31069;
+    case POSIX_SC_2_FORT_DEV:
+        return 0x31069;
+    case POSIX_SC_2_FORT_RUN:
+        return 0x31069;
+    case POSIX_SC_2_LOCALEDEF:
+        return -0x1;
+    case POSIX_SC_2_SW_DEV:
+        return -0x1;
+    case POSIX_SC_2_UPE:
+        return 0x0;
+    case POSIX_SC_STREAM_MAX:
+        return 0x7fffffff;
+    case POSIX_SC_TZNAME_MAX:
+        return -0x1;
+    case POSIX_SC_ASYNCHRONOUS_IO:
+        return 0x8000;
+    case POSIX_SC_MAPPED_FILES:
+        return 0x31069;
+    case POSIX_SC_MEMLOCK:
+        return 0x4000;
+    case POSIX_SC_MEMLOCK_RANGE:
+        return 0x1e;
+    case POSIX_SC_MEMORY_PROTECTION:
+        return 0x100;
+    case POSIX_SC_MESSAGE_PASSING:
+        return 0x7fffffff;
+    case POSIX_SC_PRIORITIZED_IO:
+        return -0x1;
+    case POSIX_SC_PRIORITY_SCHEDULING:
+        return -0x1;
+    case POSIX_SC_REALTIME_SIGNALS:
+        return 0x63;
+    case POSIX_SC_SEMAPHORES:
+        return 0x800;
+    case POSIX_SC_FSYNC:
+        return 0x63;
+    case POSIX_SC_SHARED_MEMORY_OBJECTS:
+        return 0x3e8;
+    case POSIX_SC_SYNCHRONIZED_IO:
+        return 0x2;
+    case POSIX_SC_THREAD_ATTR_STACKSIZE:
+        return 0x1;
+    case POSIX_SC_THREAD_CPUTIME:
+        return 0x1;
+    case POSIX_SC_THREAD_DESTRUCTOR_ITERATIONS:
+        return 0x48000;
+    case POSIX_SC_THREAD_KEYS_MAX:
+        return 0x1a078630b2dd7;
+    case POSIX_SC_THREAD_PRIO_INHERIT:
+        return -0x1;
+    case POSIX_SC_THREAD_PRIO_PROTECT:
+        return -0x1;
+    case POSIX_SC_THREAD_PRIORITY_SCHEDULING:
+        return 0x2bc;
+    case POSIX_SC_THREAD_PROCESS_SHARED:
+        return 0x2bc;
+    case POSIX_SC_THREAD_SAFE_FUNCTIONS:
+        return 0x1;
+    case POSIX_SC_THREAD_SPORADIC_SERVER:
+        return -0x1;
+    case POSIX_SC_THREAD_STACK_MIN:
+        return 0x1;
+    case POSIX_SC_THREAD_THREADS_MAX:
+        return 0x1;
+    case POSIX_SC_TIMEOUTS:
+        return -0x1;
+    // Manually specified
+    case POSIX_SC_PAGESIZE:
+        return posix_getpagesize();
+    default:
+        LOG_ERROR(Lib_Kernel, "unhandled {}", name);
+        return 0;
+    }
+}
+
+void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+    service_thread = std::jthread{KernelServiceThread};
+
+    static char const** kernel_environ = g_environment;
+
+    Libraries::Kernel::RegisterFileSystem(sym);
+    Libraries::Kernel::RegisterTime(sym);
+    Libraries::Kernel::RegisterThreads(sym);
+    Libraries::Kernel::RegisterMemory(sym);
+    Libraries::Kernel::RegisterEventQueue(sym);
+    Libraries::Kernel::RegisterProcess(sym);
+    Libraries::Kernel::RegisterException(sym);
+    Libraries::Kernel::RegisterDebug(sym);
+    Libraries::Kernel::RegisterCoredump(sym);
+
+    LIB_OBJ("f7uOxY9mM1U", "libkernel", 1, "libkernel", &g_stack_chk_guard);
+    LIB_OBJ("+2thxYZ4syk", "libkernel", 1, "libkernel", &kernel_environ);
+    LIB_OBJ("djxxOmW6-aw", "libkernel", 1, "libkernel", &g_progname);
+    LIB_FUNCTION("D4yla3vx4tY", "libkernel", 1, "libkernel", sceKernelError);
+    LIB_FUNCTION("YeU23Szo3BM", "libkernel", 1, "libkernel", sceKernelGetAllowedSdkVersionOnSystem);
+    LIB_FUNCTION("Mv1zUObHvXI", "libkernel", 1, "libkernel", sceKernelGetSystemSwVersion);
+    LIB_FUNCTION("igMefp4SAv0", "libkernel", 1, "libkernel", get_authinfo);
+    LIB_FUNCTION("G-MYv5erXaU", "libkernel", 1, "libkernel", sceKernelGetAppInfo);
+    LIB_FUNCTION("1yca4VvfcNA", "libkernel", 1, "libkernel", sceKernelTitleWorkaroundIsEnabled);
+    LIB_FUNCTION("+g+UP8Pyfmo", "libkernel", 1, "libkernel", sceKernelGetProcessType);
+    LIB_FUNCTION("PfccT7qURYE", "libkernel", 1, "libkernel", kernel_ioctl);
+    LIB_FUNCTION("wW+k21cmbwQ", "libkernel", 1, "libkernel", kernel_ioctl);
+    LIB_FUNCTION("JGfTMBOdUJo", "libkernel", 1, "libkernel", sceKernelGetFsSandboxRandomWord);
+    LIB_FUNCTION("JGfTMBOdUJo", "libkernel_psmkit", 1, "libkernel",
+                 sceKernelGetFsSandboxRandomWord);
+    LIB_FUNCTION("6xVpy0Fdq+I", "libkernel", 1, "libkernel", _sigprocmask);
+    LIB_FUNCTION("Xjoosiw+XPI", "libkernel", 1, "libkernel", sceKernelUuidCreate);
+    LIB_FUNCTION("Ou3iL1abvng", "libkernel", 1, "libkernel", stack_chk_fail);
+    LIB_FUNCTION("9BcDykPmo1I", "libkernel", 1, "libkernel", __Error);
+    LIB_FUNCTION("k+AXqu2-eBc", "libkernel", 1, "libkernel", posix_getpagesize);
+    LIB_FUNCTION("k+AXqu2-eBc", "libScePosix", 1, "libkernel", posix_getpagesize);
+    LIB_FUNCTION("7NwggrWJ5cA", "libkernel", 1, "libkernel", __sys_regmgr_call);
+
+    LIB_FUNCTION("mkawd0NA9ts", "libkernel", 1, "libkernel", posix_sysconf);
+    LIB_FUNCTION("mkawd0NA9ts", "libScePosix", 1, "libkernel", posix_sysconf);
+
+    LIB_FUNCTION("4oXYe9Xmk0Q", "libkernel", 1, "libkernel", sceKernelGetGPI);
+    LIB_FUNCTION("ca7v6Cxulzs", "libkernel", 1, "libkernel", sceKernelSetGPO);
+    LIB_FUNCTION("iKJMWrAumPE", "libkernel", 1, "libkernel", getargc);
+    LIB_FUNCTION("FJmglmTMdr4", "libkernel", 1, "libkernel", getargv);
+}
+
+} // namespace Libraries::Kernel

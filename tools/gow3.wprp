@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- GOW3 frame markers (src/patches/hooks.cpp RunFrame), started beside WPR's CPU profile by tools\wpr-capture.ps1. -->
+<WindowsPerformanceRecorder Version="1.0" Author="GOW3" Comments="Frame loop start events for etlprof">
+  <Profiles>
+    <EventCollector Id="GOW3Collector" Name="GOW3 Frames">
+      <BufferSize Value="64"/>
+      <Buffers Value="16"/>
+    </EventCollector>
+    <EventProvider Id="GOW3FrameProvider" Name="e5b7a118-eaa4-4971-bca2-413393acfa70" Level="5"/>
+    <Profile Id="GOW3.Verbose.Memory" Name="GOW3" Description="GOW3 frame markers" LoggingMode="Memory" DetailLevel="Verbose">
+      <Collectors>
+        <EventCollectorId Value="GOW3Collector">
+          <EventProviders>
+            <EventProviderId Value="GOW3FrameProvider"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

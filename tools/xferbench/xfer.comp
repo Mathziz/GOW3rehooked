@@ -1,0 +1,13 @@
+#version 450
+// Reads every dword of the frame's GPU-read spans once (chunks of <= 256 dwords), like the draws would.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Data { uint d[]; };
+layout(std430, binding = 1) readonly buffer Chunks { uvec2 c[]; };
+layout(std430, binding = 2) buffer Out { uint o[]; };
+layout(push_constant) uniform P { uint base; uint n; };
+void main() {
+    uint i = gl_WorkGroupID.x + gl_WorkGroupID.y * 4096u;
+    if (i >= n) return;
+    uvec2 ch = c[i];
+    if (gl_LocalInvocationID.x < ch.y && d[base + ch.x + gl_LocalInvocationID.x] == 0xDEADBEEFu) o[0] = i;
+}

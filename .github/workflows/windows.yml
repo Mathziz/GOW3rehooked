@@ -1,0 +1,186 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x86_64 (O3)
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\build-fast\Windows\vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\build-fast\Windows\.cache\vcpkg-binaries
+      SCCACHE_DIR: ${{ github.workspace }}\build-fast\Windows\.cache\sccache
+      SCCACHE_CACHE_SIZE: 2G
+      VULKAN_SDK: ${{ github.workspace }}\build-fast\Windows\vcpkg\installed\x64-gow3-static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install LLVM 22.1.8, sccache and NASM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $tools = Join-Path $env:RUNNER_TEMP 'gow3-tools'
+          New-Item -ItemType Directory -Path "$tools\llvm", "$tools\sccache" -Force | Out-Null
+          $downloads = @(
+            @('llvm', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz', 'd96c2cc1736f4eb7fa43cb9bbdf56d93551a9ae0a9aadb9c99c3c3b2b712a234'),
+            @('sccache', 'https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.tar.gz', '130e4f8eb672e76590e9993c2ab890c4763b88238577bb11d8062158c7698353')
+          )
+          foreach ($download in $downloads) {
+            $archive = Join-Path $tools "$($download[0]).tar"
+            Invoke-WebRequest $download[1] -OutFile $archive
+            if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $download[2]) {
+              throw "Checksum mismatch: $($download[0])"
+            }
+            tar -xf $archive -C "$tools\$($download[0])" --strip-components 1
+            if ($LASTEXITCODE -ne 0) { throw "Extraction failed: $($download[0])" }
+          }
+          "LLVM_ROOT=$tools\llvm" >> $env:GITHUB_ENV
+          "$tools\llvm\bin" >> $env:GITHUB_PATH
+          "$tools\sccache" >> $env:GITHUB_PATH
+          choco install nasm --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'NASM installation failed' }
+          "$env:ProgramFiles\NASM" >> $env:GITHUB_PATH
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: microsoft/vcpkg
+          ref: 3d22b64585ca026e881728fd87e541c23a611a43
+          path: build-fast/Windows/vcpkg
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        with:
+          path: |
+            build-fast/Windows/.cache/sccache
+            build-fast/Windows/.cache/vcpkg-binaries
+          key: windows2025-clang22-o3-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake', 'build-fast.ps1', '.github/workflows/windows.yml') }}-${{ github.sha }}
+          restore-keys: |
+            windows2025-clang22-o3-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake', 'build-fast.ps1', '.github/workflows/windows.yml') }}-
+            windows2025-clang22-o3-
+      - name: Restore shaderc and Vulkan packages (build on cache miss)
+        id: dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path $env:VCPKG_DEFAULT_BINARY_CACHE -Force | Out-Null
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          & "$env:VCPKG_ROOT\vcpkg.exe" install shaderc:x64-gow3-static vulkan-headers:x64-gow3-static vulkan-loader:x64-gow3-static --overlay-triplets="$env:GITHUB_WORKSPACE\tools\vcpkg"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows dependency installation failed' }
+      - name: Build Windows Release with O3 and full LTO
+        shell: pwsh
+        run: |
+          $cmake = Get-Content -LiteralPath CMakeLists.txt -Raw
+          if (-not $cmake.Contains('-flto=thin')) { throw 'Expected the local ThinLTO configuration' }
+          $ciProject = @(
+            'project(gow3_recomp LANGUAGES C CXX)',
+            'set(CMAKE_C_FLAGS_RELEASE "/O2 /Ob2 /DNDEBUG /clang:-O3")',
+            'set(CMAKE_CXX_FLAGS_RELEASE "/O2 /Ob2 /DNDEBUG /clang:-O3")'
+          ) -join "`n"
+          $cmake = $cmake.Replace('project(gow3_recomp LANGUAGES C CXX)', $ciProject)
+          $cmake = $cmake.Replace('-flto=thin', '-flto=full').Replace('add_link_options(', 'add_link_options(/opt:lldlto=3 ')
+          Set-Content -LiteralPath CMakeLists.txt -Value $cmake
+          ./build-fast.ps1 -Release -NoDeploy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $commands = Get-Content -LiteralPath build-fast/Release/compile_commands.json -Raw
+          $buildRules = Get-Content -LiteralPath build-fast/Release/build.ninja -Raw
+          if ($commands.Contains('-flto=thin') -or -not $commands.Contains('-flto=full') -or
+              -not $commands.Contains('/clang:-O3') -or
+              -not $buildRules.Contains('/opt:lldlto=3')) {
+            throw 'Expected O3 and full LTO with optimization level 3 in CI'
+          }
+      - name: Package both Windows executables with the licenses, the third-party notices and the shader recipes
+        shell: pwsh
+        env:
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Each component built into the executables, with the license file that carries its copyright notice.
+          $share = "$env:VULKAN_SDK/share"
+          $components = @(
+            @('FFmpeg (LGPL-2.1-or-later.txt)', 'src/externals/ffmpeg/LICENSE.md'),
+            @('SDL3', 'src/externals/sdl3/LICENSE.txt'),
+            @('HIDAPI (in SDL3)', 'src/externals/sdl3/src/hidapi/LICENSE-orig.txt'),
+            @('Dear ImGui', 'src/externals/imgui/LICENSE.txt'),
+            @('stb', 'src/externals/stb/LICENSE'),
+            @('AMD FidelityFX Super Resolution 1', 'src/present/fsr/LICENSE.txt'),
+            @('Intel CMAA2, Copyright Intel Corporation', 'licenses/Apache-2.0.txt'),
+            @('shaderc', "$share/shaderc/copyright"),
+            @('glslang', "$share/glslang/copyright"),
+            @('SPIRV-Tools', "$share/spirv-tools/copyright"),
+            @('SPIRV-Headers', "$share/spirv-headers/copyright"),
+            @('Zydis', 'src/externals/zydis/LICENSE'),
+            @('Zycore (in Zydis)', 'src/externals/zydis/dependencies/zycore/LICENSE'),
+            @('Xbyak', 'src/externals/xbyak/COPYRIGHT'),
+            @('xxHash', 'src/externals/xxhash/LICENSE'),
+            @('Zstandard', 'src/externals/zstd/LICENSE'),
+            @('fmt', 'src/externals/fmt/LICENSE'),
+            @('magic_enum', 'src/externals/magic_enum/LICENSE'),
+            @('LibAtrac9', 'src/externals/LibAtrac9/LICENSE'),
+            @('Cinzel typeface', 'src/ui/fonts/OFL.txt')
+          )
+          $rule = '=' * 80
+          $notices = @("GOW3rehooked is licensed under the GNU General Public License v2.0 or later (GPL-2.0-or-later.txt) and builds on code from the shadPS4 project. Its source code is at $env:SOURCE_URL.", '',
+                       'The executables also contain the third-party components below. The full texts of the licenses they name are in this folder.')
+          foreach ($c in $components) { $notices += '', $rule, $c[0], $rule, '', (Get-Content -LiteralPath $c[1] -Raw).Trim("`r`n".ToCharArray()) }
+          $package = 'build/package'
+          New-Item -ItemType Directory -Path "$package/licenses", "$package/_rehooked_/shader_cache" -Force | Out-Null
+          Copy-Item build/gow3.exe, build/gow3_debug.exe $package
+          Copy-Item licenses/* "$package/licenses"
+          # The shader variants of a full playthrough: the first AOT preparation starts with them.
+          Copy-Item assets/shader_cache/recipes-hash2-aes.bin "$package/_rehooked_/shader_cache"
+          Set-Content -LiteralPath "$package/licenses/THIRD-PARTY-NOTICES.txt" -Value $notices -Encoding utf8
+          Compress-Archive -Path "$package/*" -DestinationPath build/GOW3rehooked-Windows-x86_64.zip -CompressionLevel Optimal
+      - name: Upload Windows ZIP with both executables, the licenses and the shader recipes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: build/GOW3rehooked-Windows-x86_64.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $zip = 'build/GOW3rehooked-Windows-x86_64.zip'
+          $release = gh release view $env:RELEASE_TAG --json isDraft,assets 2>$null | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG --verify-tag --draft --title "GOW3rehooked $env:RELEASE_TAG" --notes 'Windows x86_64 build. Extract the ZIP next to eboot.bin and run gow3.exe. Use gow3_debug.exe to enable diagnostics.'
+            if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
+            $release = [pscustomobject]@{ isDraft = $true; assets = @() }
+          }
+          if ($release.isDraft) {
+            gh release upload $env:RELEASE_TAG $zip --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
+            gh release edit $env:RELEASE_TAG --draft=false
+            if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
+          } elseif ($release.assets.name -notcontains [IO.Path]::GetFileName($zip)) {
+            gh release upload $env:RELEASE_TAG $zip
+            if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
+          }
+      - name: Save compiler and dependency caches
+        if: always() && steps.dependencies.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            build-fast/Windows/.cache/sccache
+            build-fast/Windows/.cache/vcpkg-binaries
+          key: ${{ steps.cache.outputs.cache-primary-key }}
