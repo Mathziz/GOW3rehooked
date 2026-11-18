@@ -2,6 +2,11 @@ name: Windows
 
 on:
   workflow_dispatch:
+    inputs:
+      ivy_bridge:
+        description: Build for Ivy Bridge CPUs such as the Core i5-3470
+        type: boolean
+        default: false
   push:
     tags: ['v*']
 
@@ -9,17 +14,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: build-${{ github.ref }}${{ inputs.ivy_bridge && '-ivybridge' || '' }}
   cancel-in-progress: true
 
 jobs:
   windows:
-    name: Windows x86_64 (O3)
+    name: Windows x86_64${{ startsWith(github.ref, 'refs/tags/v') && ' and AVX1' || inputs.ivy_bridge && ' AVX1' || '' }} (O3)
     runs-on: windows-2025
     timeout-minutes: 60
     permissions:
       contents: write
     env:
+      BUILD_VARIANTS: ${{ startsWith(github.ref, 'refs/tags/v') && 'standard,ivybridge' || inputs.ivy_bridge && 'ivybridge' || 'standard' }}
+      CACHE_SUFFIX: ${{ inputs.ivy_bridge && '-ivybridge' || '' }}
       VCPKG_ROOT: ${{ github.workspace }}\build-fast\Windows\vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\build-fast\Windows\.cache\vcpkg-binaries
       SCCACHE_DIR: ${{ github.workspace }}\build-fast\Windows\.cache\sccache
@@ -68,9 +75,10 @@ jobs:
           path: |
             build-fast/Windows/.cache/sccache
             build-fast/Windows/.cache/vcpkg-binaries
-          key: windows2025-clang22-o3-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake', 'build-fast.ps1', '.github/workflows/windows.yml') }}-${{ github.sha }}
+          key: windows2025-clang22-o3${{ env.CACHE_SUFFIX }}-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake', 'build-fast.ps1', '.github/workflows/windows.yml') }}-${{ github.sha }}
           restore-keys: |
-            windows2025-clang22-o3-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake', 'build-fast.ps1', '.github/workflows/windows.yml') }}-
+            windows2025-clang22-o3${{ env.CACHE_SUFFIX }}-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake', 'build-fast.ps1', '.github/workflows/windows.yml') }}-
+            windows2025-clang22-o3${{ env.CACHE_SUFFIX }}-
             windows2025-clang22-o3-
       - name: Restore shaderc and Vulkan packages (build on cache miss)
         id: dependencies
@@ -94,14 +102,24 @@ jobs:
           $cmake = $cmake.Replace('project(gow3_recomp LANGUAGES C CXX)', $ciProject)
           $cmake = $cmake.Replace('-flto=thin', '-flto=full').Replace('add_link_options(', 'add_link_options(/opt:lldlto=3 ')
           Set-Content -LiteralPath CMakeLists.txt -Value $cmake
-          ./build-fast.ps1 -Release -NoDeploy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $commands = Get-Content -LiteralPath build-fast/Release/compile_commands.json -Raw
-          $buildRules = Get-Content -LiteralPath build-fast/Release/build.ninja -Raw
-          if ($commands.Contains('-flto=thin') -or -not $commands.Contains('-flto=full') -or
-              -not $commands.Contains('/clang:-O3') -or
-              -not $buildRules.Contains('/opt:lldlto=3')) {
-            throw 'Expected O3 and full LTO with optimization level 3 in CI'
+          foreach ($variant in ($env:BUILD_VARIANTS -split ',')) {
+            $ivyBridge = $variant -eq 'ivybridge'
+            ./build-fast.ps1 -Release -NoDeploy -IvyBridge:$ivyBridge
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $buildDir = if ($ivyBridge) { 'build-fast/Release-ivybridge' } else { 'build-fast/Release' }
+            $commands = Get-Content -LiteralPath "$buildDir/compile_commands.json" -Raw
+            $buildRules = Get-Content -LiteralPath "$buildDir/build.ninja" -Raw
+            if ($commands.Contains('-flto=thin') -or -not $commands.Contains('-flto=full') -or
+                -not $commands.Contains('/clang:-O3') -or
+                -not $buildRules.Contains('/opt:lldlto=3')) {
+              throw 'Expected O3 and full LTO with optimization level 3 in CI'
+            }
+            $cpu = if ($ivyBridge) { 'ivybridge' } else { 'x86-64-v3' }
+            foreach ($entry in ($commands | ConvertFrom-Json)) {
+              if ($entry.file -match '\.(c|cpp)$' -and $entry.command -notlike "* /clang:-march=$cpu *") {
+                throw "Expected CPU target $cpu for $($entry.file)"
+              }
+            }
           }
       - name: Package both Windows executables with the licenses, the third-party notices and the shader recipes
         shell: pwsh
@@ -139,28 +157,41 @@ jobs:
           foreach ($c in $components) { $notices += '', $rule, $c[0], $rule, '', (Get-Content -LiteralPath $c[1] -Raw).Trim("`r`n".ToCharArray()) }
           $package = 'build/package'
           New-Item -ItemType Directory -Path "$package/licenses", "$package/_rehooked_/shader_cache" -Force | Out-Null
-          Copy-Item build/gow3.exe, build/gow3_debug.exe $package
           Copy-Item licenses/* "$package/licenses"
           # The shader variants of a full playthrough: the first AOT preparation starts with them.
           Copy-Item assets/shader_cache/recipes-hash2-aes.bin "$package/_rehooked_/shader_cache"
           Set-Content -LiteralPath "$package/licenses/THIRD-PARTY-NOTICES.txt" -Value $notices -Encoding utf8
-          Compress-Archive -Path "$package/*" -DestinationPath build/GOW3rehooked-Windows-x86_64.zip -CompressionLevel Optimal
-      - name: Upload Windows ZIP with both executables, the licenses and the shader recipes
+          foreach ($variant in ($env:BUILD_VARIANTS -split ',')) {
+            $binaries = if ($variant -eq 'ivybridge') { 'build/ivybridge' } else { 'build' }
+            $suffix = if ($variant -eq 'ivybridge') { '-AVX1' } else { '' }
+            Copy-Item "$binaries/gow3.exe", "$binaries/gow3_debug.exe" $package -Force
+            Compress-Archive -Path "$package/*" -DestinationPath "build/GOW3rehooked-Windows-x86_64$suffix.zip" -CompressionLevel Optimal
+          }
+      - name: Upload standard Windows ZIP
+        if: contains(env.BUILD_VARIANTS, 'standard')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: build/GOW3rehooked-Windows-x86_64.zip
           archive: false
           if-no-files-found: error
           retention-days: 14
+      - name: Upload AVX1 Windows ZIP
+        if: contains(env.BUILD_VARIANTS, 'ivybridge')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: build/GOW3rehooked-Windows-x86_64-AVX1.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
       - name: Publish GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $zip = 'build/GOW3rehooked-Windows-x86_64.zip'
+          $zips = @('build/GOW3rehooked-Windows-x86_64.zip', 'build/GOW3rehooked-Windows-x86_64-AVX1.zip')
           $release = gh release view $env:RELEASE_TAG --json isDraft,assets 2>$null | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) {
             gh release create $env:RELEASE_TAG --verify-tag --draft --title "GOW3rehooked $env:RELEASE_TAG" --notes 'Windows x86_64 build. Extract the ZIP next to eboot.bin and run gow3.exe. Use gow3_debug.exe to enable diagnostics.'
@@ -168,13 +199,16 @@ jobs:
             $release = [pscustomobject]@{ isDraft = $true; assets = @() }
           }
           if ($release.isDraft) {
-            gh release upload $env:RELEASE_TAG $zip --clobber
+            gh release upload $env:RELEASE_TAG @zips --clobber
             if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
             gh release edit $env:RELEASE_TAG --draft=false
             if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
-          } elseif ($release.assets.name -notcontains [IO.Path]::GetFileName($zip)) {
-            gh release upload $env:RELEASE_TAG $zip
-            if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
+          } else {
+            $missing = @($zips | Where-Object { $release.assets.name -notcontains [IO.Path]::GetFileName($_) })
+            if ($missing.Count) {
+              gh release upload $env:RELEASE_TAG @missing
+              if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
+            }
           }
       - name: Save compiler and dependency caches
         if: always() && steps.dependencies.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'

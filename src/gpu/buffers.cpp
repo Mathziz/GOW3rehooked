@@ -299,11 +299,19 @@ void Renderer::Write(std::span<WriteRange> ranges) {
                         if (valid && q.want != 0xFF) std::copy_n(q.blocks->hashes, std::size(q.hashes), q.hashes);
                         q.h = Gpu::PieceHash::CopyBlocks(snapshot, q.p, q.n, q.hashes, q.want);
                         if (!valid) q.mask = q.want;
+#if defined(__AVX2__)
                         else for (u32 b = 0; b < std::size(q.hashes); b += 4) {
                             const auto old = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q.blocks->hashes + b));
                             const auto now = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q.hashes + b));
                             q.mask |= (u32(~_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(old, now)))) & 15) << b;
                         }
+#else
+                        else for (u32 b = 0; b < std::size(q.hashes); b += 2) {
+                            const auto old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q.blocks->hashes + b));
+                            const auto now = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q.hashes + b));
+                            q.mask |= (u32(~_mm_movemask_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(old, now)))) & 3) << b;
+                        }
+#endif
                         changed_blocks(q.mask, [&](u64 o, u64 n) { std::memcpy(captured + q.capture + o, snapshot + o, n); });
                         if (!q.mask) q.h = q.previous;
                         else if (q.h == q.previous) q.h ^= 2;

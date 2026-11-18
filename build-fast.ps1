@@ -5,13 +5,15 @@ param(
     [ValidateRange(1, 256)][int]$Jobs = [Environment]::ProcessorCount,
     [switch]$Release,
     [switch]$ConfigureOnly,
-    [switch]$NoDeploy
+    [switch]$NoDeploy,
+    [switch]$IvyBridge
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $BuildType = if ($Release) { 'Release' } else { 'RelWithDebInfo' }
-$BuildDirectory = Join-Path $Root "build-fast\$BuildType"
+$BuildSuffix = if ($IvyBridge) { '-ivybridge' } else { '' }
+$BuildDirectory = Join-Path $Root "build-fast\$BuildType$BuildSuffix"
 $GameDirectory = $env:GOW3_GAME_DIR  # the binaries are also copied there when set
 $SdkDirectory = $env:GOW3_SDK_DIR    # EWDK, VulkanSDK, vcpkg and sccache-cache, when set
 $Names = @('gow3.exe', 'gow3_debug.exe')
@@ -130,6 +132,7 @@ try {
     $compiler = Join-Path $env:LLVM_ROOT 'bin\clang-cl.exe'
     $configure = @('-S', $Root, '-B', $BuildDirectory, '-G', 'Ninja',
         "-DCMAKE_BUILD_TYPE=$BuildType", "-DCMAKE_C_COMPILER=$compiler", "-DCMAKE_CXX_COMPILER=$compiler",
+        "-DGOW3_IVY_BRIDGE=$($IvyBridge.IsPresent)",
         "-DCMAKE_LINKER=$(Join-Path $env:LLVM_ROOT 'bin\lld-link.exe')",
         "-DCMAKE_PREFIX_PATH=$shadercRoot",
         "-DCMAKE_AR=$(Join-Path $env:LLVM_ROOT 'bin\llvm-lib.exe')",
@@ -146,7 +149,7 @@ try {
     if ($ConfigureOnly) { exit 0 }
     & cmake --build $BuildDirectory --parallel $Jobs --target gow3 gow3_debug -- -k 0
     Assert-Exit 'Incremental build'
-    $output = Join-Path $Root 'build'
+    $output = Join-Path $Root $(if ($IvyBridge) { 'build\ivybridge' } else { 'build' })
     New-Item -ItemType Directory -Path $output -Force | Out-Null
     Publish-Binaries (Join-Path $BuildDirectory 'bin') $output
     if (-not $NoDeploy -and $GameDirectory) { Publish-Binaries $output $GameDirectory }

@@ -24,7 +24,7 @@ No game code or assets are included. You need your own copy of the game.
 | Component | Requirement |
 | --- | --- |
 | Operating system | Windows 10 or 11, 64-bit |
-| Intel CPU | 4th-generation Core (Haswell) or newer. |
+| Intel CPU | 4th-generation Core (Haswell) or newer for the standard build. |
 | AMD CPU | Ryzen 1000 or newer. |
 | AMD GPU | Radeon RX 5300 (RDNA 1) or newer. |
 | NVIDIA GPU | GeForce GTX 950 or newer. |
@@ -32,7 +32,9 @@ No game code or assets are included. You need your own copy of the game.
 | Memory | 16 GB of RAM recommended |
 | Game | God of War III Remastered, European (CUSA01715) or American (CUSA01623) release, updated to version 1.02 |
 
-The build requires an x86-64-v3 CPU (including AVX2, BMI1/2, FMA, F16C, LZCNT and MOVBE). Six cores or more are recommended.
+The standard build requires an x86-64-v3 CPU (including AVX2, BMI1/2, FMA, F16C, LZCNT and MOVBE). Six cores or more are recommended.
+
+The experimental AVX1 build targets Ivy Bridge CPUs such as the Core i5-3470. The GPU requirements still apply.
 
 Use a current Windows graphics driver for your card. The renderer requires Vulkan 1.3 with shader objects, depth clip control, push descriptors, conditional rendering, sparse buffer residency and min/max sampler filtering. Radeon also needs `VK_KHR_maintenance5`. Windows capability reports are available for the [Radeon RX 5300](https://vulkan.gpuinfo.org/displayreport.php?id=53293), [Radeon RX 5500 XT](https://vulkan.gpuinfo.org/displayreport.php?id=45797) and [GeForce GTX 950](https://vulkan.gpuinfo.org/displayreport.php?id=47069).
 
@@ -40,7 +42,7 @@ The game has to be in a folder that contains `eboot.bin`, `sce_module` and `sce_
 
 ## Installation
 
-1. Download the latest `GOW3rehooked-Windows-x86_64.zip` from the [Releases](../../releases/latest) page.
+1. Download `GOW3rehooked-Windows-x86_64.zip` from the [Releases](../../releases/latest) page. For an Ivy Bridge CPU, download `GOW3rehooked-Windows-x86_64-AVX1.zip`.
 2. Extract the ZIP into the game folder, next to `eboot.bin`:
 
    ```text

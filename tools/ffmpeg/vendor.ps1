@@ -117,7 +117,7 @@ $list
 target_include_directories(ffmpeg SYSTEM PUBLIC `${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:HAVE_AV_CONFIG_H;_ISOC11_SOURCE;_FILE_OFFSET_BITS=64;_LARGEFILE_SOURCE;_USE_MATH_DEFINES;_CRT_NONSTDC_NO_WARNINGS;_WIN32_WINNT=0x0600;PIC>)
 # FFmpeg relies on the optimizer dropping calls under disabled ARCH_*/HAVE_* checks; no LTO (inline asm names symbols).
-target_compile_options(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:/clang:-march=x86-64-v3;/std:c17;-w>
+target_compile_options(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:/clang:-march=`${GOW3_CPU_ARCH};/std:c17;-w>
     `$<`$<COMPILE_LANGUAGE:ASM_NASM>:-I`${CMAKE_CURRENT_SOURCE_DIR}/;-I`${CMAKE_CURRENT_SOURCE_DIR}/libavutil/x86/;-P`${CMAKE_CURRENT_SOURCE_DIR}/config.asm>)
 target_link_libraries(ffmpeg PUBLIC bcrypt)
 "@ | Set-Content -LiteralPath (Join-Path $Target 'CMakeLists.txt')

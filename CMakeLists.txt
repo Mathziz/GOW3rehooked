@@ -12,9 +12,13 @@ add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
 # Omitted aggregate members are value-initialized on purpose (designated initializers).
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/clang:-Wno-missing-field-initializers> $<$<COMPILE_LANGUAGE:CXX>:/clang:-Wno-missing-designated-field-initializers>)
-# Minimum CPU x86-64-v3 (AVX2, BMI1/2, FMA, LZCNT) without implicit FMA contraction, so results stay unchanged;
-# ThinLTO everywhere, with a link cache for incremental builds.
-add_compile_options(/clang:-march=x86-64-v3 /clang:-ffp-contract=off -flto=thin)
+option(GOW3_IVY_BRIDGE "Build for Intel Ivy Bridge CPUs" OFF)
+set(GOW3_CPU_ARCH x86-64-v3)
+if(GOW3_IVY_BRIDGE)
+    set(GOW3_CPU_ARCH ivybridge)
+endif()
+# Keep implicit FMA contraction off and use a ThinLTO cache for incremental builds.
+add_compile_options(/clang:-march=${GOW3_CPU_ARCH} /clang:-ffp-contract=off -flto=thin)
 add_link_options(/lldltocache:${CMAKE_BINARY_DIR}/lto-cache)
 find_package(Vulkan REQUIRED) # gpu/device.cpp
 set(ARCHITECTURE x86_64)
@@ -54,6 +58,7 @@ endforeach()
 target_include_directories(gow3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(gow3 PRIVATE ${SRC}) # every project include is a path from src/
 target_compile_definitions(gow3 PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE _SCL_SECURE_NO_WARNINGS)
+target_compile_definitions(gow3 PRIVATE $<$<BOOL:${GOW3_IVY_BRIDGE}>:GOW3_IVY_BRIDGE>)
 target_compile_options(gow3 PRIVATE /Gy /Gw /GS- /clang:-Wno-unknown-warning-option)
 target_link_libraries(gow3 PRIVATE fmt::fmt Zydis xbyak
     magic_enum::magic_enum SDL3::SDL3 LibAtrac9

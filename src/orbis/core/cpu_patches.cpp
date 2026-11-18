@@ -515,6 +515,177 @@ static void ReplaceMOVNTSD(void* address, const ZydisDecodedInstruction&,
     ReplaceMOVNT(address, 0xF2);
 }
 
+#ifdef GOW3_IVY_BRIDGE
+static bool PatchIvyBridgeInstruction(const ZydisDecodedOperand*) {
+    return true;
+}
+
+static Xbyak::Reg GuestGpr(ZydisRegister reg) {
+    if (reg >= ZYDIS_REGISTER_AX && reg <= ZYDIS_REGISTER_R15W) {
+        return Xbyak::Reg16(reg - ZYDIS_REGISTER_AX);
+    }
+    return ZydisToXbyakRegister(reg);
+}
+
+static Xbyak::Address GuestIvyMemory(const ZydisDecodedOperand& op, const u8* next, u32 stack_bias) {
+    if (op.mem.base == ZYDIS_REGISTER_RIP) {
+        const auto target = reinterpret_cast<uintptr_t>(next) + op.mem.disp.value;
+        return ptr[rip + reinterpret_cast<const void*>(target)];
+    }
+    if (op.mem.base == ZYDIS_REGISTER_EIP) {
+        const auto target = static_cast<u32>(reinterpret_cast<uintptr_t>(next) + op.mem.disp.value);
+        return ptr[reinterpret_cast<const void*>(static_cast<uintptr_t>(target))];
+    }
+    auto adjusted = op;
+    if (op.mem.base == ZYDIS_REGISTER_RSP || op.mem.base == ZYDIS_REGISTER_ESP) {
+        adjusted.mem.disp.value += stack_bias;
+        adjusted.mem.disp.size = 32;
+    }
+    return ZydisToXbyakMemoryOperand(adjusted);
+}
+
+static void ReadIvyOperand(Xbyak::CodeGenerator& c, const Xbyak::Reg& dst,
+                           const ZydisDecodedOperand& op, const u8* next, u32 stack_bias) {
+    if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(dst, op.imm.value.u);
+    } else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        c.mov(dst, GuestIvyMemory(op, next, stack_bias));
+    } else if (stack_bias && GuestGpr(op.reg.value).getIdx() == rsp.getIdx()) {
+        c.lea(dst, ptr[rsp + stack_bias]);
+    } else {
+        c.mov(dst, GuestGpr(op.reg.value));
+    }
+}
+
+static void GenerateIvyBridgeInstruction(void* address, const ZydisDecodedInstruction& ins,
+                                         const ZydisDecodedOperand* ops, Xbyak::CodeGenerator& c) {
+    const auto* next = static_cast<const u8*>(address) + ins.length;
+    const auto mnemonic = ins.mnemonic;
+    const auto bits = ins.operand_width;
+    if (mnemonic == ZYDIS_MNEMONIC_LZCNT || mnemonic == ZYDIS_MNEMONIC_TZCNT) {
+        const auto dst = GuestGpr(ops[0].reg.value);
+        Xbyak::Label zero, done;
+        ReadIvyOperand(c, dst, ops[1], next, 0);
+        if (mnemonic == ZYDIS_MNEMONIC_LZCNT) c.bsr(dst, dst);
+        else c.bsf(dst, dst);
+        c.jz(zero);
+        if (mnemonic == ZYDIS_MNEMONIC_LZCNT) c.xor_(dst, bits - 1);
+        else c.test(dst, dst);
+        c.jmp(done);
+        c.L(zero);
+        c.mov(dst, bits);
+        c.test(dst, dst);
+        c.stc();
+        c.L(done);
+        return;
+    }
+
+    // Save scratch registers below the guest red zone. Keep operand and address registers intact
+    // until all reads have completed.
+    u32 occupied = (1u << rsp.getIdx()) | (1u << rcx.getIdx());
+    const auto occupy = [&occupied](ZydisRegister reg) {
+        const int id = ZydisRegisterGetId(reg);
+        if (id >= 0 && id < 16) occupied |= 1u << id;
+    };
+    for (u8 i = 0; i < ins.operand_count_visible; ++i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER) occupy(ops[i].reg.value);
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            occupy(ops[i].mem.base);
+            occupy(ops[i].mem.index);
+        }
+    }
+    const auto pick = [&occupied, bits] {
+        const int id = std::countr_one(occupied);
+        occupied |= 1u << id;
+        return Xbyak::Reg(id, Xbyak::Operand::REG, bits);
+    };
+    const auto value = pick();
+    const auto aux = pick();
+    constexpr u32 spill = 128 + 2 * sizeof(u64);
+    c.lea(rsp, ptr[rsp - 128]);
+    c.push(Xbyak::Reg64(value.getIdx()));
+    c.push(Xbyak::Reg64(aux.getIdx()));
+    ReadIvyOperand(c, value, ops[1], next, spill);
+
+    if (mnemonic == ZYDIS_MNEMONIC_MOVBE) {
+        if (bits == 16) {
+            c.pushfq();
+            c.rol(value, 8);
+            c.popfq();
+        } else {
+            c.bswap(Xbyak::Reg32e(value.getIdx(), bits));
+        }
+    } else if (mnemonic == ZYDIS_MNEMONIC_ANDN) {
+        ReadIvyOperand(c, aux, ops[2], next, spill);
+        c.not_(value);
+        c.and_(value, aux);
+    } else if (mnemonic == ZYDIS_MNEMONIC_BEXTR) {
+        ReadIvyOperand(c, aux, ops[2], next, spill);
+        c.push(rcx);
+        Xbyak::Label zero, done;
+        c.mov(ecx, Xbyak::Reg32(aux.getIdx()));
+        c.movzx(ecx, cl);
+        c.cmp(ecx, bits);
+        c.jae(zero);
+        c.shr(value, cl);
+        c.mov(ecx, Xbyak::Reg32(aux.getIdx()));
+        c.movzx(ecx, ch);
+        c.test(ecx, ecx);
+        c.jz(zero);
+        c.cmp(ecx, bits);
+        c.jae(done);
+        c.neg(ecx);
+        c.shl(value, cl);
+        c.shr(value, cl);
+        c.jmp(done);
+        c.L(zero);
+        c.xor_(value, value);
+        c.L(done);
+        c.test(value, value);
+        c.pop(rcx);
+    } else {
+        if (mnemonic == ZYDIS_MNEMONIC_BLSI) {
+            c.mov(aux, value);
+            c.neg(value);
+            c.and_(value, aux);
+            Xbyak::Label done;
+            c.jz(done);
+            c.stc();
+            c.L(done);
+        } else {
+            c.lea(aux, ptr[Xbyak::Reg64(value.getIdx()) - 1]);
+            Xbyak::Label nonzero, done;
+            c.test(value, value);
+            c.jnz(nonzero);
+            c.mov(value, mnemonic == ZYDIS_MNEMONIC_BLSR ? 0 : -1);
+            c.test(value, value);
+            c.stc();
+            c.jmp(done);
+            c.L(nonzero);
+            if (mnemonic == ZYDIS_MNEMONIC_BLSR) c.and_(value, aux);
+            else c.xor_(value, aux);
+            c.L(done);
+        }
+    }
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        c.mov(GuestIvyMemory(ops[0], next, spill), value);
+    } else {
+        const auto dst = GuestGpr(ops[0].reg.value);
+        if (dst.getIdx() == rsp.getIdx()) {
+            c.pop(Xbyak::Reg64(aux.getIdx()));
+            c.xchg(Xbyak::Reg64(value.getIdx()), qword[rsp]);
+            c.lea(rsp, ptr[rsp + 128 + sizeof(u64)]);
+            c.mov(dst, ptr[rsp - 128 - sizeof(u64)]);
+            return;
+        }
+        c.mov(dst, value);
+    }
+    c.pop(Xbyak::Reg64(aux.getIdx()));
+    c.pop(Xbyak::Reg64(value.getIdx()));
+    c.lea(rsp, ptr[rsp + 128]);
+}
+#endif
+
 using PatchFilter = bool (*)(const ZydisDecodedOperand*);
 using InstructionGenerator = void (*)(void*, const ZydisDecodedInstruction&,
                                       const ZydisDecodedOperand*, Xbyak::CodeGenerator&);
@@ -538,6 +709,16 @@ static const bool need_tcb_trampoline = false;
 #endif
 
 static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches = {
+#ifdef GOW3_IVY_BRIDGE
+    {ZYDIS_MNEMONIC_ANDN, {{PatchIvyBridgeInstruction, GenerateIvyBridgeInstruction, true}}},
+    {ZYDIS_MNEMONIC_BEXTR, {{PatchIvyBridgeInstruction, GenerateIvyBridgeInstruction, true}}},
+    {ZYDIS_MNEMONIC_BLSI, {{PatchIvyBridgeInstruction, GenerateIvyBridgeInstruction, true}}},
+    {ZYDIS_MNEMONIC_BLSMSK, {{PatchIvyBridgeInstruction, GenerateIvyBridgeInstruction, true}}},
+    {ZYDIS_MNEMONIC_BLSR, {{PatchIvyBridgeInstruction, GenerateIvyBridgeInstruction, true}}},
+    {ZYDIS_MNEMONIC_LZCNT, {{PatchIvyBridgeInstruction, GenerateIvyBridgeInstruction, true}}},
+    {ZYDIS_MNEMONIC_TZCNT, {{PatchIvyBridgeInstruction, GenerateIvyBridgeInstruction, true}}},
+    {ZYDIS_MNEMONIC_MOVBE, {{PatchIvyBridgeInstruction, GenerateIvyBridgeInstruction, true}}},
+#endif
     // SSE4a
     {ZYDIS_MNEMONIC_EXTRQ, {{FilterNoSSE4a, GenerateEXTRQ, true}}},
     {ZYDIS_MNEMONIC_INSERTQ, {{FilterNoSSE4a, GenerateINSERTQ, true}}},
@@ -567,6 +748,9 @@ struct PatchModule {
 
     /// Tracker for patched code locations.
     std::set<u8*> patched;
+#ifdef GOW3_IVY_BRIDGE
+    std::map<const u8*, const u8*> ivy_bridge_traps;
+#endif
 
     /// Code generator for patching the module.
     Xbyak::CodeGenerator patch_gen;
@@ -1594,6 +1778,53 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
     return patch != patches->second.end() ? &*patch : nullptr;
 }
 
+#ifdef GOW3_IVY_BRIDGE
+static const u8* GetIvyBridgeTrampoline(PatchModule& module, const DecodedCodeInstruction& decoded,
+                                       const PatchInfo* patch) {
+    const auto* site = reinterpret_cast<const u8*>(decoded.address);
+    if (const auto it = module.ivy_bridge_traps.find(site); it != module.ivy_bridge_traps.end()) {
+        return it->second;
+    }
+    if (patch == nullptr || patch->generator != GenerateIvyBridgeInstruction ||
+        module.trampoline_exhausted) {
+        return nullptr;
+    }
+    auto& c = module.trampoline_gen;
+    const auto offset = c.getSize();
+    try {
+        patch->generator(reinterpret_cast<void*>(decoded.address), decoded.instruction,
+                         decoded.operands.data(), c);
+        c.jmp(site + decoded.instruction.length);
+    } catch (const Xbyak::Error& error) {
+        c.setSize(offset);
+        if (HandleTrampolineError(&module, error)) return nullptr;
+        throw;
+    }
+    const auto* trampoline = c.getCode() + offset;
+    module.ivy_bridge_traps.emplace(site, trampoline);
+    return trampoline;
+}
+
+static bool RedirectIvyBridgeTrap(void* context, bool decode) {
+    const auto* site = static_cast<const u8*>(Common::GetRip(context));
+    auto* module = GetContainingModule(site);
+    if (!module) return false;
+    std::unique_lock lock{module->mutex};
+    const u8* trampoline{};
+    if (const auto it = module->ivy_bridge_traps.find(site); it != module->ivy_bridge_traps.end()) {
+        trampoline = it->second;
+    } else if (decode) {
+        const auto decoded = DecodeCodeInstruction(reinterpret_cast<uintptr_t>(site),
+                                                   reinterpret_cast<uintptr_t>(module->end));
+        trampoline = GetIvyBridgeTrampoline(*module, decoded, FindMatchingPatch(decoded));
+    }
+    if (!trampoline) return false;
+    static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rip =
+        reinterpret_cast<uintptr_t>(trampoline);
+    return true;
+}
+#endif
+
 } // namespace
 
 using AddressRanges = std::vector<std::pair<uintptr_t, uintptr_t>>;
@@ -1893,6 +2124,17 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
         const auto record_unsupported = [&](uintptr_t site) {
             const auto& rewrite = rewrite_sites.at(site);
             if (rewrite.cpu_patch != nullptr) {
+#ifdef GOW3_IVY_BRIDGE
+                const auto& decoded = function.instructions.at(site);
+                if (GetIvyBridgeTrampoline(*module, decoded, rewrite.cpu_patch)) {
+                    // LZCNT and TZCNT would otherwise execute as BSR and BSF on Ivy Bridge.
+                    auto* code = reinterpret_cast<u8*>(site);
+                    code[0] = 0x0f;
+                    code[1] = 0x0b; // UD2
+                    ++result.patched_cpu_patch_instruction_count;
+                    return;
+                }
+#endif
                 ++result.unsupported_cpu_patch_instruction_count;
             }
             if (rewrite.protect_red_zone) {
@@ -2220,6 +2462,12 @@ static bool PatchesAccessViolationHandler(void* context, void* /* fault_address 
 
 static bool PatchesIllegalInstructionHandler(void* context) {
     void* code_address = Common::GetRip(context);
+#ifdef GOW3_IVY_BRIDGE
+    if (static_cast<const u8*>(code_address)[0] == 0x0f &&
+        static_cast<const u8*>(code_address)[1] == 0x0b && RedirectIvyBridgeTrap(context, false)) {
+        return true;
+    }
+#endif
 #if defined(_WIN32)
     // Windows static guest red-zone protection
     const bool inspect_short_cpu_patch =
@@ -2235,6 +2483,9 @@ static bool PatchesIllegalInstructionHandler(void* context) {
         return TryExecuteIllegalInstruction(context, code_address);
     } else {
         if (!TryPatchJit(code_address)) {
+#ifdef GOW3_IVY_BRIDGE
+            if (RedirectIvyBridgeTrap(context, true)) return true;
+#endif
             ZydisDecodedInstruction instruction;
             ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
             const auto status =
