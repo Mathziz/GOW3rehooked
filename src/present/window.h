@@ -18,6 +18,7 @@ enum class StartupError { NoGame, Packaged, WrongVersion };
 bool RequestSettingsRestart(const Config& config);
 // Restarts the game with JIT shaders for that one run, the saved settings left as they are (the AOT build was skipped).
 bool RequestJitRestart();
+void NotifyMainMenuReady();
 // True when this process is such a restart; the request is consumed, so later restarts are AOT again.
 bool TakeJitOnce();
 [[noreturn]] void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::path& game_directory);

@@ -68,6 +68,11 @@ fs::path SaveInstance::GetParamSFOPath(const fs::path& dir_path) {
     return dir_path / sce_sys / "param.sfo";
 }
 
+bool SaveInstance::IsSearchableSlot(const fs::path& path, std::error_code& error) {
+    return !path.filename().native().starts_with(L"sce_") && fs::is_directory(path, error) &&
+           fs::is_regular_file(GetParamSFOPath(path), error);
+}
+
 void SaveInstance::SetupDefaultParamSFO(PSF& param_sfo, std::string dir_name,
                                         std::string game_serial) {
     int locale = EmulatorSettings.GetConsoleLanguage();

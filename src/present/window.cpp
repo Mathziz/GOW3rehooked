@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 #include <stb_image.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <format>
 #include <fstream>
@@ -21,6 +22,7 @@
 #include "main/host.h"
 #include "present/presenter.h"
 #include "present/prompt.h"
+#include "present/save_import_ui.h"
 #include "present/splash.h"
 #include "gpu/gpu_thread.h"
 #include "debug/dump_archive.h"
@@ -37,7 +39,7 @@ Frontend::WindowSDL* g_window; // read by input/input_mouse.cpp
 namespace Gow3::Window {
 namespace {
 SDL_Window* window;
-Uint32 restart_event;
+Uint32 restart_event, main_menu_event;
 Frontend::WindowSDL input_window;
 
 struct Handle {
@@ -59,7 +61,7 @@ std::wstring QuotePath(const std::filesystem::path& path) {
 constexpr const wchar_t* JitOnceVariable = L"GOW3_JIT_ONCE";
 
 // `jit_once`: the replacement runs with JIT shaders while the saved settings (AOT) stay as they are.
-void RestartWithSettings(const std::filesystem::path& game, const Config& config, bool jit_once) {
+void Restart(const std::filesystem::path& game, const Config* config, bool jit_once) {
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
     Handle parent, cancel, ready;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &parent.value, SYNCHRONIZE, TRUE, 0) ||
@@ -99,10 +101,10 @@ void RestartWithSettings(const std::filesystem::path& game, const Config& config
         throw std::runtime_error("Replacement game could not prepare for restart");
     }
     try {
-        if (!jit_once) {
+        if (config && !jit_once) {
             const auto config_path = game / PortDir::Root / PortDir::Settings / "config.cfg";
-            const bool mechanism_changed = LoadConfig(config_path).shader_mechanism != config.shader_mechanism;
-            SaveMenuConfig(config_path, config);
+            const bool mechanism_changed = LoadConfig(config_path).shader_mechanism != config->shader_mechanism;
+            SaveMenuConfig(config_path, *config);
             if (mechanism_changed) ResetAotCooldown();
         }
     } catch (...) {
@@ -218,8 +220,9 @@ void SetDisplayMode(const Config& config) {
 void Open(const Config& config, bool splash) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) throw std::runtime_error(std::string("SDL_Init: ") + SDL_GetError());
     // The input and ImGui code use SDL_EVENT_USER through SDL_EVENT_USER + 15 directly.
-    if (!(restart_event = SDL_RegisterEvents(17))) throw std::runtime_error(std::string("SDL_RegisterEvents: ") + SDL_GetError());
+    if (!(restart_event = SDL_RegisterEvents(18))) throw std::runtime_error(std::string("SDL_RegisterEvents: ") + SDL_GetError());
     restart_event += 16;
+    main_menu_event = restart_event + 1;
     // The window starts at the game resolution, scaled down to fit the desktop work area when windowed.
     const auto& resolution = Resolutions[config.resolution];
     int width = resolution.width, height = resolution.height;
@@ -309,6 +312,14 @@ bool RequestRestart(const Config& config, bool jit_once) {
 bool RequestSettingsRestart(const Config& config) { return RequestRestart(config, false); }
 bool RequestJitRestart() { return RequestRestart(Config{}, true); }
 
+void NotifyMainMenuReady() {
+    static std::atomic_flag queued;
+    if (queued.test_and_set()) return;
+    SDL_Event event{};
+    event.type = main_menu_event;
+    if (!SDL_PushEvent(&event)) queued.clear();
+}
+
 bool TakeJitOnce() {
     const bool set = GetEnvironmentVariableW(JitOnceVariable, nullptr, 0) != 0;
     if (set) SetEnvironmentVariableW(JitOnceVariable, nullptr);  // the next restart is AOT again
@@ -329,14 +340,24 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
     Splash::Priority priority;  // the hold-to-skip input and the splash's frames keep up with the shader build
     for (SDL_Event event;;) {
         priority.Update();
+        if (SaveImportUi::Update()) {
+            try {
+                Restart(game_directory, nullptr, false);
+                break;
+            } catch (const std::exception& error) {
+                Log(std::string("Save import restart failed: ") + error.what());
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", error.what(), window);
+                SaveImportUi::RestartFailed();
+            }
+        }
         const bool mouse_inside = SDL_GetMouseFocus() == window;
         const Uint64 elapsed = SDL_GetTicks() - mouse_time;
-        if (mouse_inside && !mouse_hidden && elapsed >= 3000) {
+        if (!SaveImportUi::Active() && mouse_inside && !mouse_hidden && elapsed >= 3000) {
             ImGui::Core::SetMouseCursorHidden(mouse_hidden = true);
         } else if (!mouse_inside && mouse_hidden) {
             ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
         }
-        int timeout = mouse_inside && !mouse_hidden ? int(3000 - elapsed) : -1;
+        int timeout = !SaveImportUi::Active() && mouse_inside && !mouse_hidden ? int(3000 - elapsed) : -1;
         if (ImGui::Core::MustKeepDrawing()) timeout = timeout < 0 ? 16 : std::min(timeout, 16);
         if (!SDL_WaitEventTimeout(&event, timeout)) {
             if (ImGui::Core::MustKeepDrawing()) ImGui::Core::NewFrame();
@@ -348,10 +369,15 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
             mouse_time = SDL_GetTicks();
             if (mouse_hidden) ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
         }
+        if (event.type == main_menu_event) {
+            SaveImportUi::Offer(window, game_directory);
+            if (SaveImportUi::Active() && mouse_hidden) ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
+            continue;
+        }
         if (event.type == restart_event) {
             std::unique_ptr<Config> config(static_cast<Config*>(event.user.data1));
             try {
-                RestartWithSettings(game_directory, *config, event.user.data2 != nullptr);
+                Restart(game_directory, config.get(), event.user.data2 != nullptr);
                 break;
             } catch (const std::exception& error) {
                 Log(std::string("Settings restart failed: ") + error.what());
@@ -362,7 +388,8 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
         const bool captured = ImGui::Core::ProcessEvent(event);
         if (ImGui::Core::MustKeepDrawing()) ImGui::Core::NewFrame();
         if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED || event.type == SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED) Presenter::UpdateDisplay();
-        if (captured) continue;
+        if (captured || (SaveImportUi::Active() && (event.type == SDL_EVENT_KEY_DOWN ||
+                         event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN))) continue;
         switch (event.type) {
         case SDL_EVENT_QUIT: case SDL_EVENT_QUIT_DIALOG: break;
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: UpdateWindowSize(); continue;
@@ -395,6 +422,7 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
         break;
     }
     // Guest threads cannot be unwound; the process ends with the window.
+    SaveImportUi::WaitForCopy();
     Libraries::SaveData::Backup::StopThread();
     StopDiagnosticHooks();
     if (S4::enabled) S4::Stop();

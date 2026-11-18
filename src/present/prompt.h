@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// The full-screen message shown before the game starts (a missing game, a crashed last run): a title, a question and up to two
-// notes, answered with Cross (Enter, click) or Circle (Escape, click). Without `choice` there is a single OK button.
 #pragma once
+#include <array>
+#include <string>
 
 namespace Gow3::Prompt {
-enum class Answer { Pending, Yes, No };
+enum class Answer { Pending, Yes, No, Back };
 struct Content {
-    const char *title, *question, *notes[2];  // string literals; an empty note is skipped
-    bool choice;                              // Yes / No instead of OK
+    std::string title, question;
+    std::array<std::string, 2> notes;
+    bool choice{}; // Yes/No instead of OK
+    std::array<std::string, 3> actions; // Custom Cross, Square and Circle labels
+    bool status{}; // No buttons
+    bool step_layout{};
 };
-void Show(const Content& content);
+void Show(Content content);
+void Hide();
 Answer Result();
 } // namespace Gow3::Prompt

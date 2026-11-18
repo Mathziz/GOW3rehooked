@@ -3,18 +3,21 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include "ui/gow3_ui_theme.h"
 #include "ui/imgui_layer.h"
 
 namespace Gow3::Prompt {
 namespace {
-std::atomic<Answer> answer{Answer::Pending};
+Answer answer{Answer::Pending};
 
 class Layer final : public ImGui::Layer {
 public:
-    explicit Layer(const Content& content) : content(content) {}
+    void SetContent(Content next) {
+        content = std::move(next);
+        answer = Answer::Pending;
+        armed = false;
+    }
 
     void Draw() override {
         using namespace ImGui;
@@ -25,52 +28,78 @@ public:
         auto* body = UI::g_font_body ? UI::g_font_body : font;
         UI::DrawBasaltBackground(list, {0, 0}, size);
 
-        const auto centered = [&](ImFont* f, float px, float y, ImU32 color, const char* text, bool shadow = false) {
-            const float x = (size.x - f->CalcTextSizeA(px, FLT_MAX, 0.0f, text).x) * 0.5f;
-            if (shadow) list->AddText(f, px, {x + 1.0f, y + 1.5f}, IM_COL32(0, 0, 0, 220), text);
-            list->AddText(f, px, {x, y}, color, text);
+        const auto centered = [&](ImFont* f, float px, float y, ImU32 color, const std::string& text, bool shadow = false) {
+            const float wrap = std::max(1.0f, size.x * 0.84f);
+            const ImVec2 extent = f->CalcTextSizeA(px, FLT_MAX, wrap, text.c_str());
+            const float x = (size.x - extent.x) * 0.5f;
+            if (shadow) list->AddText(f, px, {x + 1.0f, y + 1.5f}, IM_COL32(0, 0, 0, 220), text.c_str(), nullptr, wrap);
+            list->AddText(f, px, {x, y}, color, text.c_str(), nullptr, wrap);
+            return extent.y;
         };
         const float title_size = std::max(18.0f, 2.0f * cqw), ask_size = std::max(15.0f, 1.45f * cqw);
-        const float note_size = std::max(13.0f, 1.05f * cqw), radius = std::max(13.0f, 1.2f * cqw), label_size = std::max(15.0f, 1.3f * cqw);
+        const float note_size = std::max(13.0f, 1.05f * cqw);
+        const float button_size = std::max(15.0f, 1.3f * cqw);
+        const float button_scale = content.step_layout ? std::min(1.0f, size.x / (40.0f * button_size)) : 1.0f;
+        const float label_size = button_size * button_scale, radius = std::max(13.0f, 1.2f * cqw) * button_scale;
         const float omega_r = std::max(16.0f, 2.0f * cqw);
         float y = size.y * 0.5f - 12.0f * cqw;
         const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(GetTime()) * 2.1f);
         UI::DrawOmegaSymbol(list, {size.x * 0.5f, y + omega_r}, omega_r, UI::Theme::GoldBronze, pulse, true);
         y += omega_r * 2.0f + 2.0f * cqw;
-        centered(font, title_size, y, UI::Theme::GoldLight, content.title, true);
-        y += title_size + 2.2f * cqw;
-        centered(font, ask_size, y, UI::Theme::TextMain, content.question);
-        y += ask_size + 1.8f * cqw;
-        for (const char* note : content.notes) {
-            if (!*note) continue;
-            centered(body, note_size, y, UI::Theme::TextMuted, note);
-            y += note_size * 1.5f;
+        y += centered(font, title_size, y, UI::Theme::GoldLight, content.title, true) + 2.2f * cqw;
+        y += centered(content.step_layout ? body : font, ask_size, y, UI::Theme::TextMain, content.question) + 1.8f * cqw;
+        const float notes_top = y;
+        for (const auto& note : content.notes) {
+            if (note.empty()) continue;
+            y += centered(body, note_size, y, UI::Theme::TextMuted, note) + 0.5f * note_size;
         }
-        y += 4.0f * cqw - note_size * 0.5f;
+        if (content.step_layout) y = std::max(y, notes_top + content.notes.size() * 1.5f * note_size);
+        y += (content.step_layout ? 2.5f : 4.0f) * cqw - note_size * 0.5f;
+        if (content.status) return;
 
         struct Button { UI::PS4Symbol symbol; const char* label; Answer result; ImGuiKey pad, key; };
-        const Button choices[]{{UI::PS4Symbol::Cross, "YES", Answer::Yes, ImGuiKey_GamepadFaceDown, ImGuiKey_Enter},
-                               {UI::PS4Symbol::Circle, "NO", Answer::No, ImGuiKey_GamepadFaceRight, ImGuiKey_Escape}};
-        const Button ok[]{{UI::PS4Symbol::Cross, "OK", Answer::Yes, ImGuiKey_GamepadFaceDown, ImGuiKey_Enter}};
-        const Button* buttons = content.choice ? choices : ok;
-        const int count = content.choice ? 2 : 1;
-        const float gap = 6.0f * cqw;
-        float widths[2], total = gap * (count - 1);
-        for (int i = 0; i < count; ++i) total += widths[i] = UI::HintWidth(buttons[i].symbol, radius, buttons[i].label, font, label_size);
+        const bool custom = !content.actions[0].empty();
+        const Button buttons[]{
+            {UI::PS4Symbol::Cross, custom ? content.actions[0].c_str() : content.choice ? "YES" : "OK",
+             Answer::Yes, ImGuiKey_GamepadFaceDown, ImGuiKey_Enter},
+            {UI::PS4Symbol::Square, content.actions[1].c_str(), Answer::No, ImGuiKey_GamepadFaceLeft, ImGuiKey_Delete},
+            {UI::PS4Symbol::Circle, custom ? content.actions[2].c_str() : content.choice ? "NO" : "",
+             custom ? Answer::Back : Answer::No, ImGuiKey_GamepadFaceRight, ImGuiKey_Escape},
+        };
+        const float gap = 6.0f * cqw, column = 9.0f * label_size;
+        float widths[3]{}, total = -gap;
+        for (size_t i = 0; i < std::size(buttons); ++i) {
+            if (!*buttons[i].label) continue;
+            widths[i] = UI::HintWidth(buttons[i].symbol, radius, buttons[i].label, font, label_size);
+            total += widths[i] + gap;
+        }
         float x = (size.x - total) * 0.5f;
         Answer chosen = Answer::Pending;
-        for (int i = 0; i < count; ++i) {
+        for (size_t i = 0; i < std::size(buttons); ++i) {
+            if (!widths[i]) continue;
             const auto& b = buttons[i];
-            UI::DrawHint(list, x, y + radius, radius, b.symbol, b.label, font, label_size);
-            const ImRect rect{{x, y}, {x + widths[i], y + radius * 2.0f}};
+            ImRect rect{{x, y}, {x + widths[i], y + radius * 2.0f}};
+            if (content.step_layout) {
+                // Step pages center each key in a fixed column with its label below, so nothing moves between pages.
+                const float center = size.x * 0.5f + (static_cast<float>(i) - 1.0f) * column;
+                const float key = UI::HintGlyphWidth(b.symbol, radius, font);
+                const float text = font->CalcTextSizeA(label_size, FLT_MAX, 0.0f, b.label).x;
+                const float label_y = y + radius * 2.0f + 0.35f * label_size, half = std::max(key, text) * 0.5f;
+                UI::DrawHint(list, center - key * 0.5f, y + radius, radius, b.symbol, nullptr, font, label_size);
+                list->AddText(font, label_size, {center - text * 0.5f, label_y}, UI::Theme::GoldLight, b.label);
+                rect = {{center - half, y}, {center + half, label_y + label_size}};
+            } else {
+                UI::DrawHint(list, x, y + radius, radius, b.symbol, b.label, font, label_size);
+            }
             if (armed && (IsKeyPressed(b.pad, false) || IsKeyPressed(b.key, false) || (IsMouseClicked(ImGuiMouseButton_Left) && rect.Contains(GetIO().MousePos))))
                 chosen = b.result;
             x += widths[i] + gap;
         }
         // A message with nothing to choose is closed by either button.
-        if (!content.choice && armed && (IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || IsKeyPressed(ImGuiKey_Escape, false))) chosen = Answer::Yes;
+        if (!custom && !content.choice && armed &&
+            (IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || IsKeyPressed(ImGuiKey_Escape, false))) chosen = Answer::Yes;
         // The press that was held when the window opened must not answer it.
-        if (!armed) armed = !IsKeyDown(ImGuiKey_GamepadFaceDown) && !IsKeyDown(ImGuiKey_GamepadFaceRight) && !IsKeyDown(ImGuiKey_Enter) && !IsKeyDown(ImGuiKey_Escape);
+        if (!armed) armed = std::ranges::none_of(buttons, [](const Button& b) { return IsKeyDown(b.pad) || IsKeyDown(b.key); });
         if (chosen != Answer::Pending) answer = chosen;
     }
 
@@ -78,11 +107,18 @@ private:
     Content content;
     bool armed{};
 };
+Layer layer;
+bool visible{};
 } // namespace
 
-void Show(const Content& content) {
-    static Layer layer(content);
-    ImGui::Layer::AddLayer(&layer);
+void Show(Content content) {
+    layer.SetContent(std::move(content));
+    if (!visible) ImGui::Layer::AddLayer(&layer);
+    visible = true;
+}
+void Hide() {
+    if (visible) ImGui::Layer::RemoveLayer(&layer);
+    visible = false;
 }
 Answer Result() { return answer; }
 } // namespace Gow3::Prompt

@@ -63,7 +63,7 @@ target_compile_options(gow3 PRIVATE /Gy /Gw /GS- /clang:-Wno-unknown-warning-opt
 target_link_libraries(gow3 PRIVATE fmt::fmt Zydis xbyak
     magic_enum::magic_enum SDL3::SDL3 LibAtrac9
     ffmpeg Dear_ImGui Vulkan::Vulkan xxhash zstd runtime_headers ${clang_builtins_library} OneCore ws2_32 Psapi
-    Synchronization dbghelp bcrypt shell32 user32)
+    Synchronization dbghelp bcrypt shell32 user32 windowsapp)
 set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
 set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL Release)
 find_package(unofficial-shaderc CONFIG REQUIRED)

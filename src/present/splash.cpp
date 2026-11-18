@@ -330,6 +330,7 @@ void Reveal() { start_menu = true; }
 void Dismiss() {
     Reveal();
     MarkLaunchReady();
+    Window::NotifyMainMenuReady();
 }
 
 bool IsStartMenuMusic(const char* path) { return std::strstr(path, "MENU_LOOP") != nullptr; }

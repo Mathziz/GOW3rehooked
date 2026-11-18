@@ -31,11 +31,11 @@ static std::atomic<bool> continue_requested;
 
 namespace fs = std::filesystem;
 
-static std::optional<fs::file_time_type> ContinueSaveTime(const fs::path& path) {
+std::optional<fs::file_time_type> ContinueSaveTime(const fs::path& path) {
     std::error_code error;
     const auto data = path / "SAVEDATA";
     if (_wcsicmp(path.filename().c_str(), L"USERDATA") == 0 ||
-        !fs::is_regular_file(data, error) || !fs::is_regular_file(path / "sce_sys" / "param.sfo", error) ||
+        !fs::is_regular_file(data, error) || !SaveInstance::IsSearchableSlot(path, error) ||
         fs::exists(path / "sce_sys" / "corrupted", error) || error) return std::nullopt;
     // Even a read-only load can rewrite param.sfo. Use the gameplay data's write time.
     const auto time = fs::last_write_time(data, error);

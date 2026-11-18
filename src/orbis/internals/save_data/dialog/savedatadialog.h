@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include <filesystem>
+#include <optional>
 
 #include "orbis/common/types.h"
 #include "orbis/internals/system/commondialog.h"
@@ -17,6 +19,7 @@ struct OrbisSaveDataDialogResult;
 enum class OrbisSaveDataDialogProgressBarTarget : u32;
 
 bool HasContinueSave();
+std::optional<std::filesystem::file_time_type> ContinueSaveTime(const std::filesystem::path& path);
 void RequestContinue(bool requested);
 
 CommonDialog::Error PS4_SYSV_ABI sceSaveDataDialogClose();

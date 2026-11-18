@@ -216,7 +216,7 @@ SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
     }
 }
 
-// Reads one save of the dialog's user and title into the list; false when it has no param.sfo.
+// Reads one save of the dialog's user and title into the list.
 bool SaveDialogState::LoadItem(std::string_view dir_name) {
     auto dir_path = SaveInstance::MakeDirSavePath(user_id, title_id, dir_name);
 
@@ -226,7 +226,7 @@ bool SaveDialogState::LoadItem(std::string_view dir_name) {
     }
 
     PSF param_sfo;
-    param_sfo.Open(param_sfo_path);
+    if (!param_sfo.Open(param_sfo_path)) return false;
 
     auto last_write = std::chrono::system_clock::to_time_t(param_sfo.GetLastWrite());
     std::string date_str = fmt::format("{:%d %b %Y · %I:%M %p}", *std::localtime(&last_write));

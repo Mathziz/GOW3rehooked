@@ -803,12 +803,9 @@ Error PS4_SYSV_ABI sceSaveDataDirNameSearch(const OrbisSaveDataDirNameSearchCond
     std::vector<std::string> dir_list;
 
     for (const auto& path : fs::directory_iterator{save_path}) {
-        auto dir_name = path.path().filename().string();
-        // skip non-directories, sce_* and directories without param.sfo
-        if (fs::is_directory(path) && !dir_name.starts_with("sce_") &&
-            fs::exists(SaveInstance::GetParamSFOPath(path))) {
-            dir_list.push_back(dir_name);
-        }
+        std::error_code error;
+        if (SaveInstance::IsSearchableSlot(path.path(), error))
+            dir_list.push_back(path.path().filename().string());
     }
     if (cond->dirName != nullptr) {
         // Filter names
@@ -828,9 +825,11 @@ Error PS4_SYSV_ABI sceSaveDataDirNameSearch(const OrbisSaveDataDirNameSearchCond
         const auto dir_path = SaveInstance::MakeDirSavePath(cond->userId, title_id, dir_name);
         const auto sfo_path = SaveInstance::GetParamSFOPath(dir_path);
         PSF sfo;
-        if (!sfo.Open(sfo_path)) {
+        auto blocks = std::optional<std::span<const u8>>{};
+        if (!sfo.Open(sfo_path) ||
+            ((blocks = sfo.GetBinary(SaveParams::SAVEDATA_BLOCKS)) && blocks->size() != sizeof(u64))) {
             LOG_ERROR(Lib_SaveData, "Failed to read SFO: {}", fmt::UTF(sfo_path.u8string()));
-            ASSERT_MSG(false, "Failed to read SFO");
+            continue;
         }
 
         size_t size = Common::FS::GetDirectorySize(dir_path);
@@ -840,6 +839,7 @@ Error PS4_SYSV_ABI sceSaveDataDirNameSearch(const OrbisSaveDataDirNameSearchCond
         map_free_size.emplace(dir_name, total - size / OrbisSaveDataBlockSize);
         map_max_blocks.emplace(dir_name, total);
     }
+    std::erase_if(dir_list, [&](const auto& name) { return !map_dir_sfo.contains(name); });
 
 #define PROJ(x) [&](const auto& v) { return x; }
     switch (cond->key) {
