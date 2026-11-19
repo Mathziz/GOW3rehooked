@@ -2,6 +2,10 @@
 // The Vulkan instance, window surface and device shared by the renderer and the presenter, and the renderer's own device.
 #include "gpu/device.h"
 #include "gpu/renderer_impl.h"
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 #ifndef GOW3_OFFLINE  // the window's instance needs SDL and the emulator's runtime (framecap builds without them)
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -50,15 +54,17 @@ void Initialize(SDL_Window* window) {
         }
     }
     if (validate || temp_fault || DebugAuto("GOW3_TEMP_LABELS")) instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);  // labels
+    u32 count = 0;
+#ifdef _WIN32
     auto has = [](std::span<const VkExtensionProperties> list, const char* name) {
         return std::ranges::any_of(list, [&](const auto& e) { return !std::strcmp(e.extensionName, name); });
     };
-    u32 count = 0;
     vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> instance_available(count);
     vkEnumerateInstanceExtensionProperties(nullptr, &count, instance_available.data());
     const bool caps2 = has(instance_available, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);  // needed by full_screen_exclusive
     if (caps2) instance_extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+#endif
     const VkInstanceCreateInfo instance_info{.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
         .enabledLayerCount = validate ? 1u : 0u, .ppEnabledLayerNames = &layer,
         .enabledExtensionCount = u32(instance_extensions.size()), .ppEnabledExtensionNames = instance_extensions.data()};
@@ -96,35 +102,64 @@ void Initialize(SDL_Window* window) {
     if (!SDL_Vulkan_CreateSurface(window, context.instance, nullptr, &context.surface))
         throw std::runtime_error(std::string("SDL_Vulkan_CreateSurface: ") + SDL_GetError());
 
-    // First device with a queue the renderer can use (graphics, compute, sparse binding) that presents to the window, a
-    // discrete GPU preferred.
+    // Prefer a discrete GPU with a queue the renderer can use that presents to the window.
     vkEnumeratePhysicalDevices(context.instance, &count, nullptr);
     std::vector<VkPhysicalDevice> devices(count);
     vkEnumeratePhysicalDevices(context.instance, &count, devices.data());
     int best = -1;
+#ifdef __linux__
+    constexpr u32 amd_vendor_id = 0x1002;
+    bool best_radeon = false, best_radv = false, missing_radeon_maintenance5 = false;
+#endif
     for (auto candidate : devices) {
-        const auto properties = Gpu::QueueFamilies(candidate);
         VkPhysicalDeviceProperties info{};
         vkGetPhysicalDeviceProperties(candidate, &info);
+        const int score = info.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 1 : 0;
+        if (info.apiVersion < VK_API_VERSION_1_3 || score < best) continue;
+
+        const auto properties = Gpu::QueueFamilies(candidate);
         for (u32 i = 0; i < properties.size(); ++i) {
+            if (!Gpu::QueueFamilySuitable(properties[i].queueFlags)) continue;
             VkBool32 presents{};
             vkGetPhysicalDeviceSurfaceSupportKHR(candidate, i, context.surface, &presents);
-            const int score = info.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 1 : 0;
-            if (Gpu::QueueFamilySuitable(properties[i].queueFlags) && presents && info.apiVersion >= VK_API_VERSION_1_3 && score > best) {
-                best = score; context.physical = candidate; context.family = i;
+            if (!presents) continue;
+
+            bool preferred = score > best;
+#ifdef __linux__
+            const bool radeon = info.vendorID == amd_vendor_id;
+            if (radeon && !Gpu::SupportsMaintenance5(candidate)) {
+                missing_radeon_maintenance5 = true;
                 break;
             }
+            bool radv = false;
+            if (radeon) {
+                VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+                VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+                vkGetPhysicalDeviceProperties2(candidate, &properties2);
+                radv = driver.driverID == VK_DRIVER_ID_MESA_RADV;
+                preferred = preferred || (radv && best_radeon && !best_radv);
+            }
+            if (preferred) best_radeon = radeon, best_radv = radv;
+#endif
+            if (preferred) best = score, context.physical = candidate, context.family = i;
+            break;
         }
     }
+#ifdef __linux__
+    if (best < 0 && missing_radeon_maintenance5)
+        throw std::runtime_error("Radeon requires VK_KHR_maintenance5. Install or update the Mesa Vulkan driver (RADV).");
+#endif
     if (best < 0) throw std::runtime_error("No Vulkan 1.3 device presents to the window");
 
     bool unified_layouts = false;
     std::vector<const char*> device_extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+#ifdef _WIN32
     vkEnumerateDeviceExtensionProperties(context.physical, nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> device_available(count);
     vkEnumerateDeviceExtensionProperties(context.physical, nullptr, &count, device_available.data());
     context.full_screen_exclusive = caps2 && has(device_available, "VK_EXT_full_screen_exclusive");
     if (context.full_screen_exclusive) device_extensions.push_back("VK_EXT_full_screen_exclusive");
+#endif
     Check(Gpu::CreateDevice(context.physical, context.family, device_extensions, &context.device, &context.present_wait, &context.reflex, &unified_layouts), "Create Vulkan device");
     Log(std::format("Vulkan Unified Image Layouts: {}", unified_layouts ? "supported and enabled" : "not supported (disabled)"));
     vkGetDeviceQueue(context.device, context.family, 0, &context.queue);
@@ -349,6 +384,7 @@ void TempAddressBinding(const VkDebugUtilsMessengerCallbackDataEXT* d) {
             const VkDebugUtilsObjectNameInfoEXT* o = d->objectCount ? d->pObjects : nullptr;
             std::string who;
             if (b->size >= (8u << 20)) {
+#ifdef _WIN32
                 PWSTR n = nullptr;
                 if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &n)) && n)
                     for (const wchar_t* c = n; *c; ++c) who += (char)*c;
@@ -360,12 +396,24 @@ void TempAddressBinding(const VkDebugUtilsMessengerCallbackDataEXT* d) {
                     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)f[i], &m)) GetModuleFileNameA(m, path, MAX_PATH);
                     who += std::format(" {}+{:#x}", std::filesystem::path(path).filename().string(), (u64)f[i] - (u64)m);
                 }
+#else
+                who = Common::GetCurrentThreadNameView();
+                void* frames[40];
+                for (int i = 1, count = backtrace(frames, std::size(frames)); i < count; ++i) {
+                    Dl_info info{};
+                    if (dladdr(frames[i], &info) && info.dli_fname)
+                        who += std::format(" {}+{:#x}", std::filesystem::path(info.dli_fname).filename().string(),
+                                           reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(info.dli_fbase));
+                    else
+                        who += std::format(" ?+{:#x}", reinterpret_cast<u64>(frames[i]));
+                }
+#endif
             }
             std::scoped_lock lock(temp_bind_lock);
             temp_binds.push_back({b->baseAddress, b->size, o ? o->objectHandle : 0, o ? (u32)o->objectType : 0, (u32)b->flags,
                                   temp_bind_frame.load(std::memory_order_relaxed), b->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT,
                                   temp_call ? temp_call : "-", std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000,
-                                  (u32)GetCurrentThreadId(), TempBindMs(), std::move(who)});
+                                  (u32)Gow3::ThreadId(), TempBindMs(), std::move(who)});
         }
 }
 
@@ -498,7 +546,7 @@ void Renderer::Impl::TempLost(const char* where, VkResult r) {  // TEMP fault
                 if (b)
                     note(std::format("nearest {}: #{} at frame {} type {} [{:#x}, {:#x}) handle {:#x}: {}", b == below ? "below" : "above", b - temp_binds.data(), b->frame, b->type,
                                      b->base, b->base + b->size, b->handle, name(b->handle)));
-            note(std::format("{} bindings recorded; this (GPU) thread {} tid {}", temp_binds.size(), std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000, GetCurrentThreadId()));
+            note(std::format("{} bindings recorded; this (GPU) thread {} tid {}", temp_binds.size(), std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000, Gow3::ThreadId()));
         }
         for (auto& v : vendor) note(std::format("vendor '{}' code {:#x} data {:#x}", v.description, v.vendorFaultCode, v.vendorFaultData));
     }

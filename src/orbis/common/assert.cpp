@@ -9,6 +9,8 @@
 #include <string>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cstdio>
 #endif
 
 #if defined(ARCH_X86_64)
@@ -44,6 +46,8 @@ bool ShowFatalError(const char* message) {
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), static_cast<int>(wide.size()));
     MessageBoxW(nullptr, wide.c_str(), L"God of War III",
                 MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND);
+#else
+    std::fprintf(stderr, "Fatal error: %s\n", message);
 #endif
     return true;
 }

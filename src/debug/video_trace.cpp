@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <format>
 #include <memory>
-#include <windows.h>
 #include "debug/dump_archive.h"
 #include "gpu/gpu_thread.h"
 #include "main/host.h"
@@ -77,7 +76,7 @@ void TraceAudioFlow(u32 kind, u64 port, s64 value) {
     using namespace VideoTrace;
     const u64 i = flow_count.fetch_add(1, std::memory_order_relaxed);
     auto& slot = flow[i % flow_capacity];
-    slot.event = {DiagClock(), port, value, kind, GetCurrentThreadId()};
+    slot.event = {DiagClock(), port, value, kind, Gow3::ThreadId()};
     slot.seq.store(i + 1, std::memory_order_release);
 }
 void TraceVideoReadback(u64 address, u64 size, u64 frame, bool skipped) {

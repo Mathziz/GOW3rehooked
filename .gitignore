@@ -5,10 +5,12 @@
 !/patches/
 !/src/
 !/tools/
+!/.gitattributes
 !/.gitignore
 !/CMakeLists.txt
 !/README.md
 !/build-fast.ps1
+!/build-fast.sh
 !/debug.ps1
 /src/patches/reference/
 /patches/**/*.xml

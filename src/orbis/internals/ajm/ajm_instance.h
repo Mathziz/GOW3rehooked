@@ -8,6 +8,7 @@
 #include "orbis/internals/ajm/ajm.h"
 #include "orbis/internals/ajm/ajm_batch.h"
 
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <tuple>

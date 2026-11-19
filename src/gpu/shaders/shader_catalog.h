@@ -30,8 +30,10 @@ struct Mapping {
     size_t Relative(size_t p, size_t begin, size_t end) const;
     std::string Text(size_t p, size_t n) const;
     std::filesystem::path path;
+#ifdef _WIN32
     void* file{};
     void* mapping{};
+#endif
     const u8* data{};
     size_t size{};
 };

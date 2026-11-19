@@ -3,8 +3,10 @@
 
 #include "orbis/common/assert.h"
 #include "orbis/common/debug.h"
+#include "orbis/common/futex.h"
 #include "orbis/common/thread.h"
 #include "main/config.h"
+#include <cstring>
 #include <immintrin.h>
 #include "orbis/core/debug_state.h"
 #include "orbis/core/emulator_settings.h"
@@ -34,7 +36,16 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     vblank_thread = std::jthread([this](const std::stop_token& token) { VblankThread(token); });
 }
 
+#ifdef _WIN32
 VideoOutDriver::~VideoOutDriver() = default;
+#else
+VideoOutDriver::~VideoOutDriver() {
+    vblank_thread.request_stop();
+    flip_notifications.fetch_add(1, std::memory_order_release);
+    Common::FutexWakeAll(&flip_notifications);
+    vblank_thread.join();
+}
+#endif
 
 int VideoOutDriver::Open(const ServiceThreadParams* /*params*/) {
     if (main_port.is_open) {
@@ -287,8 +298,15 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .eop = is_eop,
             .frame_id = Gow3::Presenter::FrameForFlip(),
         });
+#ifndef _WIN32
+        flip_notifications.fetch_add(1, std::memory_order_release);
+#endif
     }
+#ifdef _WIN32
     Common::InterruptSleep(vblank_thread.native_handle());
+#else
+    Common::FutexWakeAll(&flip_notifications);
+#endif
 }
 
 
@@ -309,14 +327,34 @@ void VideoOutDriver::VblankThread(const std::stop_token& token) {
         // which still tick for the game. A submit ends the sleep.
         const bool on_submit = main_port.flip_rate.load() == 0;
         auto wake = deadline;
+#ifndef _WIN32
+        u32 seen = 0;
+#endif
         if (on_submit) {
             std::scoped_lock lock(mutex);
             if (!requests.empty()) wake = std::min(wake, last_flip + period);
+#ifndef _WIN32
+            seen = flip_notifications.load(std::memory_order_relaxed);
+#endif
         }
         const auto planned = Gow3::DiagNow();
+#ifdef _WIN32
         if (const auto left = wake - steady_clock::now();
             left > spin && !Common::AccurateSleep(duration_cast<nanoseconds>(left - spin), nullptr, on_submit))
             continue; // a flip was submitted: plan again
+#else
+        if (const auto left = wake - steady_clock::now(); left > spin) {
+            const auto delay = duration_cast<nanoseconds>(left - spin);
+            if (on_submit) {
+                // A submit after the queue check also changes the futex word before it wakes us.
+                Common::FutexWait(flip_notifications, seen, delay);
+                if (flip_notifications.load(std::memory_order_acquire) != seen || steady_clock::now() < wake - spin)
+                    continue;
+            } else {
+                Common::AccurateSleep(delay, nullptr, false);
+            }
+        }
+#endif
         while (steady_clock::now() < wake && !token.stop_requested()) _mm_pause();
         if (token.stop_requested()) return;
         const auto now = steady_clock::now();

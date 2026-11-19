@@ -164,15 +164,19 @@ void SaveMenuConfig(const std::filesystem::path& path, const Config& config) {
         output += std::string(values[i].first) + "=" + values[i].second + "\n";
     }
     auto temporary = path;
+#ifdef _WIN32
     temporary += L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+#else
+    temporary += "." + std::to_string(getpid()) + ".tmp";
+#endif
     try {
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         file.write(output.data(), std::streamsize(output.size()));
         file.flush();
         if (!file) throw std::runtime_error("Cannot save config.cfg");
         file.close();
-        if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            throw std::runtime_error(WindowsError("Save config.cfg"));
+        if (!ReplaceFile(temporary, path))
+            throw std::runtime_error(HostError("Save config.cfg"));
     } catch (...) { std::filesystem::remove(temporary); throw; }
 }
 }

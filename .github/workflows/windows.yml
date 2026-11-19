@@ -1,4 +1,4 @@
-name: Windows
+name: Windows and Linux
 
 on:
   workflow_dispatch:
@@ -218,3 +218,107 @@ jobs:
             build-fast/Windows/.cache/sccache
             build-fast/Windows/.cache/vcpkg-binaries
           key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  linux:
+    name: Linux x86_64 (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '["standard","ivybridge"]' || inputs.ivy_bridge && '["ivybridge"]' || '["standard"]') }}
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      VARIANT: ${{ matrix.variant }}
+      SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld g++-14 cmake ninja-build pkg-config nasm \
+            glslc libshaderc-dev glslang-dev glslang-tools spirv-tools libvulkan-dev libunwind-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libdecor-0-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols desktop-file-utils zip
+          headers="$RUNNER_TEMP/vulkan-headers"
+          mkdir -p "$headers"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.328.tar.gz |
+            tar -xz --strip-components=1 -C "$headers"
+          printf 'VULKAN_SDK=%s\n' "$headers" >> "$GITHUB_ENV"
+      - name: Build Linux Release
+        run: |
+          args=(--release)
+          if [[ "$VARIANT" == ivybridge ]]; then args+=(--ivy-bridge); fi
+          bash ./build-fast.sh "${args[@]}"
+      - name: Install AppImage tools
+        run: |
+          tools="$RUNNER_TEMP/appimage-tools"
+          mkdir -p "$tools"
+          download() {
+            local name=$1 url=$2 hash=$3
+            curl --fail --silent --show-error --location --retry 3 "$url" --output "$tools/$name"
+            printf '%s  %s\n' "$hash" "$tools/$name" | sha256sum -c -
+            chmod +x "$tools/$name"
+          }
+          download linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage \
+            c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+          download appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
+            ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+          printf '%s\n' "$tools" >> "$GITHUB_PATH"
+      - name: Package Linux AppImages, licenses and shader recipes
+        id: package
+        run: |
+          build=build-fast/Linux/Release
+          zip=build/GOW3rehooked-Linux-x86_64
+          if [[ "$VARIANT" == ivybridge ]]; then build+=-ivybridge; zip+=-AVX1; fi
+          zip+=.zip
+          mkdir -p build
+          bash ./tools/appimage/package.sh "$build/bin" "$zip" "$SOURCE_URL"
+          printf 'file=%s\n' "$zip" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ steps.package.outputs.file }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-linux:
+    name: Upload Linux ZIPs to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: GOW3rehooked-Linux-*.zip
+          path: build
+          merge-multiple: true
+          skip-decompress: true
+      - name: Upload Linux release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $zips = @('build/GOW3rehooked-Linux-x86_64.zip', 'build/GOW3rehooked-Linux-x86_64-AVX1.zip')
+          foreach ($zip in $zips) {
+            if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) { throw "Missing release ZIP: $zip" }
+          }
+          $release = gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed' }
+          $missing = @($zips | Where-Object { $release.assets.name -notcontains [IO.Path]::GetFileName($_) })
+          if ($missing.Count) {
+            gh release upload $env:RELEASE_TAG @missing
+            if ($LASTEXITCODE -ne 0) { throw 'Linux release ZIP upload failed' }
+          }

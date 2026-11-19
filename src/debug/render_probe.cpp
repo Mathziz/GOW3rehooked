@@ -6,7 +6,6 @@
 #include <format>
 #include <memory>
 #include <mutex>
-#include <windows.h>
 #ifndef GOW3_OFFLINE
 #include "debug/dump_archive.h"
 #endif
@@ -30,7 +29,7 @@ void Bind(unsigned thread) {
         current = nullptr;
         return;
     }
-    current = &active.threads[thread], current->tid = GetCurrentThreadId();
+    current = &active.threads[thread], current->tid = Gow3::ThreadId();
 }
 void Begin(u64 frame, std::span<const std::pair<u64, u64>> regions) {
     if (!DebugEnabled()) {
@@ -96,7 +95,7 @@ void Write() {
     if (!end) return;
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
-    localtime_s(&tm, &now);
+    Gow3::LocalTime(tm, now);
     char stamp[32];
     std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
     const std::string memory_name = std::format("render-{}.memory.csv", stamp);

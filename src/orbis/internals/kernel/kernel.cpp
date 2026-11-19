@@ -32,7 +32,7 @@
 #ifdef _WIN64
 #include <Rpc.h>
 #else
-#include <uuid/uuid.h>
+#include <sys/random.h>
 #endif
 #include "orbis/common/util.h"
 #include "orbis/core/linker.h"
@@ -218,8 +218,18 @@ s32 PS4_SYSV_ABI sceKernelUuidCreate(OrbisKernelUuid* orbisUuid) {
         return ORBIS_KERNEL_ERROR_EFAULT;
     }
 #else
-    uuid_t uuid;
-    uuid_generate(uuid);
+    u8 uuid[sizeof(OrbisKernelUuid)]{};
+    size_t got = 0;
+    while (got < sizeof(uuid)) {
+        const ssize_t n = getrandom(uuid + got, sizeof(uuid) - got, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return ORBIS_KERNEL_ERROR_EFAULT;
+        }
+        got += static_cast<size_t>(n);
+    }
+    uuid[6] = static_cast<u8>((uuid[6] & 0x0Fu) | 0x40u);
+    uuid[8] = static_cast<u8>((uuid[8] & 0x3Fu) | 0x80u);
 #endif
     std::memcpy(orbisUuid, &uuid, sizeof(OrbisKernelUuid));
     return ORBIS_OK;

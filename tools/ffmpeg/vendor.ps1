@@ -103,6 +103,83 @@ foreach ($file in $files) {
     ++$copied
 }
 Copy-Item -LiteralPath (Join-Path $source 'COPYING.LGPLv2.1'), (Join-Path $source 'LICENSE.md') -Destination $Target
+$linuxOverrides = @'
+#ifndef _WIN32
+#undef OS_NAME
+#define OS_NAME linux
+#undef SLIBSUF
+#define SLIBSUF ".so"
+#undef HAVE_DIRECT_H
+#define HAVE_DIRECT_H 0
+#undef HAVE_DXGIDEBUG_H
+#define HAVE_DXGIDEBUG_H 0
+#undef HAVE_DXVA_H
+#define HAVE_DXVA_H 0
+#undef HAVE_IO_H
+#define HAVE_IO_H 0
+#undef HAVE_WINDOWS_H
+#define HAVE_WINDOWS_H 0
+#undef HAVE_SYS_TIME_H
+#define HAVE_SYS_TIME_H 1
+#undef HAVE_UNISTD_H
+#define HAVE_UNISTD_H 1
+#undef HAVE_DOS_PATHS
+#define HAVE_DOS_PATHS 0
+#undef HAVE_LIBC_MSVCRT
+#define HAVE_LIBC_MSVCRT 0
+#undef HAVE_W32THREADS
+#define HAVE_W32THREADS 0
+#undef HAVE_PTHREADS
+#define HAVE_PTHREADS 1
+#undef HAVE_PRCTL
+#define HAVE_PRCTL 1
+#undef HAVE_ALIGNED_MALLOC
+#define HAVE_ALIGNED_MALLOC 0
+#undef HAVE_POSIX_MEMALIGN
+#define HAVE_POSIX_MEMALIGN 1
+#undef HAVE_GETSYSTEMTIMEASFILETIME
+#define HAVE_GETSYSTEMTIMEASFILETIME 0
+#undef HAVE_SLEEP
+#define HAVE_SLEEP 0
+#undef HAVE_GETTIMEOFDAY
+#define HAVE_GETTIMEOFDAY 1
+#undef HAVE_CLOCK_GETTIME
+#define HAVE_CLOCK_GETTIME 1
+#undef HAVE_NANOSLEEP
+#define HAVE_NANOSLEEP 1
+#undef HAVE_LOCALTIME_R
+#define HAVE_LOCALTIME_R 1
+#undef HAVE_GMTIME_R
+#define HAVE_GMTIME_R 1
+#undef HAVE_GETPROCESSAFFINITYMASK
+#define HAVE_GETPROCESSAFFINITYMASK 0
+#undef HAVE_SCHED_GETAFFINITY
+#define HAVE_SCHED_GETAFFINITY 1
+#undef HAVE_SYSCONF
+#define HAVE_SYSCONF 1
+#undef HAVE_SETCONSOLETEXTATTRIBUTE
+#define HAVE_SETCONSOLETEXTATTRIBUTE 0
+#undef HAVE_GETSTDHANDLE
+#define HAVE_GETSTDHANDLE 0
+#undef HAVE_STRERROR_R
+#define HAVE_STRERROR_R 1
+#undef HAVE_BCRYPT
+#define HAVE_BCRYPT 0
+#endif
+#endif /* FFMPEG_CONFIG_H */
+'@
+$configPath = Join-Path $Target 'config.h'
+((Get-Content -LiteralPath $configPath -Raw) -replace '#endif /\* FFMPEG_CONFIG_H \*/\s*$', "$linuxOverrides`n") | Set-Content -LiteralPath $configPath -NoNewline
+New-Item -ItemType Directory -Path (Join-Path $Target 'compat') -Force | Out-Null
+@'
+#include <stdio.h>
+#include "libavutil/file_open.h"
+
+FILE *avpriv_fopen_utf8(const char *path, const char *mode)
+{
+    return fopen(path, mode);
+}
+'@ | Set-Content -LiteralPath (Join-Path $Target 'compat\linux_fopen.c')
 $list = ($compiled | ForEach-Object { "    $_" }) -join "`n"
 @"
 # FFmpeg $Version, vendored by tools/ffmpeg/vendor.ps1: the sources of the objects the port links (H.264 decoder for the
@@ -115,10 +192,19 @@ add_library(ffmpeg STATIC
 $list
 )
 target_include_directories(ffmpeg SYSTEM PUBLIC `${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_definitions(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:HAVE_AV_CONFIG_H;_ISOC11_SOURCE;_FILE_OFFSET_BITS=64;_LARGEFILE_SOURCE;_USE_MATH_DEFINES;_CRT_NONSTDC_NO_WARNINGS;_WIN32_WINNT=0x0600;PIC>)
 # FFmpeg relies on the optimizer dropping calls under disabled ARCH_*/HAVE_* checks; no LTO (inline asm names symbols).
-target_compile_options(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:/clang:-march=`${GOW3_CPU_ARCH};/std:c17;-w>
-    `$<`$<COMPILE_LANGUAGE:ASM_NASM>:-I`${CMAKE_CURRENT_SOURCE_DIR}/;-I`${CMAKE_CURRENT_SOURCE_DIR}/libavutil/x86/;-P`${CMAKE_CURRENT_SOURCE_DIR}/config.asm>)
-target_link_libraries(ffmpeg PUBLIC bcrypt)
+if(WIN32)
+    target_compile_definitions(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:HAVE_AV_CONFIG_H;_ISOC11_SOURCE;_FILE_OFFSET_BITS=64;_LARGEFILE_SOURCE;_USE_MATH_DEFINES;_CRT_NONSTDC_NO_WARNINGS;_WIN32_WINNT=0x0600;PIC>)
+    target_compile_options(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:/clang:-march=`${GOW3_CPU_ARCH};/std:c17;-w>
+        `$<`$<COMPILE_LANGUAGE:ASM_NASM>:-I`${CMAKE_CURRENT_SOURCE_DIR}/;-I`${CMAKE_CURRENT_SOURCE_DIR}/libavutil/x86/;-P`${CMAKE_CURRENT_SOURCE_DIR}/config.asm>)
+    target_link_libraries(ffmpeg PUBLIC bcrypt)
+else()
+    target_sources(ffmpeg PRIVATE compat/linux_fopen.c)
+    target_compile_definitions(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:HAVE_AV_CONFIG_H;_ISOC11_SOURCE;_FILE_OFFSET_BITS=64;_LARGEFILE_SOURCE;_POSIX_C_SOURCE=200112L;_XOPEN_SOURCE=600;PIC>)
+    target_compile_options(ffmpeg PRIVATE `$<`$<COMPILE_LANGUAGE:C>:-march=`${GOW3_CPU_ARCH};-std=c17;-fPIC;-fvisibility=hidden;-w>
+        `$<`$<AND:`$<COMPILE_LANGUAGE:C>,`$<CONFIG:Debug>>:-O1>
+        `$<`$<COMPILE_LANGUAGE:ASM_NASM>:-I`${CMAKE_CURRENT_SOURCE_DIR}/;-I`${CMAKE_CURRENT_SOURCE_DIR}/libavutil/x86/;-P`${CMAKE_CURRENT_SOURCE_DIR}/config.asm>)
+    target_link_libraries(ffmpeg PUBLIC Threads::Threads m)
+endif()
 "@ | Set-Content -LiteralPath (Join-Path $Target 'CMakeLists.txt')
 Write-Host "$($compiled.Count) sources, $copied files in $Target"

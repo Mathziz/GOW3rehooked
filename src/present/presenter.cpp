@@ -19,8 +19,10 @@
 #include "main/host.h"
 #include "gpu/device.h"
 #include "gpu/shaders/gcn_translator.h"
+#ifdef _WIN32
 #include <windows.h>
 #include <vulkan/vulkan_win32.h>
+#endif
 
 namespace Gow3::Presenter {
 namespace {
@@ -49,6 +51,7 @@ s64 flip_time{};
 std::atomic<PresentationTiming*> timing{};
 u64 present_id{};
 bool reflex_requested{};
+#ifdef _WIN32
 // Borderless and Exclusive display modes (VK_EXT_full_screen_exclusive, application controlled): exclusive access is held while
 // the window has the input focus and released when it loses it, so Alt+Tab and overlay windows get the composed desktop back
 // (composed, the NVIDIA DXGI layer copies every frame). Windowed never goes exclusive (the NVIDIA native present method
@@ -59,6 +62,7 @@ bool exclusive_mode{}, exclusive_held{}, exclusive_refused{}, exclusive_lost{};
 std::chrono::steady_clock::time_point exclusive_retry{};
 PFN_vkAcquireFullScreenExclusiveModeEXT acquire_exclusive;
 PFN_vkReleaseFullScreenExclusiveModeEXT release_exclusive;
+#endif
 u64 flipped_frame{};
 std::atomic<u64> rendered_frame{};
 thread_local u64 render_frame{};
@@ -306,6 +310,7 @@ bool CreateSwapchain() {
     }
     if (auto* t = timing.load(std::memory_order_acquire)) t->Detach();
     DestroySwapchainViews();
+#ifdef _WIN32
     if (std::exchange(exclusive_held, false)) release_exclusive(device, swapchain);
     VkSurfaceFullScreenExclusiveWin32InfoEXT monitor{.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT,
         .hmonitor = exclusive_mode ? MonitorFromWindow(static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window),
@@ -314,6 +319,9 @@ bool CreateSwapchain() {
         .pNext = exclusive_mode ? &monitor : nullptr,
         .fullScreenExclusive = exclusive_mode ? VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT};
     const void* chain = vk.full_screen_exclusive ? &exclusive : nullptr;
+#else
+    const void* chain = nullptr;
+#endif
     const VkSwapchainLatencyCreateInfoNV latency{.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV, .pNext = chain, .latencyModeEnable = VK_TRUE};
     if (vk.reflex && reflex_requested) chain = &latency;
     const VkSwapchainCreateInfoKHR info{
@@ -344,6 +352,7 @@ bool CreateSwapchain() {
     return true;
 }
 
+#ifdef _WIN32
 // Exclusive mode: taken while the window is full screen with the input focus (retried once a second while the driver refuses),
 // given back when it loses either.
 void HoldExclusive() {
@@ -367,6 +376,9 @@ bool Remake(VkResult result) {
     exclusive_held = false;
     return true;
 }
+#else
+bool Remake(VkResult result) { return result == VK_ERROR_OUT_OF_DATE_KHR; }
+#endif
 
 // The flipped display buffer: a view of its image the pass can sample (UNORM sibling of an sRGB format; a BGRA buffer in an
 // RGBA image is read as BGRA, byte for byte) and the area of the swapchain it fills, letterboxed with its aspect kept.
@@ -399,7 +411,10 @@ bool Show(Frame& frame, VkRect2D& area, VkExtent2D& input, u64 address, bool bgr
 }
 
 void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
-    if ((!swapchain && !CreateSwapchain()) || exclusive_lost) return;
+    if (!swapchain && !CreateSwapchain()) return;
+#ifdef _WIN32
+    if (exclusive_lost) return;
+#endif
     const u32 slot = frame_index;
     auto& frame = frames[slot];
     frame_index ^= 1;
@@ -663,7 +678,9 @@ void Run(const std::stop_token& token) {
     Splash::Priority priority;  // the splash's frames keep up with the shader build
     while (!token.stop_requested()) {
         priority.Update();
+#ifdef _WIN32
         if (exclusive_mode && swapchain) HoldExclusive();  // also while no frames come (16 ms wakes)
+#endif
         s64 latch{};
         u64 address{};
         bool bgra{};
@@ -721,12 +738,14 @@ void Initialize(SDL_Window* sdl_window, const Config& config) {
     device = vk.device;
     queue = vk.queue;
     reflex_requested = config.nvidia_reflex;
+#ifdef _WIN32
     exclusive_mode = vk.full_screen_exclusive && config.display_mode != DisplayMode::Windowed;
     if (exclusive_mode) {
         acquire_exclusive = reinterpret_cast<PFN_vkAcquireFullScreenExclusiveModeEXT>(vkGetDeviceProcAddr(device, "vkAcquireFullScreenExclusiveModeEXT"));
         release_exclusive = reinterpret_cast<PFN_vkReleaseFullScreenExclusiveModeEXT>(vkGetDeviceProcAddr(device, "vkReleaseFullScreenExclusiveModeEXT"));
         exclusive_mode = acquire_exclusive && release_exclusive;
     }
+#endif
     if (reflex_requested && !vk.reflex) Log("NVIDIA Reflex unavailable; using normal presentation pacing");
     timing.store(new PresentationTiming(device, window, FramePeriodNs(config.fps), vk.present_wait, vk.reflex && reflex_requested), std::memory_order_release);
     u32 format_count{};

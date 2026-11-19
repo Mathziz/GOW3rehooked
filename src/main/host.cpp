@@ -2,12 +2,17 @@
 #include "main/host.h"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <format>
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#endif
 
 namespace Gow3 {
 namespace {
@@ -15,21 +20,47 @@ std::mutex log_mutex;
 std::array<std::string, 4096> messages;
 size_t message_begin{}, message_count{}, dropped_messages{};
 std::deque<std::string> debug_messages;
-HANDLE debug_file = INVALID_HANDLE_VALUE; // debug: opened by the first FlushLog(), then Log() writes through
+#ifdef _WIN32
+const auto invalid_file = INVALID_HANDLE_VALUE;
+#else
+constexpr int invalid_file = -1;
+#endif
+auto debug_file = invalid_file; // debug: opened by the first FlushLog(), then Log() writes through
 std::string debug_line;
 }
 
 std::filesystem::path ExecutableDirectory() {
+#ifdef _WIN32
     std::wstring path(512, L'\0');
     for (;;) {
         auto size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-        if (!size) throw std::runtime_error(WindowsError("GetModuleFileNameW"));
+        if (!size) throw std::runtime_error(HostError("GetModuleFileNameW"));
         if (size < path.size()) {
             path.resize(size);
             return std::filesystem::path(path).parent_path();
         }
         path.resize(path.size() * 2);
     }
+#else
+    return std::filesystem::read_symlink("/proc/self/exe").parent_path();
+#endif
+}
+
+bool ReplaceFile(const std::filesystem::path& source, const std::filesystem::path& destination) {
+#ifdef _WIN32
+    return MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+    return std::rename(source.c_str(), destination.c_str()) == 0;
+#endif
+}
+
+[[noreturn]] void ExitImmediately(int status) {
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), status);
+    ExitProcess(status);
+#else
+    std::_Exit(status);
+#endif
 }
 
 namespace {
@@ -80,7 +111,7 @@ void SaveSession() {
         out.flush();
         if (!out) return Log("Cannot write launch session");
     }
-    if (!MoveFileExW(temporary.c_str(), session_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    if (!ReplaceFile(temporary, session_path))
         return Log("Cannot replace launch session");
     std::error_code error;
     std::filesystem::remove(session_path.parent_path() / "launch.flag", error); // retire the old crash marker
@@ -162,18 +193,31 @@ std::vector<unsigned char> ReadFile(const std::filesystem::path& path) {
     return bytes;
 }
 
-std::string WindowsError(std::string_view action) {
+std::string HostError(std::string_view action) {
+#ifdef _WIN32
     return std::string(action) + " failed (Win32 " + std::to_string(GetLastError()) + ")";
+#else
+    return std::string(action) + ": " + std::generic_category().message(errno);
+#endif
 }
 
 void Log(std::string_view message) {
     std::scoped_lock lock(log_mutex);
     if (DebugEnabled()) {
-        if (debug_file == INVALID_HANDLE_VALUE) { debug_messages.emplace_back(message); return; }
+        if (debug_file == invalid_file) { debug_messages.emplace_back(message); return; }
         // Straight to the OS: the line survives a crash of the process.
         debug_line.assign(message).push_back('\n');
+#ifdef _WIN32
         DWORD written;
         WriteFile(debug_file, debug_line.data(), DWORD(debug_line.size()), &written, nullptr);
+#else
+        std::string_view pending(debug_line);
+        while (!pending.empty()) {
+            const auto n = write(debug_file, pending.data(), pending.size());
+            if (n > 0) pending.remove_prefix(n);
+            else if (n == 0 || errno != EINTR) break;
+        }
+#endif
         return;
     }
     if (message_count == messages.size()) {
@@ -186,7 +230,7 @@ void Log(std::string_view message) {
 
 void FlushLog(const std::filesystem::path& path) {
     std::scoped_lock lock(log_mutex);
-    if (debug_file != INVALID_HANDLE_VALUE) return; // written through already
+    if (debug_file != invalid_file) return; // written through already
     std::ofstream file(path, std::ios::app | std::ios::binary);
     if (!file) throw std::runtime_error("Cannot write " + path.string());
     if (dropped_messages) file << "Log ring discarded " << dropped_messages << " older messages\n";
@@ -198,8 +242,13 @@ void FlushLog(const std::filesystem::path& path) {
     message_begin = message_count = dropped_messages = 0;
     debug_messages.clear();
     file.close();
+#ifdef _WIN32
     if (DebugEnabled() && (debug_file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                                     nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)) == INVALID_HANDLE_VALUE)
-        throw std::runtime_error(WindowsError("CreateFileW " + path.string()));
+        throw std::runtime_error(HostError("CreateFileW " + path.string()));
+#else
+    if (DebugEnabled() && (debug_file = open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644)) == invalid_file)
+        throw std::runtime_error(HostError("Open " + path.string()));
+#endif
 }
 }

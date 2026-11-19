@@ -17,6 +17,10 @@
 #include "patches/memory_patcher.h"
 #include "present/window.h"
 #include "gpu/gpu_thread.h"
+#ifndef _WIN32
+#include "gpu/buffers.h"
+#include "debug/s4_trace.h"
+#endif
 #include "gpu/shaders/shader_aot.h"
 #include "gpu/shaders/shader_cache.h"
 #include "gpu/shaders/shader_recipes.h"
@@ -27,6 +31,7 @@
 #include <bit>
 
 namespace {
+#ifdef _WIN32
 // The error mode below hides Windows' crash dialog, so without this a crash closes the game silently.
 LONG WINAPI ReportUnhandledCrash(EXCEPTION_POINTERS* info) {
     const auto* record = info->ExceptionRecord;
@@ -50,8 +55,16 @@ LONG WINAPI ReportUnhandledCrash(EXCEPTION_POINTERS* info) {
     ShowFatalError(text.c_str());
     return EXCEPTION_EXECUTE_HANDLER; // ends the process
 }
+#endif
 
-thread_local std::wstring last_error;
+thread_local std::basic_string<Gow3PathChar> last_error;
+#ifdef _WIN32
+constexpr auto LogWriteFailure = L"\nCould not write gow3.log.";
+constexpr auto UnexpectedError = L"Unexpected runtime initialization error";
+#else
+constexpr auto LogWriteFailure = "\nCould not write gow3.log.";
+constexpr auto UnexpectedError = "Unexpected runtime initialization error";
+#endif
 std::filesystem::path validation_log;
 void ObserveRuntimeImport(const char* name, const char* nid, void* caller) {
     const std::string_view function(name);
@@ -59,21 +72,29 @@ void ObserveRuntimeImport(const char* name, const char* nid, void* caller) {
         Gow3::Log(std::format("RUNTIME_GRAPHICS_BOUNDARY {} [{}] caller={:#x}", name, nid,
                              reinterpret_cast<uintptr_t>(caller)));
         Gow3::FlushLog(validation_log);
+#ifdef _WIN32
         ExitProcess(2);
+#else
+        Gow3::ExitImmediately(2);
+#endif
     }
 }
 void StoreError(const char* error) {
+#ifdef _WIN32
     const int size = MultiByteToWideChar(CP_UTF8, 0, error, -1, nullptr, 0);
     if (!size) { last_error = L"Runtime initialization failed"; return; }
     last_error.resize(static_cast<size_t>(size));
     MultiByteToWideChar(CP_UTF8, 0, error, -1, last_error.data(), size);
     last_error.resize(static_cast<size_t>(size - 1));
+#else
+    last_error = error;
+#endif
 }
 }
 
-const wchar_t* Gow3LastError() { return last_error.c_str(); }
+const Gow3PathChar* Gow3LastError() { return last_error.c_str(); }
 
-int Gow3Run(const wchar_t* executable_directory, const wchar_t* game_directory, uint32_t flags) {
+int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_directory, uint32_t flags) {
     using namespace Gow3;
     std::filesystem::path log_path;
     last_error.clear();
@@ -86,7 +107,11 @@ int Gow3Run(const wchar_t* executable_directory, const wchar_t* game_directory, 
             // A packaged game is only looked for when there is no eboot.bin.
             std::error_code error;
             const auto packaged = std::ranges::any_of(std::filesystem::directory_iterator(game, error), [](const auto& entry) {
+#ifdef _WIN32
                 return _wcsicmp(entry.path().extension().c_str(), L".fpkg") == 0;
+#else
+                return Common::ToLower(entry.path().extension().string()) == ".fpkg";
+#endif
             });
             Window::ReportStartupError(packaged ? Window::StartupError::Packaged : Window::StartupError::NoGame);
         }
@@ -94,10 +119,14 @@ int Gow3Run(const wchar_t* executable_directory, const wchar_t* game_directory, 
         log_path = app / "gow3.log";
         if (DebugEnabled()) FlushLog(log_path); // debug lines are written through from here on
         if (DebugEnabled()) Log("GOW3 Orbis runtime initialization; debug mode");
+#ifdef _WIN32
         Common::NtApi::Initialize();
+#endif
         Log(Cpu::Describe());
+#ifdef _WIN32
         SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX);
         SetUnhandledExceptionFilter(ReportUnhandledCrash);
+#endif
         const auto config = LoadConfig(app / PortDir::Settings / "config.cfg");
         GpuThread::Configure(config.anisotropy);
         if (DebugEnabled()) Log(std::format("Configuration: {} at {:.2f} fps, skip intro {}, skip videos {}, mode {}",
@@ -140,8 +169,14 @@ int Gow3Run(const wchar_t* executable_directory, const wchar_t* game_directory, 
             Gpu::Aot::lazy = config.lazy_aot;
             Gpu::Aot::sample_log2 = std::countr_zero(config.msaa);
             Window::Open(config);
+#ifndef _WIN32
+            if (S4::enabled) S4::Install();
+            GuestMemory::Install();
+#endif
         }
+#ifdef _WIN32
         Core::WindowsGuestRedZoneProtection::SetActiveMode(WindowsGuestRedZoneProtectionMode::StaticPatching);
+#endif
         if (linker->LoadModule(game / "eboot.bin") != 0) throw std::runtime_error("Cannot load EBOOT");
         if (flags == 0) {
             InstallHooks(*linker->GetModule(0), config);
@@ -160,9 +195,17 @@ int Gow3Run(const wchar_t* executable_directory, const wchar_t* game_directory, 
             return symbol.library == "libSceGnmDriver" || symbol.library == "libSceVideoOut";
         };
         const auto pending_graphics = std::ranges::count_if(linker->UnresolvedImports(), graphics_import);
-        if (DebugEnabled()) Log(std::format("Registered Orbis symbols: {}; pending graphics imports: {}; upstream runtime fallbacks: {}; Windows TCB slot: {}",
-                        linker->GetHLESymbols().GetSize(), pending_graphics,
-                        linker->UnresolvedImports().size() - pending_graphics, Core::GetTcbKey()));
+        if (DebugEnabled()) {
+#ifdef _WIN32
+            Log(std::format("Registered Orbis symbols: {}; pending graphics imports: {}; upstream runtime fallbacks: {}; Windows TCB slot: {}",
+                            linker->GetHLESymbols().GetSize(), pending_graphics,
+                            linker->UnresolvedImports().size() - pending_graphics, Core::GetTcbKey()));
+#else
+            Log(std::format("Registered Orbis symbols: {}; pending graphics imports: {}; upstream runtime fallbacks: {}",
+                            linker->GetHLESymbols().GetSize(), pending_graphics,
+                            linker->UnresolvedImports().size() - pending_graphics));
+#endif
+        }
         for (const auto& symbol : linker->UnresolvedImports())
             if (DebugEnabled()) Log(std::format("{} {} [{}] library={} module={}",
                             graphics_import(symbol) ? "PENDING_GRAPHICS" : "UPSTREAM_FALLBACK", symbol.nidName,
@@ -178,19 +221,25 @@ int Gow3Run(const wchar_t* executable_directory, const wchar_t* game_directory, 
         }
         static const std::vector<std::string> args{"/app0/eboot.bin"}; // the guest main thread keeps a reference
         linker->Execute(args);
-        if (flags & Gow3ValidateRuntime) Sleep(INFINITE);
+        if (flags & Gow3ValidateRuntime) {
+#ifdef _WIN32
+            Sleep(INFINITE);
+#else
+            for (;;) pause();
+#endif
+        }
         Window::RunEventLoop(log_path, game);
     } catch (const std::exception& error) {
         EndLaunch(); // reported to the user: not a crash
         StoreError(error.what());
         Log(std::string("STARTUP: ") + error.what());
         if (!log_path.empty()) {
-            try { FlushLog(log_path); } catch (...) { last_error += L"\nCould not write gow3.log."; }
+            try { FlushLog(log_path); } catch (...) { last_error += LogWriteFailure; }
         }
         return 1;
     } catch (...) {
         EndLaunch();
-        last_error = L"Unexpected runtime initialization error";
+        last_error = UnexpectedError;
         return 1;
     }
 }

@@ -113,6 +113,9 @@ struct VirtualMemoryArea {
     std::string name = "";
     s32 fd = 0;
     bool disallow_merge = false;
+#ifndef _WIN32
+    int host_protection = 0;
+#endif
 
     bool Contains(VAddr addr, u64 size) const {
         return addr >= base && (addr + size) <= (base + this->size);
@@ -145,6 +148,9 @@ struct VirtualMemoryArea {
                 return false;
             }
         }
+#ifndef _WIN32
+        if (host_protection != next.host_protection && IsMapped()) return false;
+#endif
         if (prot != next.prot || type != next.type) {
             return false;
         }
@@ -278,6 +284,9 @@ public:
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
     s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot);
+#ifndef _WIN32
+    bool QueryHostRegion(VAddr addr, VAddr& start, VAddr& end, int& protection);
+#endif
 
     s32 Protect(VAddr addr, u64 size, MemoryProt prot);
 

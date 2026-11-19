@@ -69,7 +69,12 @@ fs::path SaveInstance::GetParamSFOPath(const fs::path& dir_path) {
 }
 
 bool SaveInstance::IsSearchableSlot(const fs::path& path, std::error_code& error) {
-    return !path.filename().native().starts_with(L"sce_") && fs::is_directory(path, error) &&
+#ifdef _WIN32
+    const bool system_dir = path.filename().native().starts_with(L"sce_");
+#else
+    const bool system_dir = path.filename().native().starts_with("sce_");
+#endif
+    return !system_dir && fs::is_directory(path, error) &&
            fs::is_regular_file(GetParamSFOPath(path), error);
 }
 

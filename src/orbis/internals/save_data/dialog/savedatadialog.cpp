@@ -8,6 +8,7 @@
 #include <optional>
 
 #include "orbis/common/elf_info.h"
+#include "orbis/common/util.h"
 #include "orbis/logging/log.h"
 #include "orbis/internals/libs.h"
 #include "orbis/internals/save_data/save_instance.h"
@@ -34,7 +35,12 @@ namespace fs = std::filesystem;
 std::optional<fs::file_time_type> ContinueSaveTime(const fs::path& path) {
     std::error_code error;
     const auto data = path / "SAVEDATA";
-    if (_wcsicmp(path.filename().c_str(), L"USERDATA") == 0 ||
+#ifdef _WIN32
+    const bool user_data = _wcsicmp(path.filename().c_str(), L"USERDATA") == 0;
+#else
+    const bool user_data = Common::ToLower(path.filename().string()) == "userdata";
+#endif
+    if (user_data ||
         !fs::is_regular_file(data, error) || !SaveInstance::IsSearchableSlot(path, error) ||
         fs::exists(path / "sce_sys" / "corrupted", error) || error) return std::nullopt;
     // Even a read-only load can rewrite param.sfo. Use the gameplay data's write time.

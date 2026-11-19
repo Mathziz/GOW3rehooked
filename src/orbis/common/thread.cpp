@@ -16,6 +16,7 @@
 #include "orbis/common/util.h"
 #include "orbis/logging/log.h"
 #include "orbis/common/thread.h"
+#include "orbis/common/futex.h"
 #include "ntapi.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -207,30 +208,27 @@ void InterruptSleep(void* thread) {
 #else
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
-    pthread_t this_thread = pthread_self();
-
-    const auto scheduling_type = SCHED_OTHER;
-    s32 max_prio = sched_get_priority_max(scheduling_type);
-    s32 min_prio = sched_get_priority_min(scheduling_type);
-    u32 level = std::max(static_cast<u32>(new_priority) + 1, 4U);
-
-    struct sched_param params;
-    if (max_prio > min_prio) {
-        params.sched_priority = min_prio + ((max_prio - min_prio) * level) / 4;
-    } else {
-        params.sched_priority = min_prio - ((min_prio - max_prio) * level) / 4;
-    }
-
-    pthread_setschedparam(this_thread, scheduling_type, &params);
+    const sched_param params{};
+    pthread_setschedparam(pthread_self(), new_priority == ThreadPriority::Low ? SCHED_BATCH : SCHED_OTHER, &params);
 }
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
-                   const bool interruptible, const bool /*spin_short*/) {
+                   const bool interruptible, const bool spin_short) {
+    if (duration <= std::chrono::nanoseconds::zero()) {
+        if (remaining) *remaining = {};
+        return true;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    if (!interruptible && spin_short && duration <= std::chrono::microseconds(60)) {
+        while (std::chrono::steady_clock::now() < deadline) _mm_pause();
+        if (remaining) *remaining = {};
+        return true;
+    }
     timespec request = {
         .tv_sec = duration.count() / 1'000'000'000,
         .tv_nsec = duration.count() % 1'000'000'000,
     };
-    timespec remain;
+    timespec remain{};
     int ret;
     while ((ret = nanosleep(&request, &remain)) < 0 && errno == EINTR) {
         if (interruptible) {
@@ -239,9 +237,24 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
         request = remain;
     }
     if (remaining) {
-        *remaining = std::chrono::nanoseconds(remain.tv_sec * 1'000'000'000 + remain.tv_nsec);
+        *remaining = ret == 0 ? std::chrono::nanoseconds{} : std::chrono::nanoseconds(remain.tv_sec * 1'000'000'000 + remain.tv_nsec);
     }
-    return ret == 0 || errno != EINTR;
+    return ret == 0;
+}
+
+static std::atomic<u32> gpu_writes{0};
+
+void NotifyGpuWrite() {
+    gpu_writes.fetch_add(1, std::memory_order_release);
+    FutexWakeAll(&gpu_writes);
+}
+
+bool WaitGpuWrite(const std::chrono::nanoseconds duration) {
+    if (duration > std::chrono::microseconds(150) || GetCurrentThreadNameView() != "Game:Main") return false;
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    FutexWait(gpu_writes, gpu_writes.load(std::memory_order_acquire), std::chrono::milliseconds(1));
+    while (std::chrono::steady_clock::now() < deadline) _mm_pause();
+    return true;
 }
 
 #endif

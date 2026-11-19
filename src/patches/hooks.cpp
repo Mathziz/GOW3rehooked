@@ -8,6 +8,10 @@
 #include "ui/controls_ui.h"
 #include "patches/memory_patcher.h"
 #include "main/host.h"
+#ifndef _WIN32
+#include <strings.h>
+#include <sys/mman.h>
+#endif
 #include "present/presenter.h"
 #include "present/splash.h"
 #include "present/window.h"
@@ -16,6 +20,7 @@
 #include "orbis/internals/save_data/dialog/savedatadialog.h"
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -30,12 +35,21 @@
 #include <string_view>
 #include <tuple>
 #include <SDL3/SDL.h>
-#include <windows.h>
+#ifdef _WIN32
 #include <evntprov.h>
 #pragma comment(lib, "advapi32.lib")
+#endif
 
 namespace Gow3 {
 namespace {
+[[gnu::always_inline]] inline int CompareCaseInsensitive(const char* lhs, const char* rhs) {
+#ifdef _WIN32
+    return _stricmp(lhs, rhs);
+#else
+    return strcasecmp(lhs, rhs);
+#endif
+}
+
 // Shared hook machinery.
 uintptr_t guest_base;
 float configured_frame_rate;
@@ -47,17 +61,21 @@ void PS4_SYSV_ABI UpdateInput() { Presenter::BeforeInput(); original_input_updat
 // tools\gow3.wprp records beside the WPR CPU profile; etlprof counts frames with it. Nearly free while no session listens.
 using FrameLoop = void(PS4_SYSV_ABI*)(u32);
 FrameLoop original_frame_loop;
+#ifdef _WIN32
 REGHANDLE frame_events;
 constexpr GUID kFrameProvider{0xe5b7a118, 0xeaa4, 0x4971, {0xbc, 0xa2, 0x41, 0x33, 0x93, 0xac, 0xfa, 0x70}};
 constexpr EVENT_DESCRIPTOR kFrameEvent{1, 0, 0, 4, 0, 0, 0};  // level 4: information
+#endif
 void HoldSlowMotionOnset();
 void PS4_SYSV_ABI RunFrame(u32 mode) {
+#ifdef _WIN32
     static u64 frame;
     if (++frame; EventEnabled(frame_events, &kFrameEvent)) {
         EVENT_DATA_DESCRIPTOR data;
         EventDataDescCreate(&data, &frame, sizeof(frame));
         EventWrite(frame_events, &kFrameEvent, 1, &data);
     }
+#endif
     GpuThread::AwaitCopies();
     HoldSlowMotionOnset();
     original_frame_loop(mode);
@@ -109,7 +127,7 @@ void PS4_SYSV_ABI FlipArenas() {
 using CinematicPathFn = char*(PS4_SYSV_ABI*)(const char*, char*, int, u64);
 CinematicPathFn original_cinematic_path;
 char* PS4_SYSV_ABI CinematicPath(const char* name, char* output, int size, u64 flags) {
-    if (name && (flags & 0x80) && !(flags & 0x40) && _stricmp(name, "OPENINGINT.BSF") == 0)
+    if (name && (flags & 0x80) && !(flags & 0x40) && CompareCaseInsensitive(name, "OPENINGINT.BSF") == 0)
         name = "4K/OPENINGINT_nomos8k_30.0fps_3840x2160.bsf";
     return original_cinematic_path(name, output, size, flags);
 }
@@ -136,6 +154,7 @@ void* PrepareTrampoline(u64 rva, std::span<const u8> prologue, u32 branch = 0) {
         displacement = s32(prologue.size() + 14 - end);
         std::memcpy(code.data() + end - 4, &displacement, sizeof(displacement));
     }
+#ifdef _WIN32
     auto* allocation = VirtualAlloc(nullptr, code.size(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!allocation) throw std::runtime_error("Allocate engine trampoline");
     std::memcpy(allocation, code.data(), code.size());
@@ -143,6 +162,16 @@ void* PrepareTrampoline(u64 rva, std::span<const u8> prologue, u32 branch = 0) {
     if (!VirtualProtect(allocation, code.size(), PAGE_EXECUTE_READ, &old) ||
         !FlushInstructionCache(GetCurrentProcess(), allocation, code.size()))
         throw std::runtime_error("Publish engine trampoline");
+#else
+    auto* allocation = mmap(nullptr, code.size(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (allocation == MAP_FAILED) throw std::runtime_error(HostError("Allocate engine trampoline"));
+    std::memcpy(allocation, code.data(), code.size());
+    if (mprotect(allocation, code.size(), PROT_READ | PROT_EXEC) != 0) {
+        const auto error = HostError("Publish engine trampoline");
+        munmap(allocation, code.size());
+        throw std::runtime_error(error);
+    }
+#endif
     return allocation;
 }
 
@@ -155,7 +184,14 @@ void PS4_SYSV_ABI LockJobQueue() {
     for (u64 start = __rdtsc();;) {
         if (u64 free = 0; !lock.load(std::memory_order_relaxed) && lock.compare_exchange_strong(free, 1)) return;
         _mm_pause();
-        if (__rdtsc() - start > 0x10000) SwitchToThread(), start = __rdtsc();
+        if (__rdtsc() - start > 0x10000) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            std::this_thread::yield();
+#endif
+            start = __rdtsc();
+        }
     }
 }
 
@@ -164,7 +200,14 @@ void PS4_SYSV_ABI LockJobQueue() {
 void PS4_SYSV_ABI WaitJobs(const std::atomic<s32>* pending) {
     for (u64 start = __rdtsc(); pending->load(std::memory_order_relaxed);) {
         _mm_pause();
-        if (__rdtsc() - start > 0x10000) SwitchToThread(), start = __rdtsc();
+        if (__rdtsc() - start > 0x10000) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            std::this_thread::yield();
+#endif
+            start = __rdtsc();
+        }
     }
 }
 
@@ -533,7 +576,11 @@ u64 PS4_SYSV_ABI OpenSection(u32 a, u32 b, const char* name) {
 std::filesystem::path file_path;
 
 void Drain(const std::stop_token& token) {
+#ifdef _WIN32
     FILE* f = _wfopen(file_path.c_str(), L"wb");
+#else
+    FILE* f = std::fopen(file_path.c_str(), "wb");
+#endif
     if (!f) return;
     std::fwrite("GOW3SHD1", 1, 8, f);
     u64 tail = 0, next_tick = 0;
@@ -682,7 +729,7 @@ void Log(uintptr_t ctx, Kind kind, u32 back, u32 op) {
     Stream& s = Find(ctx);
     r.resync |= Advance(s, ctx, pkt);
     s.cursor = cmd;
-    r.pkt = u64(pkt), r.ctx = ctx, r.kind = kind, r.tid = GetCurrentThreadId(), r.dirty = *reinterpret_cast<const u32*>(ctx + 0x64);
+    r.pkt = u64(pkt), r.ctx = ctx, r.kind = kind, r.tid = Gow3::ThreadId(), r.dirty = *reinterpret_cast<const u32*>(ctx + 0x64);
     const bool compute = kind == Dispatch;
     for (u32 i = 0; i < 2; ++i) {
         const u32 user = compute ? 0x240 : i ? 0x4c : 0x0c, pgm = compute ? 0x20c : i ? 0x48 : 0x08;
@@ -717,7 +764,7 @@ u64 PS4_SYSV_ABI SubmitFrame(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     const u64 before = *Guest<const u64*>(kMainCtx + 0x40);
     const u64 result = original_submit(a, b, c, d, e, f);
     Record r{};
-    r.kind = Submit, r.pkt = before, r.ctx = *Guest<const u64*>(kMainCtx + 0x40), r.tid = GetCurrentThreadId();
+    r.kind = Submit, r.pkt = before, r.ctx = *Guest<const u64*>(kMainCtx + 0x40), r.tid = Gow3::ThreadId();
     Push(r);
     return result;
 }
@@ -725,7 +772,11 @@ u64 PS4_SYSV_ABI SubmitFrame(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
 std::filesystem::path file_path;
 
 void Drain(const std::stop_token& token) {
+#ifdef _WIN32
     FILE* f = _wfopen(file_path.c_str(), L"wb");
+#else
+    FILE* f = std::fopen(file_path.c_str(), "wb");
+#endif
     if (!f) return;
     std::fwrite("GOW3DRW1", 1, 8, f);
     u64 tail = 0;
@@ -899,8 +950,15 @@ void Configure(const Config& config) {
     for (u32 i = 0; i < OptionCount; ++i) initial_indices[i] = settings[i].index;
 }
 
-u32 Be32(const u8* p) { return _byteswap_ulong(*reinterpret_cast<const u32*>(p)); }
-void PutBe32(u8* p, u32 v) { *reinterpret_cast<u32*>(p) = _byteswap_ulong(v); }
+[[gnu::always_inline]] inline u32 SwapBytes(u32 value) {
+#ifdef _WIN32
+    return _byteswap_ulong(value);
+#else
+    return std::byteswap(value);
+#endif
+}
+u32 Be32(const u8* p) { return SwapBytes(*reinterpret_cast<const u32*>(p)); }
+void PutBe32(u8* p, u32 v) { *reinterpret_cast<u32*>(p) = SwapBytes(v); }
 
 void WriteMainRows(bool available) {
     continue_available = available;
@@ -1337,12 +1395,14 @@ u64 PS4_SYSV_ABI Chunk(u64 ctx, u64 a2, u64 chunk, u64 spheres, u64 visible, u64
 void ShadowFileOpen(const char* path) {
     if (!Shadow::ring || !path) return;
     const size_t n = strnlen(path, 256);
-    if (n > 4 && !_stricmp(path + n - 4, ".wad")) Shadow::PushName(Shadow::WadOpen, 0, 0, 0, path);
+    if (n > 4 && !CompareCaseInsensitive(path + n - 4, ".wad")) Shadow::PushName(Shadow::WadOpen, 0, 0, 0, path);
 }
 
 void InstallHooks(Core::Module& eboot, const Config& config) {
     guest_base = eboot.GetBaseAddress();
+#ifdef _WIN32
     EventRegister(&kFrameProvider, nullptr, nullptr, &frame_events);
+#endif
     configured_frame_rate = GameFrameRate(config.fps);
     TitleMenu::Configure(config);
     // Ghidra: complete prologues, verified before the detours are installed.

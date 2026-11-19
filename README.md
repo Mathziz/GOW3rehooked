@@ -4,14 +4,14 @@
 
 ![Title menu with the added Continue, Rehooked, Help and Controls, and Quit Game entries](assets/screenshots/title-menu.png)
 
-GOW3rehooked lets you play God of War III Remastered on a Windows PC, made by the same dev which created the original GOW3 build for shadPS4. It was made with a lot of love, care and obsession for performance.
+GOW3rehooked lets you play God of War III Remastered on a Windows or Linux PC, made by the same dev which created the original GOW3 build for shadPS4. It was made with a lot of love, care and obsession for performance.
 
 No game code or assets are included. You need your own copy of the game.
 
 <p align="center">
   <br>
   <a href="https://github.com/cuesta4/GOW3rehooked/releases/latest">
-    <img src="assets/download-button.svg" alt="Download Latest Release for Windows" width="286" height="58">
+    <img src="assets/download-button.svg" alt="Download Latest Release" width="286" height="58">
   </a>
   <br><br>
 </p>
@@ -23,7 +23,7 @@ No game code or assets are included. You need your own copy of the game.
 
 | Component | Requirement |
 | --- | --- |
-| Operating system | Windows 10 or 11, 64-bit |
+| Operating system | Windows 10 or 11, or Linux x86-64 |
 | Intel CPU | 4th-generation Core (Haswell) or newer for the standard build. |
 | AMD CPU | Ryzen 1000 or newer. |
 | AMD GPU | Radeon RX 5300 (RDNA 1) or newer. |
@@ -36,11 +36,13 @@ The standard build requires an x86-64-v3 CPU (including AVX2, BMI1/2, FMA, F16C,
 
 The experimental AVX1 build targets Ivy Bridge CPUs such as the Core i5-3470. The GPU requirements still apply.
 
-Use a current Windows graphics driver for your card. The renderer requires Vulkan 1.3 with shader objects, depth clip control, push descriptors, conditional rendering, sparse buffer residency and min/max sampler filtering. Radeon also needs `VK_KHR_maintenance5`. Windows capability reports are available for the [Radeon RX 5300](https://vulkan.gpuinfo.org/displayreport.php?id=53293), [Radeon RX 5500 XT](https://vulkan.gpuinfo.org/displayreport.php?id=45797) and [GeForce GTX 950](https://vulkan.gpuinfo.org/displayreport.php?id=47069).
+Use a current graphics driver for your card. The renderer requires Vulkan 1.3 with shader objects, depth clip control, push descriptors, conditional rendering, sparse buffer residency and min/max sampler filtering. Radeon also needs `VK_KHR_maintenance5`. Windows capability reports are available for the [Radeon RX 5300](https://vulkan.gpuinfo.org/displayreport.php?id=53293), [Radeon RX 5500 XT](https://vulkan.gpuinfo.org/displayreport.php?id=45797) and [GeForce GTX 950](https://vulkan.gpuinfo.org/displayreport.php?id=47069).
 
 The game has to be in a folder that contains `eboot.bin`, `sce_module` and `sce_sys`. A game that is still packaged in a single file has to be extracted first. Only version 1.02 works, because GOW3rehooked modifies the game at exact locations of that version's executable.
 
 ## Installation
+
+### Windows
 
 1. Download `GOW3rehooked-Windows-x86_64.zip` from the [Releases](../../releases/latest) page. For an Ivy Bridge CPU, download `GOW3rehooked-Windows-x86_64-AVX1.zip`.
 2. Extract the ZIP into the game folder, next to `eboot.bin`:
@@ -60,6 +62,12 @@ The game has to be in a folder that contains `eboot.bin`, `sce_module` and `sce_
 3. Run `gow3.exe`. The first few launches may show the [shader preparation screen](#shaders-prepared-in-advance).
 4. Choose your settings under Rehooked in the title menu.
 
+### Linux
+
+Download `GOW3rehooked-Linux-x86_64.zip` from [Releases](../../releases/latest). For an Ivy Bridge CPU, download `GOW3rehooked-Linux-x86_64-AVX1.zip`. Extract the ZIP next to `eboot.bin` and run `./gow3.AppImage`. Use `./gow3_debug.AppImage` for diagnostics. If your extractor dropped the executable bits, run `chmod +x gow3*.AppImage`. On systems without FUSE, set `APPIMAGE_EXTRACT_AND_RUN=1` when launching either executable.
+
+For a source build, use Clang and LLD, a C++23 standard library such as libstdc++ 14, CMake, Ninja, NASM, Vulkan headers 1.4.328 or newer, `glslc`, shaderc, glslang, SPIRV-Tools, and libunwind. The [workflow](.github/workflows/windows.yml) lists the Ubuntu 24.04 packages. Run `bash build-fast.sh --release`, then `build-fast/Linux/Release/bin/gow3 --game-dir /path/to/game`. Add `--ivy-bridge` to build for AVX1.
+
 Everything GOW3rehooked writes goes into `_rehooked_`:
 
 | Path | Contents |
@@ -68,7 +76,7 @@ Everything GOW3rehooked writes goes into `_rehooked_`:
 | `saves\` | Your saves |
 | `shader_cache\` | Translated shaders, and the shader recipes from the ZIP, which grow as you play |
 | `gow3.log` | A log, which grows with every launch |
-| `gow3-<date>-<time>.dmp` | Diagnostics of one session run with `gow3_debug.exe`, see [Reporting bugs](#reporting-bugs) |
+| `gow3-<date>-<time>.dmp` | Diagnostics of one session run with the debug launcher, see [Reporting bugs](#reporting-bugs) |
 
 To update, extract the new ZIP over the old files and let it replace them. Your settings, saves and translated shaders are not in the ZIP and stay as they are. To uninstall, delete the two executables and `licenses`, and `_rehooked_` as well if you don't want to keep your saves.
 
@@ -117,7 +125,7 @@ You can play with a gamepad or with keyboard and mouse, and remap both from a sc
 
 ### Menus and saves
 
-Continue appears above New Game once you have a save and directly loads the latest. The game originally has 32 manual save slots. GOW3rehooked raises that to 64. The save and load screens let you duplicate or delete saves. Open Save Folder opens Explorer with the selected save highlighted.
+Continue appears above New Game once you have a save and directly loads the latest. The game originally has 32 manual save slots. GOW3rehooked raises that to 64. The save and load screens let you duplicate or delete saves. Open Save Folder opens the selected save in your file manager.
 
 Rehooked holds every setting in the game's own menu style, feel free to tinker. Help and Controls has an explanation of each setting and allows you to remap the controls.
 
@@ -191,7 +199,7 @@ Defaults are in bold.
 
 ## Troubleshooting
 
-- “EBOOT.BIN NOT FOUND” at startup means `gow3.exe` is not in the game folder. Put it next to `eboot.bin`.
+- “EBOOT.BIN NOT FOUND” at startup means the launcher did not find the game folder. Put `gow3.exe` or `gow3.AppImage` next to `eboot.bin`.
 - “YOUR GAME IS COMPRESSED” means the folder holds a packaged game. Extract it first.
 - “YOUR GAME IS NOT VERSION 1.02” means the game needs its 1.02 update, or is not the European (CUSA01715) or American (CUSA01623) release.
 - If the game crashed before reaching the title menu, the next launch offers to reset your settings. Answer Yes if the crashes began after you changed one.
@@ -201,7 +209,7 @@ Defaults are in bold.
 
 Report problems on the [Issues](../../issues) page, after checking that yours isn't already there. A report that comes with diagnostic files is much easier to act on.
 
-1. Start the game with `gow3_debug.exe` instead of `gow3.exe`. It is the same game with diagnostics turned on, so it runs slower.
+1. Start the game with `gow3_debug.exe` on Windows or `gow3_debug.AppImage` on Linux. The game runs slower with diagnostics turned on.
 2. Reproduce the problem. If it is visual, press F9 while it is on screen. The game pauses for a moment while it records that frame.
 3. Quit from the title menu, or close the window.
 4. Open `_rehooked_` and find `gow3.log` and the newest `gow3-<date>-<time>.dmp` (a crash may leave only `gow3.log`).
@@ -209,12 +217,16 @@ Report problems on the [Issues](../../issues) page, after checking that yours is
    - what happened and what you expected;
    - where in the game it happens (a save from `_rehooked_\saves` made just before the problem helps);
    - your settings;
-   - your CPU, GPU, driver version and Windows version.
+   - your CPU, GPU, driver version and operating system version.
 
-If you are asked for a more detailed capture, start the game with this PowerShell command instead of step 1, replacing the path with your game folder. It is slower than `gow3_debug.exe` alone.
+If you are asked for a more detailed capture, set `GOW3_DEBUG=2` before running the debug launcher. It is slower than the default debug mode.
 
 ```powershell
 $env:GOW3_DEBUG = "2"; & "C:\your\game\path\gow3_debug.exe"
+```
+
+```sh
+GOW3_DEBUG=2 ./gow3_debug.AppImage
 ```
 
 ## Credits

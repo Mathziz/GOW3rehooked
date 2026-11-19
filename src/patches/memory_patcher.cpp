@@ -33,13 +33,17 @@ void MemoryPatcher::Apply(std::span<const MemoryPatch> patches) {
             if (!module.memory->TryWriteBacking(reinterpret_cast<void*>(module.GetBaseAddress() + p.rva),
                                                  p.replacement.data(), p.replacement.size()))
                 throw std::runtime_error("Patch range has no writable loader backing");
+#ifdef _WIN32
         if (!FlushInstructionCache(GetCurrentProcess(), nullptr, 0))
-            throw std::runtime_error(WindowsError("Publish memory patches"));
+            throw std::runtime_error(HostError("Publish memory patches"));
+#endif
     } catch (...) {
         for (const auto& p : patches)
             module.memory->TryWriteBacking(reinterpret_cast<void*>(module.GetBaseAddress() + p.rva),
                                             p.expected.data(), p.expected.size());
+#ifdef _WIN32
         FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+#endif
         throw;
     }
 }

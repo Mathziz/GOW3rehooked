@@ -71,7 +71,11 @@ template <class ReturnType, class... Args, PS4_SYSV_ABI ReturnType (*func)(Args.
 struct HostCallWrapperImpl<func> {
     // Kept out of line so the common path stays a flag test and a tail call, without the timer's frame and unwind state.
     [[clang::noinline, gnu::cold]] static ReturnType PS4_SYSV_ABI Timed(Args... args) {
+#ifdef _WIN32
         const HostCallTimer timer(__FUNCSIG__);
+#else
+        const HostCallTimer timer(__PRETTY_FUNCTION__);
+#endif
         return func(args...);
     }
     static ReturnType PS4_SYSV_ABI wrap(Args... args) {

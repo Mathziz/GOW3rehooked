@@ -17,7 +17,9 @@ using u64 = std::uint64_t;
 
 // Read-only mapping of one file.
 struct Mapping {
+#ifdef _WIN32
     void *file = nullptr, *mapping = nullptr;
+#endif
     const u8* data = nullptr;
     size_t size = 0;
     Mapping() = default;

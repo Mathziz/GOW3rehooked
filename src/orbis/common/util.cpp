@@ -5,21 +5,32 @@
 #include <chrono>
 #include <sstream>
 #include <thread>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <cstring>
+#include <sys/mman.h>
+#include <ucontext.h>
+#endif
 
 #include "orbis/common/assert.h"
 #include "orbis/common/ntapi.h"
 #include "orbis/common/slot_vector.h"
 #include "orbis/common/util.h"
 
+#ifdef _WIN32
 NtClose_t NtClose = nullptr;
 NtSetInformationFile_t NtSetInformationFile = nullptr;
 NtCreateThread_t NtCreateThread = nullptr;
 NtTerminateThread_t NtTerminateThread = nullptr;
 NtQueueApcThreadEx_t NtQueueApcThreadEx = nullptr;
 
+#endif
+
 namespace Common {
 
+#ifdef _WIN32
 namespace NtApi {
 void Initialize() {
     HMODULE nt_handle = GetModuleHandleA("ntdll.dll");
@@ -31,6 +42,7 @@ void Initialize() {
     NtQueueApcThreadEx = (NtQueueApcThreadEx_t)GetProcAddress(nt_handle, "NtQueueApcThreadEx");
 }
 } // namespace NtApi
+#endif
 
 const char g_scm_rev[] = "5d6ff7934d1296faf9684f1e585fc6deb52f19cb";
 
@@ -41,9 +53,13 @@ static u64 EstimateRDTSCFrequency() {
     FencedRDTSC();
 
     const auto now_ns = [] {
+#ifdef _WIN32
         FILETIME ft;
         GetSystemTimePreciseAsFileTime(&ft);
         return 100 * ((u64{ft.dwHighDateTime} << 32) | ft.dwLowDateTime);
+#else
+        return u64(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
     };
     const u64 start_time = now_ns();
     const u64 tsc_start = FencedRDTSC();
@@ -63,6 +79,7 @@ NativeClock::NativeClock()
                                        rdtsc_frequency)} {}
 
 std::string GetLastErrorMsg() {
+#ifdef _WIN32
     LPSTR err_str;
     const DWORD res = FormatMessageA(
         FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -74,6 +91,9 @@ std::string GetLastErrorMsg() {
     std::string ret(err_str);
     LocalFree(err_str);
     return ret;
+#else
+    return std::strerror(errno);
+#endif
 }
 
 std::string ToLower(std::string_view input) {
@@ -92,6 +112,7 @@ std::vector<std::string> SplitString(const std::string& str, char delimiter) {
     return output;
 }
 
+#ifdef _WIN32
 std::string UTF16ToUTF8(std::wstring_view input) {
     const int len = static_cast<int>(input.size());
     const int size = WideCharToMultiByte(CP_UTF8, 0, input.data(), len, nullptr, 0, nullptr, nullptr);
@@ -140,5 +161,28 @@ void ReleaseMemoryPages(void* base, std::size_t) noexcept {
         ASSERT(VirtualFree(base, 0, MEM_RELEASE));
     }
 }
+#else
+namespace {
+const auto& Registers(void* ctx) { return static_cast<ucontext_t*>(ctx)->uc_mcontext.gregs; }
+}
+
+void* GetRip(void* ctx) { return reinterpret_cast<void*>(Registers(ctx)[REG_RIP]); }
+bool IsWriteError(void* ctx) { return (Registers(ctx)[REG_ERR] & 2) != 0; }
+bool IsExecuteError(void* ctx) { return (Registers(ctx)[REG_ERR] & 16) != 0; }
+
+void* ReserveMemoryPages(std::size_t size) noexcept {
+    void* base = mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    ASSERT(base != MAP_FAILED);
+    return base;
+}
+
+void CommitMemoryPages(void* address, std::size_t size) noexcept {
+    ASSERT(mprotect(address, size, PROT_READ | PROT_WRITE) == 0);
+}
+
+void ReleaseMemoryPages(void* base, std::size_t size) noexcept {
+    if (base) ASSERT(munmap(base, size) == 0);
+}
+#endif
 
 } // namespace Common

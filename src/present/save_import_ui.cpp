@@ -3,6 +3,7 @@
 
 #include <SDL3/SDL.h>
 #include <chrono>
+#include <ctime>
 #include <format>
 #include <future>
 #include <memory>
@@ -90,7 +91,11 @@ std::string Summary(const SaveImport::SaveSet& set) {
                         std::chrono::duration_cast<std::chrono::seconds>(set.slots.front().time - std::chrono::file_clock::now());
     const auto time = std::chrono::system_clock::to_time_t(recent);
     std::tm local{};
+#ifdef _WIN32
     if (localtime_s(&local, &time)) return Count(set.slots.size()) + " found";
+#else
+    if (!localtime_r(&time, &local)) return Count(set.slots.size()) + " found";
+#endif
     char date[64];
     if (!std::strftime(date, sizeof(date), "%d %b %Y, %H:%M", &local)) return Count(set.slots.size()) + " found";
     return std::format("{} found. Most recent: {}.", Count(set.slots.size()), date);

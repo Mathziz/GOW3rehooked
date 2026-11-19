@@ -50,7 +50,11 @@ static float UiScale() {
 using Gow3::UI::Fade;
 
 #include "main/host.h"
+#ifdef _WIN32
 #include <shellapi.h>
+#else
+#include <SDL3/SDL_misc.h>
+#endif
 #undef DELETE // winnt.h / wingdi.h macros that clash with DialogType::DELETE and UserMessageType::ERROR
 #undef ERROR
 
@@ -923,6 +927,7 @@ void SaveDialogUi::DrawList(bool interactive) {
     if (has_folder && (IsKeyPressed(ImGuiKey_GamepadStart, false) || IsKeyPressed(ImGuiKey_F, false) ||
                        (IsMouseClicked(ImGuiMouseButton_Left) && folder_button.Contains(ctx.IO.MousePos)))) {
         auto path = SaveInstance::MakeDirSavePath(state->user_id, state->title_id, selected_item->dir_name);
+#ifdef _WIN32
         wchar_t windows[MAX_PATH]{};
         const auto length = GetWindowsDirectoryW(windows, MAX_PATH);
         if (!length || length >= MAX_PATH) return Gow3::Log("Could not find Explorer in the Windows directory");
@@ -930,6 +935,25 @@ void SaveDialogUi::DrawList(bool interactive) {
         const auto args = std::wstring(L"/select,\"") + path.make_preferred().native() + L"\"";
         if (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", explorer.c_str(), args.c_str(), nullptr, SW_SHOWNORMAL)) <= 32)
             Gow3::Log("Could not open the save folder in Explorer");
+#else
+        std::error_code ec;
+        const auto abs = std::filesystem::absolute(path, ec);
+        const auto& native = (ec ? path : abs).native();
+        std::string uri = "file://";
+        uri.reserve(uri.size() + native.size());
+        constexpr char kHex[] = "0123456789ABCDEF";
+        for (unsigned char c : native) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                c == '/' || c == '-' || c == '_' || c == '.' || c == '~') {
+                uri.push_back(static_cast<char>(c));
+            } else {
+                uri.push_back('%');
+                uri.push_back(kHex[c >> 4]);
+                uri.push_back(kHex[c & 0xF]);
+            }
+        }
+        if (!SDL_OpenURL(uri.c_str())) Gow3::Log("Could not open the save folder: " + std::string(SDL_GetError()));
+#endif
         return;
     }
 

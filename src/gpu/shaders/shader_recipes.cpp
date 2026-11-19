@@ -65,7 +65,11 @@ void Recipes::Configure(const std::filesystem::path& dir) {
     const auto path = dir / (PieceHash::UsesAes() ? "recipes-hash2-aes.bin" : "recipes-hash2-xxh.bin");
     std::uintmax_t good = 8;  // end of the last whole record
     bool valid = false;
+#ifdef _WIN32
     if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+#else
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {
+#endif
         std::uint32_t head[2];
         valid = std::fread(head, 4, 2, f) == 2 && head[0] == kMagic && head[1] == kFormat;
         std::vector<std::uint8_t> body;
@@ -90,7 +94,11 @@ void Recipes::Configure(const std::filesystem::path& dir) {
         std::error_code ec;  // a killed run left a torn tail: cut it
         std::filesystem::resize_file(path, good, ec);
     }
+#ifdef _WIN32
     file = _wfopen(path.c_str(), valid ? L"ab" : L"wb");
+#else
+    file = std::fopen(path.c_str(), valid ? "ab" : "wb");
+#endif
     if (!file) return;
     if (!valid) {
         const std::uint32_t head[2]{kMagic, kFormat};

@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
+#ifdef _WIN32
 #include <intrin.h>
+#endif
 #include <xxhash.h>
 
 namespace Gpu::PieceHash {
@@ -24,7 +26,11 @@ inline constexpr u64 secret[]{0x2d358dccaa6c78a5ull, 0x8bb84b93962eacc9ull, 0x4b
                               0xa0761d6478bd642full, 0xe7037ed1a0b428dbull, 0x90ed1765281c388cull, 0xaaaaaaaaaaaaaaaaull};
 static inline u64 Read64(const void* p) { u64 v; std::memcpy(&v, p, 8); return v; }
 static inline u64 Read32(const void* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
+#ifdef _WIN32
 static inline u64 Mix(u64 a, u64 b) { u64 hi; u64 lo = _umul128(a, b, &hi); return lo ^ hi; }
+#else
+static inline u64 Mix(u64 a, u64 b) { const unsigned __int128 p = static_cast<unsigned __int128>(a) * b; return u64(p) ^ u64(p >> 64); }
+#endif
 static inline u64 Rapid(const void* data, std::size_t size, u64 seed = 0) {
     const auto* p = static_cast<const std::uint8_t*>(data);
     seed ^= Mix(seed ^ secret[2], secret[1]);
@@ -71,7 +77,12 @@ static inline u64 Rapid(const void* data, std::size_t size, u64 seed = 0) {
         a = Read64(p + i - 16) ^ i; b = Read64(p + i - 8);
     }
     a ^= secret[1]; b ^= seed;
+#ifdef _WIN32
     u64 hi; a = _umul128(a, b, &hi); b = hi;
+#else
+    const unsigned __int128 prod = static_cast<unsigned __int128>(a) * b;
+    a = u64(prod); b = u64(prod >> 64);
+#endif
     return Mix(a ^ secret[7], b ^ secret[1] ^ i);
 }
 __attribute__((target("aes"))) static inline u64 AesShort(const void* data, std::size_t n) {

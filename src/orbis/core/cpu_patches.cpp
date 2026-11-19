@@ -1819,8 +1819,12 @@ static bool RedirectIvyBridgeTrap(void* context, bool decode) {
         trampoline = GetIvyBridgeTrampoline(*module, decoded, FindMatchingPatch(decoded));
     }
     if (!trampoline) return false;
+#ifdef _WIN32
     static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rip =
         reinterpret_cast<uintptr_t>(trampoline);
+#else
+    IncrementRip(context, reinterpret_cast<uintptr_t>(trampoline) - reinterpret_cast<uintptr_t>(site));
+#endif
     return true;
 }
 #endif

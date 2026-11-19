@@ -51,7 +51,7 @@ struct KeptFixed { RecipeHead h; u64 key, code_start, fetch_start; u32 file, pat
 
 u64 KeptStamp(u64 files_stamp) {
     std::error_code ec;
-    const auto module = Gow3::ExecutableDirectory() / L"gow3.exe";  // a new build derives the contract differently
+    const auto module = Gow3::ExecutableDirectory() / Gow3::ExecutableName;  // a new build derives the contract differently
     const u64 parts[]{files_stamp, Aot::sample_log2, std::filesystem::file_size(module, ec), u64(std::filesystem::last_write_time(module, ec).time_since_epoch().count()), kKeptFormat};
     return PieceHash::Stable64(parts, sizeof(parts));
 }

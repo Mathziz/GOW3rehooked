@@ -11,7 +11,9 @@
 #include <format>
 #include <optional>
 #include <string>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include "orbis/common/elf_info.h"
 #include "orbis/core/emulator_settings.h"
 #include "ui/gow3_ui_theme.h"
@@ -312,10 +314,16 @@ void Show(bool logos, bool wanted) {
 void Priority::Step() {
     const State now = state.load(std::memory_order_acquire);
     if (now == State::Up && !raised) {
+#ifdef _WIN32
         was = GetThreadPriority(GetCurrentThread()), raised = true;
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#else
+        raised = true;
+#endif
     } else if (now == State::Gone) {
+#ifdef _WIN32
         if (raised) SetThreadPriority(GetCurrentThread(), was);
+#endif
         done = true;
     }
 }

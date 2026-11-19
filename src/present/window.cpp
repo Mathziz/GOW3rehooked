@@ -12,6 +12,9 @@
 #include <span>
 #include <stdexcept>
 #include <vector>
+#ifndef _WIN32
+#include <linux/close_range.h>
+#endif
 #include "orbis/common/elf_info.h"
 #include "orbis/core/emulator_settings.h"
 #include "ui/imgui_core.h"
@@ -42,6 +45,14 @@ SDL_Window* window;
 Uint32 restart_event, main_menu_event;
 Frontend::WindowSDL input_window;
 
+void SaveRestartSettings(const std::filesystem::path& game, const Config& config) {
+    const auto path = game / PortDir::Root / PortDir::Settings / "config.cfg";
+    const bool mechanism_changed = LoadConfig(path).shader_mechanism != config.shader_mechanism;
+    SaveMenuConfig(path, config);
+    if (mechanism_changed) ResetAotCooldown();
+}
+
+#ifdef _WIN32
 struct Handle {
     HANDLE value{};
     ~Handle() { if (value) CloseHandle(value); }
@@ -67,17 +78,17 @@ void Restart(const std::filesystem::path& game, const Config* config, bool jit_o
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &parent.value, SYNCHRONIZE, TRUE, 0) ||
         !(cancel.value = CreateEventW(&security, TRUE, FALSE, nullptr)) ||
         !(ready.value = CreateEventW(&security, TRUE, FALSE, nullptr)))
-        throw std::runtime_error(WindowsError("Prepare restart handles"));
+        throw std::runtime_error(HostError("Prepare restart handles"));
     SIZE_T bytes{};
     InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
     std::vector<unsigned char> buffer(bytes);
     auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.data());
     if (!InitializeProcThreadAttributeList(attributes, 1, 0, &bytes))
-        throw std::runtime_error(WindowsError("Prepare restart attributes"));
+        throw std::runtime_error(HostError("Prepare restart attributes"));
     const auto cleanup = std::unique_ptr<std::remove_pointer_t<LPPROC_THREAD_ATTRIBUTE_LIST>, decltype(&DeleteProcThreadAttributeList)>(attributes, DeleteProcThreadAttributeList);
     HANDLE inherited[]{parent.value, cancel.value, ready.value};
     if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr))
-        throw std::runtime_error(WindowsError("Prepare restart inheritance"));
+        throw std::runtime_error(HostError("Prepare restart inheritance"));
     const auto executable = ExecutableDirectory() / L"gow3.exe";
     std::wstring command = QuotePath(executable) + L" --restart-after " +
         std::to_wstring(reinterpret_cast<uintptr_t>(parent.value)) + L" " +
@@ -91,7 +102,7 @@ void Restart(const std::filesystem::path& game, const Config* config, bool jit_o
     const bool started = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE, EXTENDED_STARTUPINFO_PRESENT,
                                         nullptr, nullptr, &startup.StartupInfo, &process);
     if (jit_once) SetEnvironmentVariableW(JitOnceVariable, nullptr);
-    if (!started) throw std::runtime_error(WindowsError("Start replacement game"));
+    if (!started) throw std::runtime_error(HostError("Start replacement game"));
     Handle child, thread;
     child.value = process.hProcess;
     thread.value = process.hThread;
@@ -101,17 +112,29 @@ void Restart(const std::filesystem::path& game, const Config* config, bool jit_o
         throw std::runtime_error("Replacement game could not prepare for restart");
     }
     try {
-        if (config && !jit_once) {
-            const auto config_path = game / PortDir::Root / PortDir::Settings / "config.cfg";
-            const bool mechanism_changed = LoadConfig(config_path).shader_mechanism != config->shader_mechanism;
-            SaveMenuConfig(config_path, *config);
-            if (mechanism_changed) ResetAotCooldown();
-        }
+        if (config && !jit_once) SaveRestartSettings(game, *config);
     } catch (...) {
         SetEvent(cancel.value);
         throw;
     }
 }
+
+#else
+constexpr const char* JitOnceVariable = "GOW3_JIT_ONCE";
+
+[[noreturn]] void Restart(const std::filesystem::path& game, bool jit_once) {
+    if (!jit_once || setenv(JitOnceVariable, "1", 1) == 0) {
+        // Retain the AppImage mount while this process restarts, and drop all descriptors of the old runtime.
+        if (close_range(3, ~0u, CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE) == 0)
+            execl("/proc/self/exe", ExecutableName, "--game-dir", game.c_str(), nullptr);
+    }
+    const auto error = HostError("Start replacement game");
+    Log(error);
+    try { FlushLog(PortDirectory() / "gow3.log"); } catch (...) {}
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", error.c_str(), window);
+    ExitImmediately(1);
+}
+#endif
 
 // Event forwarding mirrors src/sdl_window.cpp (WindowSDL::WaitEvent, OnKeyboardMouseInput, OnGamepadEvent,
 // InitTimers); bindings come from the upstream input config (user/input_config/*.ini).
@@ -254,7 +277,13 @@ Prompt::Answer Ask(const Prompt::Content& content) {
     Prompt::Answer answer;
     for (SDL_Event event; (answer = Prompt::Result()) == Prompt::Answer::Pending;) {
         if (SDL_WaitEventTimeout(&event, 16)) {
-            if (event.type == SDL_EVENT_QUIT) TerminateProcess(GetCurrentProcess(), 0);
+            if (event.type == SDL_EVENT_QUIT) {
+#ifdef _WIN32
+                TerminateProcess(GetCurrentProcess(), 0);
+#else
+                ExitImmediately(0);
+#endif
+            }
             ImGui::Core::ProcessEvent(event);
         }
         ImGui::Core::NewFrame();
@@ -265,13 +294,16 @@ Prompt::Answer Ask(const Prompt::Content& content) {
 
 void ReportStartupError(StartupError error) {
     static constexpr const char* text[][3]{
+#ifdef _WIN32
         {"EBOOT.BIN NOT FOUND", "Place gow3.exe next to eboot.bin.", ""},
+#else
+        {"EBOOT.BIN NOT FOUND", "Place gow3.AppImage or gow3 next to eboot.bin.", ""},
+#endif
         {"YOUR GAME IS COMPRESSED", "Extract it before playing.", ""},
         {"YOUR GAME IS NOT VERSION 1.02", "Update it to version 1.02 before playing.", "CUSA01715 (Europe) and CUSA01623 (America) are supported."}};
     const auto& t = text[size_t(error)];
     Ask({"ERROR STARTING THE GAME", t[0], {t[1], t[2]}, false});
-    TerminateProcess(GetCurrentProcess(), 1);
-    ExitProcess(1); // only reached if termination failed
+    ExitImmediately(1);
 }
 
 void AskAfterCrash(const std::filesystem::path& game_directory) {
@@ -282,6 +314,7 @@ void AskAfterCrash(const std::filesystem::path& game_directory) {
     if (answer == Prompt::Answer::Yes)
         std::filesystem::remove(game_directory / PortDir::Root / PortDir::Settings / "config.cfg", error);
     EndLaunch();
+#ifdef _WIN32
     const auto executable = ExecutableDirectory() / L"gow3.exe";
     std::wstring command = QuotePath(executable) + L" --game-dir " + QuotePath(game_directory);
     STARTUPINFOW startup{sizeof(startup)};
@@ -290,10 +323,12 @@ void AskAfterCrash(const std::filesystem::path& game_directory) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
     } else {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", WindowsError("Start the game").c_str(), window);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", HostError("Start the game").c_str(), window);
     }
-    TerminateProcess(GetCurrentProcess(), 0);
-    ExitProcess(0); // only reached if termination failed
+    ExitImmediately(0);
+#else
+    Restart(game_directory, false);
+#endif
 }
 
 namespace {
@@ -321,12 +356,20 @@ void NotifyMainMenuReady() {
 }
 
 bool TakeJitOnce() {
+#ifdef _WIN32
     const bool set = GetEnvironmentVariableW(JitOnceVariable, nullptr, 0) != 0;
     if (set) SetEnvironmentVariableW(JitOnceVariable, nullptr);  // the next restart is AOT again
+#else
+    const bool set = std::getenv(JitOnceVariable) != nullptr;
+    if (set) unsetenv(JitOnceVariable);
+#endif
     return set;
 }
 
 void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::path& game_directory) {
+#ifndef _WIN32
+    bool restart = false, jit_once = false;
+#endif
     auto& controllers = *Common::Singleton<Input::GameControllers>::Instance();
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
@@ -341,6 +384,7 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
     for (SDL_Event event;;) {
         priority.Update();
         if (SaveImportUi::Update()) {
+#ifdef _WIN32
             try {
                 Restart(game_directory, nullptr, false);
                 break;
@@ -349,6 +393,10 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
                 SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", error.what(), window);
                 SaveImportUi::RestartFailed();
             }
+#else
+            restart = true;
+            break;
+#endif
         }
         const bool mouse_inside = SDL_GetMouseFocus() == window;
         const Uint64 elapsed = SDL_GetTicks() - mouse_time;
@@ -377,7 +425,13 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
         if (event.type == restart_event) {
             std::unique_ptr<Config> config(static_cast<Config*>(event.user.data1));
             try {
+#ifdef _WIN32
                 Restart(game_directory, config.get(), event.user.data2 != nullptr);
+#else
+                jit_once = event.user.data2 != nullptr;
+                if (!jit_once) SaveRestartSettings(game_directory, *config);
+                restart = true;
+#endif
                 break;
             } catch (const std::exception& error) {
                 Log(std::string("Settings restart failed: ") + error.what());
@@ -433,7 +487,9 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
     Gpu::Recipes::Instance().Report();
     try { FlushLog(log_path); } catch (...) {}
     EndLaunch();
-    TerminateProcess(GetCurrentProcess(), 0);
-    ExitProcess(0); // only reached if termination failed
+#ifndef _WIN32
+    if (restart) Restart(game_directory, jit_once);
+#endif
+    ExitImmediately(0);
 }
 } // namespace Gow3::Window

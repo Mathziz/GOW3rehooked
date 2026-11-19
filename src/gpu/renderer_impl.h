@@ -24,13 +24,15 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX  // TEMP fault (framecap builds without these)
 #endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <windows.h>  // fault diagnostics: thread names and call stacks of address bindings
+#include <windows.h>
+#endif
 #include "orbis/common/thread.h"
 #include "gpu/hazards.h"
 #include "gpu/vk_gpu.h"
@@ -308,7 +310,7 @@ struct Renderer::Impl {
     Flat<std::unique_ptr<BlockHashes[]>> written_blocks;  // dense page metadata within sparse 1 MB chunks
     void InvalidateBlocks(u64 a, u64 n = 1) {
         for (const u64 end = a + n; a < end;) {
-            const u64 hi = std::min(end, (a | 0xFFFFFull) + 1);
+            const u64 hi = std::min(end, (a | u64{0xFFFFF}) + 1);
             if (auto* b = written_blocks.Find(a >> 20))
                 for (u64 p = a >> 12; p < ((hi + 0xFFF) >> 12); ++p) (*b)[p & 255].witness = 0;
             a = hi;

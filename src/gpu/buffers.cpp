@@ -416,7 +416,14 @@ u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
 #include <memory>
 #include <mutex>
 #include <vector>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <sched.h>
+#include <sys/mman.h>
+#include <time.h>
+#include "orbis/core/signals.h"
+#endif
 #include "orbis/core/memory.h"
 #include "gpu/vk_gpu.h"
 #include "main/memory_observer.h"
@@ -432,15 +439,47 @@ const std::unique_ptr<std::atomic<u8>[]> state(new std::atomic<u8>[kPages]{});
 // Host readability per page (one bit each) as VirtualQuery reported it, dropped on every guest mapping change:
 // VirtualQuery walks the page tables to the end of the region, tens of microseconds to milliseconds on the large views.
 const std::unique_ptr<std::atomic<u64>[]> known(new std::atomic<u64>[kPages / 64]{}), readable(new std::atomic<u64>[kPages / 64]{});
+#ifdef _WIN32
 std::mutex dirty_lock;
-std::vector<u64> dirty;                       // pages reopened by a CPU write since the last frame
+std::vector<u64> dirty; // pages reopened by CPU writes since the last frame
+#else
+// Two levels let the signal handler publish without locks and keep collection proportional to dirty pages.
+const std::unique_ptr<std::atomic<u64>[]> dirty_words(new std::atomic<u64>[kPages / 64]{});
+const std::unique_ptr<std::atomic<u64>[]> dirty_groups(new std::atomic<u64>[kPages / 4096]{});
+#endif
 std::vector<u64> closed;                      // pages the last frame protected again from `dirty`, sorted (GPU thread)
 struct Live { u64 page; u32 quiet; };         // quiet: frames since its bytes last changed
 std::vector<Live> dynamic;                    // pages offered every frame (GPU thread)
 std::atomic<u32> generation{1};               // bumped on every mapping change: a query racing it may report the old one
 
 Kind KindOf(u64 page) { return Kind(state[page].load(std::memory_order_acquire) & 7); }
+#ifdef _WIN32
+using PageProtection = DWORD;
+constexpr PageProtection ReadOnly = PAGE_READONLY, ExecuteRead = PAGE_EXECUTE_READ;
+constexpr PageProtection ReadWrite = PAGE_READWRITE, ExecuteReadWrite = PAGE_EXECUTE_READWRITE;
 bool Writable(DWORD p) { return p & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY); }
+bool ProtectPages(u64 address, u64 size, PageProtection prot) {
+    DWORD old;
+    return VirtualProtect(reinterpret_cast<void*>(address), size, prot, &old) != 0;
+}
+#else
+using PageProtection = int;
+constexpr PageProtection ReadOnly = PROT_READ, ExecuteRead = PROT_READ | PROT_EXEC;
+constexpr PageProtection ReadWrite = PROT_READ | PROT_WRITE, ExecuteReadWrite = PROT_READ | PROT_WRITE | PROT_EXEC;
+struct PageRange { u64 begin, end; bool read, write, exec; };
+
+bool QueryPage(u64 address, PageRange& r) {
+    VAddr begin, end;
+    int prot;
+    if (!Core::Memory::Instance()->QueryHostRegion(address, begin, end, prot)) return false;
+    r = {begin, end, bool(prot & (PROT_READ | PROT_WRITE)), bool(prot & PROT_WRITE), bool(prot & PROT_EXEC)};
+    return true;
+}
+
+bool ProtectPages(u64 address, u64 size, PageProtection prot) {
+    return mprotect(reinterpret_cast<void*>(address), size, prot) == 0;
+}
+#endif
 
 // f(word, mask) over the bitmap words of pages [p0, p1), while it returns true.
 bool Words(u64 p0, u64 p1, auto&& f) {
@@ -459,12 +498,36 @@ bool All(const std::atomic<u64>* bits, u64 p0, u64 p1) {
 }
 
 // Protects [p0, p1) with one call per allocation piece, splitting at 16 KB guest boundaries when a span crosses allocations.
-void ProtectRange(u64 p0, u64 p1, DWORD prot) {
-    DWORD old;
-    if (p1 <= p0 || VirtualProtect(reinterpret_cast<void*>(p0 * kPage), (p1 - p0) * kPage, prot, &old) || p1 - p0 == 1) return;
+void ProtectRange(u64 p0, u64 p1, PageProtection prot) {
+    if (p1 <= p0 || ProtectPages(p0 * kPage, (p1 - p0) * kPage, prot)) return;
+#ifdef _WIN32
+    if (p1 - p0 == 1) return;
+#else
+    if (p1 - p0 == 1) {
+        // If the page could not be closed, stage it again on the next draw instead of expecting a write fault.
+        if (!(prot & PROT_WRITE)) {
+            u8 expected = Clean | (prot & PROT_EXEC ? kExec : 0);
+            state[p0].compare_exchange_strong(expected, Unknown);
+        }
+        return;
+    }
+#endif
     u64 mid = ((p0 + p1) / 2) & ~3ull;
     if (mid <= p0) mid = (p0 + p1) / 2;
     ProtectRange(p0, mid, prot), ProtectRange(mid, p1, prot);
+}
+
+void QueueDirty(u64 page, u64 end) {
+#ifdef _WIN32
+    std::scoped_lock lock(dirty_lock);
+    for (u64 p = page; p < end; ++p) dirty.push_back(p);
+#else
+    Words(page, end, [](u64 word, u64 mask) {
+        dirty_words[word].fetch_or(mask, std::memory_order_release);
+        dirty_groups[word / 64].fetch_or(u64{1} << (word % 64), std::memory_order_release);
+        return true;
+    });
+#endif
 }
 
 // Reopens a protected page and queues it: the number of pages reopened, 0 when another thread already did. The protected pages
@@ -480,50 +543,94 @@ u64 Reopen(u64 page, u64 span = 16) {
                 u8 n = state[end].load(std::memory_order_relaxed);
                 if ((n & (7 | kExec)) != ((v & kExec) | Clean) || !state[end].compare_exchange_strong(n, u8((n & ~7) | Dirty))) break;
             }
-            ProtectRange(page, end, v & kExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE);
-            std::scoped_lock lock(dirty_lock);
-            for (u64 p = page; p < end; ++p) dirty.push_back(p);
+            ProtectRange(page, end, v & kExec ? ExecuteReadWrite : ReadWrite);
+            QueueDirty(page, end);
             return end - page;
         }
     return 0;
 }
 
+// Aliasless readbacks share the mapping with guest writers. Keep it dirty until BeginFrame samples it.
+bool OpenForReadback(u64 page, bool writable) {
+    u8 v = state[page].load(std::memory_order_acquire);
+    if ((v & 7) == Clean) {
+        u8 dirty_state = (v & kExec) | Dirty;
+        if (state[page].compare_exchange_strong(v, dirty_state)) {
+            if (!ProtectPages(page * kPage, kPage, v & kExec ? ExecuteReadWrite : ReadWrite)) {
+                state[page].compare_exchange_strong(dirty_state, v);
+                return false;
+            }
+            QueueDirty(page, page + 1);
+            return true;
+        }
+        // A concurrent reopen publishes Dirty before changing the host protection.
+        writable = false;
+    }
+    return writable || ((v & 7) == Dirty && ProtectPages(page * kPage, kPage, v & kExec ? ExecuteReadWrite : ReadWrite));
+}
+
+#ifdef _WIN32
 LONG CALLBACK OnFault(EXCEPTION_POINTERS* e) {
     const auto* r = e->ExceptionRecord;
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
     const u64 page = r->ExceptionInformation[1] / kPage;
-    if (page >= kPages) return EXCEPTION_CONTINUE_SEARCH;
+    constexpr LONG resume = EXCEPTION_CONTINUE_EXECUTION, next_handler = EXCEPTION_CONTINUE_SEARCH;
+#else
+bool OnFault(void* context, void* address) {
+    if (!Common::IsWriteError(context)) return false;
+    const u64 page = reinterpret_cast<u64>(address) / kPage;
+    constexpr bool resume = true, next_handler = false;
+#endif
+    if (page >= kPages) return next_handler;
     const Gow3::FaultTimer timer;
     static thread_local u64 lost_page = ~0ull;  // the page this thread last lost the reopen of, and how many times in a row
     static thread_local u32 lost = 0;
     // A fault where the last reopened run ended is a copy going forward (memcpy of megabytes): the runs double, up to 1 MB.
     static thread_local u64 next_page = ~0ull, span = 16;
     span = page == next_page ? std::min<u64>(span * 2, 256) : 16;
-    if (const u64 n = Reopen(page, span)) return lost = 0, next_page = page + n, EXCEPTION_CONTINUE_EXECUTION;
+    if (const u64 n = Reopen(page, span)) return lost = 0, next_page = page + n, resume;
     // Another thread won the reopen and may not have changed the protection yet: run the access again, which faults again only
     // while it is still protected. VirtualQuery here walks the page tables of a view of gigabytes: milliseconds per fault.
     const Kind k = KindOf(page);
     if ((k == Dirty || k == Dynamic || k == Clean) && (lost = page == lost_page ? lost + 1 : 1, lost_page = page, lost <= 16)) {
-        if (lost > 2) SwitchToThread();
-        return EXCEPTION_CONTINUE_EXECUTION;
+        if (lost > 2) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        }
+        return resume;
     }
+#ifdef _WIN32
     MEMORY_BASIC_INFORMATION m;
     if ((k == Dirty || k == Dynamic || k == Clean) && VirtualQuery(reinterpret_cast<void*>(page * kPage), &m, sizeof(m)) &&
         (Writable(m.Protect) || m.Protect == PAGE_READONLY || m.Protect == PAGE_EXECUTE_READ))
-        return EXCEPTION_CONTINUE_EXECUTION;
-    return EXCEPTION_CONTINUE_SEARCH;
+        return resume;
+#else
+    if ((k == Dirty || k == Dynamic || k == Clean) && lost <= 1024) {
+        const timespec ts{0, 10'000};
+        nanosleep(&ts, nullptr);
+        return resume;
+    }
+#endif
+    return next_handler;
 }
 
-// Protects the pages (page << 1 | executable, sorted) read-only, one call per run of neighbours, then opens again those a
-// reopen took meanwhile (InvalidateMemory): its own protection change may have landed before this one.
+// Reopen may have made a page writable just before our protection change landed.
+void CloseCleanPages(u64 first, u64 end, bool exec) {
+    ProtectRange(first, end, exec ? ExecuteRead : ReadOnly);
+    for (u64 p = first; p < end; ++p)
+        if (KindOf(p) == Dirty) ProtectRange(p, p + 1, exec ? ExecuteReadWrite : ReadWrite);
+}
+
+// Encoded as page << 1 | executable, sorted.
 void Protect(const std::vector<u64>& pages) {
-    DWORD old;
     for (size_t i = 0, j; i < pages.size(); i = j) {
         for (j = i + 1; j < pages.size() && pages[j] == pages[j - 1] + 2; ++j) {}
-        ProtectRange(pages[i] >> 1, (pages[i] >> 1) + (j - i), pages[i] & 1 ? PAGE_EXECUTE_READ : PAGE_READONLY);
+        const u64 first = pages[i] >> 1;
+        CloseCleanPages(first, first + (j - i), pages[i] & 1);
     }
-    for (u64 p : pages)
-        if (KindOf(p >> 1) == Dirty) VirtualProtect(reinterpret_cast<void*>((p >> 1) * kPage), kPage, p & 1 ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, &old);
 }
 
 // A guest mapping or protection change: the pages are tracked and queried again.
@@ -553,7 +660,11 @@ std::atomic<u64> temp_queries{0};  // debug: VirtualQuery calls of Readable and 
 // ---- Public tracking API ----
 
 void Install() {
+#ifdef _WIN32
     AddVectoredExceptionHandler(1, OnFault);
+#else
+    Core::Signals::Instance()->RegisterAccessViolationHandler(OnFault, 1);
+#endif
     Core::Memory::Instance()->SetMemoryObserver(&observer);
 }
 
@@ -562,8 +673,12 @@ void SetRegions(const std::vector<Range>& regions) {
         for (u64 p = lo / kPage, end = std::min((hi + kPage - 1) / kPage, kPages); p < end; ++p) {
             u8 v = state[p].load();
             if ((v & 7) == Clean) {  // tracked before the regions were known: reopen without queueing
+#ifdef _WIN32
                 DWORD old;
                 VirtualProtect(reinterpret_cast<void*>(p * kPage), kPage, v & kExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, &old);
+#else
+                ProtectPages(p * kPage, kPage, v & kExec ? ExecuteReadWrite : ReadWrite);
+#endif
             }
             state[p].store(Region);
         }
@@ -571,11 +686,21 @@ void SetRegions(const std::vector<Range>& regions) {
 
 u32 BeginFrame(Gpu::Renderer& renderer, const std::vector<Range>& offer) {
     std::vector<u64> pages;
+#ifdef _WIN32
     {
         std::scoped_lock lock(dirty_lock);
         pages.swap(dirty);
     }
     std::sort(pages.begin(), pages.end());
+#else
+    for (u64 i = 0; i < kPages / 4096; ++i) {
+        for (u64 group = dirty_groups[i].exchange(0, std::memory_order_acquire); group; group &= group - 1) {
+            const u64 word = i * 64 + std::countr_zero(group);
+            for (u64 bits = dirty_words[word].exchange(0, std::memory_order_acquire); bits; bits &= bits - 1)
+                pages.push_back(word * 64 + std::countr_zero(bits));
+        }
+    }
+#endif
     // Everything this frame offers goes to the renderer in one batch (hashed in parallel), each page after its protection.
     static std::vector<Gpu::Renderer::WriteRange> writes;
     static std::vector<u64> now, protect;  // pages protected again: from `dirty` (the next `closed`); all of them, for Protect
@@ -633,21 +758,34 @@ bool Track(Gpu::Renderer& renderer, u64 lo, u64 hi) {
             a += kPage;
             continue;
         }
+#ifdef _WIN32
         MEMORY_BASIC_INFORMATION m;
+#else
+        PageRange range;
+#endif
         GOW3_DIAG temp_queries.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
         if (!VirtualQuery(reinterpret_cast<void*>(a), &m, sizeof(m))) break;
         const u64 region_end = std::min(hi, u64(m.BaseAddress) + m.RegionSize);
         if (m.State != MEM_COMMIT || (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !m.Protect) {
+#else
+        if (!QueryPage(a, range)) break;
+        const u64 region_end = std::min(hi, range.end);
+        if (!range.read) {
+#endif
             a = region_end;
             continue;
         }
         u64 end = a;
         while (end < region_end && KindOf(end / kPage) == Unknown) end += kPage;
+#ifdef _WIN32
         const DWORD prot = m.Protect & 0xFF;
         const bool writable = Writable(prot), exec = prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+#else
+        const bool writable = range.write, exec = range.exec;
+#endif
         for (u64 p = a / kPage; p < end / kPage; ++p) state[p].store(u8((writable ? Clean : Fixed) | (exec ? kExec : 0)));
-        DWORD old;
-        if (writable) VirtualProtect(reinterpret_cast<void*>(a), end - a, exec ? PAGE_EXECUTE_READ : PAGE_READONLY, &old);
+        if (writable) CloseCleanPages(a / kPage, end / kPage, exec);
         renderer.Write(a, reinterpret_cast<const void*>(a), end - a);
         staged = true;
         a = end;
@@ -669,19 +807,20 @@ u64 Store(u64 addr, const void* data, u64 size) {
             if (single) hash = Gpu::PieceHash::Copy(dst, src + o, n);
             else std::memcpy(dst, src + o, n);
         };
+#ifdef _WIN32
         MEMORY_BASIC_INFORMATION m;
+#else
+        PageRange range;
+#endif
         if (const auto* e = a >> 40 ? nullptr : backing.find(a / kBacking); e && *e) {
             write_piece(*e + (a & (kBacking - 1)));
-        } else if (page < kPages && VirtualQuery(reinterpret_cast<void*>(a), &m, sizeof(m)) && m.State == MEM_COMMIT) {
-            const u8 v = state[page].load();
-            if ((v & 7) == Clean) {  // ours: open, store, close again without queueing the page
-                DWORD old;
-                VirtualProtect(reinterpret_cast<void*>(page * kPage), kPage, v & kExec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, &old);
-                write_piece(reinterpret_cast<void*>(a));
-                VirtualProtect(reinterpret_cast<void*>(page * kPage), kPage, old, &old);
-            } else if (Writable(m.Protect)) {
-                write_piece(reinterpret_cast<void*>(a));
-            }
+#ifdef _WIN32
+        } else if (page < kPages && VirtualQuery(reinterpret_cast<void*>(a), &m, sizeof(m)) && m.State == MEM_COMMIT &&
+                   OpenForReadback(page, Writable(m.Protect))) {
+#else
+        } else if (page < kPages && QueryPage(a, range) && range.write && OpenForReadback(page, true)) {
+#endif
+            write_piece(reinterpret_cast<void*>(a));
         }
         o += n;
     }
@@ -699,11 +838,21 @@ bool Readable(u64 addr, u64 size) {
     u64 lo = 0, a = addr;
     bool ok = true;
     while (ok && a < addr + size) {
+#ifdef _WIN32
         MEMORY_BASIC_INFORMATION m;
+#else
+        PageRange range;
+#endif
         GOW3_DIAG temp_queries.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
         if (!VirtualQuery(reinterpret_cast<void*>(a), &m, sizeof(m))) return false;
         const u64 base = u64(m.BaseAddress), end = base + m.RegionSize;
         ok = m.State == MEM_COMMIT && m.Protect && !(m.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+#else
+        if (!QueryPage(a, range)) return false;
+        const u64 base = range.begin, end = range.end;
+        ok = range.read;
+#endif
         Mark(readable.get(), base / kPage, end / kPage, ok), Mark(known.get(), base / kPage, end / kPage, true);
         lo = a == addr ? base : lo, a = end;
     }

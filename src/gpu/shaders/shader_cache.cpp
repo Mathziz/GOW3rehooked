@@ -12,7 +12,12 @@
 #include "gpu/shaders/shader_recipes.h"
 #include "main/cpu.h"
 #include "main/host.h"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "main/mapped_file.h"
+#include "orbis/common/thread.h"
+#endif
 
 namespace Gpu {
 namespace {
@@ -48,23 +53,34 @@ std::string WadName(const char* path) {
 }
 
 struct ShaderCache::View {
+#ifdef _WIN32
     HANDLE file = INVALID_HANDLE_VALUE, map = nullptr;
+#endif
     const std::uint8_t* data = nullptr;
     std::size_t size = 0;
     ~View() { Close(); }
     void Close() {
+#ifdef _WIN32
         if (data) UnmapViewOfFile(data);
         if (map) CloseHandle(map);
         if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
-        file = INVALID_HANDLE_VALUE, map = nullptr, data = nullptr, size = 0;
+        file = INVALID_HANDLE_VALUE, map = nullptr;
+#else
+        Gow3::UnmapReadOnly(data, size);
+#endif
+        data = nullptr, size = 0;
     }
     bool Open(const std::filesystem::path& path) {  // shared for writing: the cache appends to the file meanwhile
+#ifdef _WIN32
         file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
         LARGE_INTEGER n{};
         if (file == INVALID_HANDLE_VALUE || !GetFileSizeEx(file, &n) || n.QuadPart <= 0) return Close(), false;
         size = std::size_t(n.QuadPart), map = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
         if (map) data = static_cast<const std::uint8_t*>(MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0));
         return data ? true : (Close(), false);
+#else
+        return Gow3::MapReadOnly(path, data, size);
+#endif
     }
 };
 
@@ -155,7 +171,11 @@ void ShaderCache::Configure(const std::filesystem::path& d, CacheKind k) {
     if (enabled && k == CacheKind::Aot) {
         wad_seen.insert(::Gpu::PieceHash::WadName("EBOOT", 5)), wad_queue.push_back("EBOOT");  // the executable's programs are always needed
         wad_thread = std::jthread([this](const std::stop_token& stop) {
+#ifdef _WIN32
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
+            Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+#endif
             for (;;) {
                 std::string wad;
                 {
@@ -465,17 +485,30 @@ void ShaderCache::Warm(const std::string& name) {
         const std::shared_ptr<View> v = Mapped(at.back().offset + at.back().packed);
         if (!v) return;
         constexpr std::uint64_t kGap = 512u << 10;  // read through a gap this small: cheaper than a seek
+#ifdef _WIN32
         std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+#else
+        const auto page_mask = std::uint64_t(getpagesize() - 1);
+#endif
         for (std::uint64_t from = at[0].offset, to = from, k = 0; k <= at.size(); ++k) {
             if (k == at.size() || at[k].offset > to + kGap) {
-                ranges.push_back({const_cast<std::uint8_t*>(v->data) + from, SIZE_T(to - from)}), bytes += to - from;
+#ifdef _WIN32
+                ranges.push_back({const_cast<std::uint8_t*>(v->data) + from, SIZE_T(to - from)});
+#else
+                const auto start = from & ~page_mask;
+                madvise(const_cast<std::uint8_t*>(v->data) + start, to - start, MADV_WILLNEED);
+                ++pieces;
+#endif
+                bytes += to - from;
                 if (k == at.size()) break;
                 from = at[k].offset;
             }
             to = std::max(to, at[k].offset + at[k].packed);
         }
+#ifdef _WIN32
         pieces += ranges.size();
         PrefetchVirtualMemory(GetCurrentProcess(), ranges.size(), ranges.data(), 0);
+#endif
     };
     ahead(used);
     std::uint32_t made[3]{};  // already there (another WAD's or a draw's), made now, failed
@@ -542,7 +575,11 @@ void ShaderCache::Flush(const char* why, bool all_threads) {
 }
 
 void ShaderCache::FlushLoop(const std::stop_token& stop) {
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+#endif
     constexpr auto kTick = std::chrono::milliseconds(500);
     constexpr std::size_t kWindow = 4;                // ticks: what the game does within two seconds
     constexpr std::uint64_t kLoadBytes = 128u << 20;  // streamed into guest memory within the window: a loading screen

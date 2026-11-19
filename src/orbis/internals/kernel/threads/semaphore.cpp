@@ -8,10 +8,12 @@
 #include <limits>
 #include <list>
 #include <mutex>
+#include <thread>
 
 #include "orbis/internals/kernel/sync/semaphore.h"
 
 #include "orbis/logging/log.h"
+#include "orbis/common/futex.h"
 #include "orbis/common/slot_vector.h"
 #include "orbis/internals/kernel/kernel.h"
 #include "orbis/internals/kernel/orbis_error.h"
@@ -315,13 +317,21 @@ public:
             // The waiter may return immediately after publication. Waking only uses the address.
             auto* address = &state;
             state.store(1, std::memory_order_release);
+#ifdef _WIN32
             WakeByAddressSingle(address);
+#else
+            Common::FutexWakeAll(address);
+#endif
         }
 
         void WaitInfinite() noexcept {
             while (state.load(std::memory_order_acquire) == 0) {
+#ifdef _WIN32
                 u32 zero = 0;
                 WaitOnAddress(&state, &zero, sizeof(state), INFINITE);
+#else
+                Common::FutexWait(state, u32{0});
+#endif
             }
         }
 
@@ -351,7 +361,11 @@ public:
                 const auto remaining = deadline - now;
                 if (remaining < std::chrono::milliseconds(1)) {
                     for (u32 spin = 0;; ++spin) {
+#ifdef _WIN32
                         YieldProcessor();
+#else
+                        _mm_pause();
+#endif
                         if (state.load(std::memory_order_acquire) != 0) {
                             const auto end = Clock::now();
                             elapsed_us = static_cast<u64>(
@@ -365,17 +379,25 @@ public:
                             return false;
                         }
                         if ((deadline - now_spin) > SpinThreshold && (spin & 31u) == 31u) {
+#ifdef _WIN32
                             SwitchToThread();
+#else
+                            std::this_thread::yield();
+#endif
                         }
                     }
                 }
 
+#ifdef _WIN32
                 const auto sleep_ms = std::chrono::floor<std::chrono::milliseconds>(remaining);
                 constexpr auto MaxFiniteWait = static_cast<s64>(INFINITE) - 1;
                 const DWORD timeout_ms =
                     static_cast<DWORD>(std::min<s64>(sleep_ms.count(), MaxFiniteWait));
                 u32 zero = 0;
                 WaitOnAddress(&state, &zero, sizeof(state), timeout_ms);
+#else
+                Common::FutexWait(state, u32{0}, remaining);
+#endif
             }
         }
     };

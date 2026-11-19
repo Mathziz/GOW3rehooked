@@ -55,6 +55,9 @@ constexpr VAddr USER_MAX = 0x5FFFFFFFFFFFULL;
 // Constants for the sizes of the ranges in address space.
 static constexpr u64 SystemManagedSize = SYSTEM_MANAGED_MAX - SYSTEM_MANAGED_MIN + 1;
 static constexpr u64 SystemReservedSize = SYSTEM_RESERVED_MAX - SYSTEM_RESERVED_MIN + 1;
+#ifndef _WIN32
+static constexpr u64 UserSize = USER_MAX - USER_MIN + 1;
+#endif
 
 // Required backing file size for mapping physical address space.
 static u64 BackingSize = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO + ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE;
@@ -661,8 +664,13 @@ struct AddressSpace::Impl {
         system_reserved_size = SystemReservedSize;
         user_size = UserSize;
 
-        constexpr int protection_flags = PROT_READ | PROT_WRITE;
-        int map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED; // compiler knows its constexpr
+        constexpr int protection_flags = PROT_NONE;
+        int map_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef __linux__
+        map_flags |= MAP_FIXED_NOREPLACE;
+#else
+        map_flags |= MAP_FIXED;
+#endif
 #if !defined(__FreeBSD__)
         map_flags |= MAP_NORESERVE;
 #endif
@@ -685,6 +693,13 @@ struct AddressSpace::Impl {
         const auto virtual_base =
             reinterpret_cast<u8*>(mmap(reinterpret_cast<void*>(SYSTEM_MANAGED_MIN), virtual_size,
                                        protection_flags, map_flags, -1, 0));
+#ifdef __linux__
+        if (virtual_base != MAP_FAILED && virtual_base != reinterpret_cast<u8*>(SYSTEM_MANAGED_MIN)) {
+            munmap(virtual_base, virtual_size);
+            LOG_CRITICAL(Kernel_Vmm, "Guest address space was mapped outside its fixed range");
+            throw std::bad_alloc{};
+        }
+#endif
         system_managed_base = virtual_base;
         system_reserved_base = reinterpret_cast<u8*>(SYSTEM_RESERVED_MIN);
         user_base = reinterpret_cast<u8*>(USER_MIN);
@@ -738,7 +753,11 @@ struct AddressSpace::Impl {
         // so please, do not, add MFD_* whatever unless you ifdef it away (must be 0 for FBSD)
         // using sized pages as well causes incessant vm_reclaim calls in kernel, do not use on FBSD
         // under any circumstances.
+#ifdef __linux__
+        backing_fd = memfd_create("BackingDmem", MFD_CLOEXEC);
+#else
         backing_fd = memfd_create("BackingDmem", 0);
+#endif
         if (backing_fd < 0) {
             LOG_CRITICAL(Kernel_Vmm, "memfd_create failed: {}", strerror(errno));
             throw std::bad_alloc{};

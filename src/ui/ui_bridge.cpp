@@ -11,7 +11,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <utility>
-#include <windows.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -138,12 +137,35 @@ void Initialize(SDL_Window* window) {
     Gow3::UI::g_font_cinzel_dec = io.Fonts->AddFontFromMemoryTTF(
         (void*)CinzelDecorative_Bold_data, CinzelDecorative_Bold_size, 38.0f, &cfg, ranges);
 
+#ifdef _WIN32
     char windows[MAX_PATH]{};
     const auto fonts = std::filesystem::path(std::string_view(windows, GetWindowsDirectoryA(windows, MAX_PATH))) / "Fonts";
-    const auto segoe = fonts / "segoeui.ttf", semibold = fonts / "seguisb.ttf";
-    if (std::filesystem::exists(segoe)) Gow3::UI::g_font_body = io.Fonts->AddFontFromFileTTF(segoe.string().c_str());
+    const auto body = fonts / "segoeui.ttf", pad = fonts / "seguisb.ttf";
+#else
+    std::filesystem::path body, pad;
+    struct FontPair { const char* regular; const char* bold; };
+    constexpr FontPair kFontPairs[] = {
+        {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"},
+        {"/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"},
+        {"/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf"},
+        {"/usr/share/fonts/truetype/DejaVuSans.ttf", "/usr/share/fonts/truetype/DejaVuSans-Bold.ttf"},
+        {"/usr/share/fonts/noto/NotoSans-Regular.ttf", "/usr/share/fonts/noto/NotoSans-Bold.ttf"},
+        {"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"},
+        {"/usr/share/fonts/google-noto/NotoSans-Regular.ttf", "/usr/share/fonts/google-noto/NotoSans-Bold.ttf"},
+        {"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"},
+        {"/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf", "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf"},
+    };
+    for (const auto& pair : kFontPairs) {
+        if (std::filesystem::exists(pair.regular)) {
+            body = pair.regular;
+            if (std::filesystem::exists(pair.bold)) pad = pair.bold;
+            break;
+        }
+    }
+#endif
+    if (std::filesystem::exists(body)) Gow3::UI::g_font_body = io.Fonts->AddFontFromFileTTF(body.string().c_str());
     if (!Gow3::UI::g_font_body) Gow3::UI::g_font_body = io.Fonts->AddFontDefaultVector();
-    if (std::filesystem::exists(semibold)) Gow3::UI::g_font_pad = io.Fonts->AddFontFromFileTTF(semibold.string().c_str());
+    if (std::filesystem::exists(pad)) Gow3::UI::g_font_pad = io.Fonts->AddFontFromFileTTF(pad.string().c_str());
     if (!Gow3::UI::g_font_pad) Gow3::UI::g_font_pad = Gow3::UI::g_font_body;
     StyleColorsDark();
     GetStyle().FontSizeBase = 20.f;

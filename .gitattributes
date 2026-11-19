@@ -1,0 +1,2 @@
+/build-fast.sh text eol=lf
+/tools/appimage/package.sh text eol=lf

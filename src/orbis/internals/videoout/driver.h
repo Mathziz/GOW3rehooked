@@ -104,6 +104,9 @@ private:
 
     std::mutex mutex;
     VideoOutPort main_port{};
+#ifndef _WIN32
+    std::atomic<u32> flip_notifications{};
+#endif
     std::jthread vblank_thread;
     std::queue<Request> requests;
 };

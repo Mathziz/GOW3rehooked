@@ -6,8 +6,8 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
-#include <windows.h>
 #include "debug/cpu_probe.h"
 #include "debug/dump_archive.h"
 #include "orbis/core/tls.h"
@@ -30,6 +30,7 @@ u32 HostCallId(const char* signature) {
 }
 
 GameThread SampleGameThread() {
+#ifdef _WIN32
     // The thread's cycle counter against the clock, measured once (a core's clock varies a little: this is a ratio).
     static const double cycles_per_ms = [] {
         ULONG64 c0, c1;
@@ -39,10 +40,19 @@ GameThread SampleGameThread() {
         QueryThreadCycleTime(GetCurrentThread(), &c1);
         return double(c1 - c0) / (double(DiagClock() - t0) * 1e-6);
     }();
-    static thread_local ULONG64 previous;
+#else
+    constexpr double cycles_per_ms = 1'000'000.0;
+#endif
+    static thread_local u64 previous;
     Core::timed_host_calls = true;
+#ifdef _WIN32
     ULONG64 cycles;
     QueryThreadCycleTime(GetCurrentThread(), &cycles);
+#else
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    const u64 cycles = u64(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+#endif
     const Core::HostCallTotals t = Core::TakeHostCallTotals();
     const GameThread sample{previous ? float(double(cycles - previous) / cycles_per_ms) : 0.f, float(double(t.ns) * 1e-6),
                             float(double(t.longest_ns) * 1e-6), float(double(std::exchange(fault_ns, 0)) * 1e-6), t.longest ? HostCallId(t.longest) : 0u};
@@ -73,7 +83,7 @@ void WriteFrames() {
     if (!DebugEnabled() || !frames.Count()) return;
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
-    localtime_s(&tm, &now);
+    Gow3::LocalTime(tm, now);
     char stamp[32];
     std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
     const std::string name = std::format("frames-{}.bin", stamp);

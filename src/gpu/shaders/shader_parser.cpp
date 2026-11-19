@@ -10,7 +10,11 @@
 #include <thread>
 #include <unordered_set>
 #include <xxhash.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "main/mapped_file.h"
+#endif
 
 namespace Gpu::Parser {
 namespace {
@@ -79,6 +83,7 @@ u64 Stamp(const std::filesystem::path& game, const std::vector<std::filesystem::
 }
 } // namespace
 
+#ifdef _WIN32
 Mapping::~Mapping() {
     if (data) UnmapViewOfFile(data);
     if (mapping) CloseHandle(mapping);
@@ -93,6 +98,13 @@ bool Mapping::Open(const std::filesystem::path& path, bool sequential) {
     if (mapping) data = static_cast<const u8*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
     return data != nullptr;
 }
+#else
+Mapping::~Mapping() { Gow3::UnmapReadOnly(data, size); }
+
+bool Mapping::Open(const std::filesystem::path& path, bool sequential) {
+    return Gow3::MapReadOnly(path, data, size, sequential ? Gow3::FileAccess::Sequential : Gow3::FileAccess::Default);
+}
+#endif
 
 Index Load(const std::filesystem::path& game, const std::filesystem::path& index_file, const std::function<void(u32)>& files_total,
            const std::function<void()>& done) {

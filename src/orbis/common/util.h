@@ -13,7 +13,11 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#ifdef _MSC_VER
 #include <intrin.h>
+#else
+#include <immintrin.h>
+#endif
 
 #include "orbis/common/types.h"
 
@@ -123,12 +127,24 @@ private:
     std::atomic_flag lck = ATOMIC_FLAG_INIT;
 };
 
+#ifdef _MSC_VER
 __forceinline u64 FencedRDTSC() {
+#else
+[[gnu::always_inline]] inline u64 FencedRDTSC() {
+#endif
     _mm_lfence();
+#ifdef _MSC_VER
     _ReadWriteBarrier();
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
     const u64 result = __rdtsc();
     _mm_lfence();
+#ifdef _MSC_VER
     _ReadWriteBarrier();
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
     return result;
 }
 
@@ -162,8 +178,10 @@ private:
 
 [[nodiscard]] std::string ToLower(std::string_view str);
 std::vector<std::string> SplitString(const std::string& str, char delimiter);
+#ifdef _WIN32
 [[nodiscard]] std::string UTF16ToUTF8(std::wstring_view input);
 [[nodiscard]] std::wstring UTF8ToUTF16W(std::string_view str);
+#endif
 
 extern const char g_scm_rev[];
 

@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <immintrin.h>
+#include <mutex>
 #include "orbis/common/thread.h"
 #include "main/host.h"
 

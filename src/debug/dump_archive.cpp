@@ -12,7 +12,6 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
-#include <windows.h>
 #include "main/host.h"
 
 namespace Gow3::DumpArchive {
@@ -37,7 +36,7 @@ const std::filesystem::path& EnsureSessionPathLocked() {
     if (!session_path.empty()) return session_path;
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
-    localtime_s(&tm, &now);
+    Gow3::LocalTime(tm, now);
     char stamp[32];
     std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
     const std::filesystem::path dir = PortDirectory();
@@ -196,8 +195,14 @@ bool CompressZstdToFile(const std::vector<u8>& tar, const std::filesystem::path&
 
     std::error_code ec;
     std::filesystem::create_directories(archive_path.parent_path(), ec);
+#ifdef _WIN32
     const std::filesystem::path temp = archive_path.wstring() + L".tmp";
     FILE* f = _wfopen(temp.c_str(), L"wb");
+#else
+    auto temp = archive_path;
+    temp += ".tmp";
+    FILE* f = std::fopen(temp.c_str(), "wb");
+#endif
     if (!f) return false;
 
     std::vector<u8> out_buf(ZSTD_CStreamOutSize());
@@ -222,7 +227,7 @@ bool CompressZstdToFile(const std::vector<u8>& tar, const std::filesystem::path&
         std::filesystem::remove(temp, ec);
         return false;
     }
-    if (!MoveFileExW(temp.c_str(), archive_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!Gow3::ReplaceFile(temp, archive_path)) {
         std::filesystem::remove(temp, ec);
         return false;
     }
@@ -230,14 +235,25 @@ bool CompressZstdToFile(const std::vector<u8>& tar, const std::filesystem::path&
 }
 
 bool ReadWholeFile(const std::filesystem::path& path, std::vector<u8>& out) {
+#ifdef _WIN32
     FILE* f = _wfopen(path.c_str(), L"rb");
+#else
+    FILE* f = std::fopen(path.c_str(), "rb");
+#endif
     if (!f) return false;
-    if (_fseeki64(f, 0, SEEK_END) != 0) {
+#ifdef _WIN32
+    constexpr auto seek = _fseeki64;
+    constexpr auto tell = _ftelli64;
+#else
+    constexpr auto seek = fseeko;
+    constexpr auto tell = ftello;
+#endif
+    if (seek(f, 0, SEEK_END) != 0) {
         std::fclose(f);
         return false;
     }
-    const long long size = _ftelli64(f);
-    if (size < 0 || _fseeki64(f, 0, SEEK_SET) != 0) {
+    const long long size = tell(f);
+    if (size < 0 || seek(f, 0, SEEK_SET) != 0) {
         std::fclose(f);
         return false;
     }

@@ -13,6 +13,9 @@
 #include "orbis/core/memory.h"
 #include "main/memory_observer.h"
 #include <shared_mutex>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 namespace Core {
 
@@ -419,6 +422,9 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     new_vma.prot = prot;
     new_vma.name = "anon";
     new_vma.type = Core::VMAType::Pooled;
+#ifndef _WIN32
+    new_vma.host_protection = PROT_READ | PROT_WRITE;
+#endif
     new_vma.phys_areas.clear();
 
     // Find suitable physical addresses
@@ -506,6 +512,10 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
     new_vma.prot = prot;
     new_vma.name = name;
     new_vma.type = type;
+#ifndef _WIN32
+    new_vma.host_protection = new_vma.IsMapped() ?
+        PROT_READ | PROT_WRITE | (True(prot & MemoryProt::CpuExec) ? PROT_EXEC : 0) : PROT_NONE;
+#endif
     new_vma.phys_areas.clear();
     return new_vma_handle;
 }
@@ -781,6 +791,11 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
     auto& new_vma = new_vma_handle->second;
     new_vma.fd = fd;
+#ifndef _WIN32
+    new_vma.host_protection = (True(prot & (MemoryProt::CpuRead | MemoryProt::GpuRead)) ? PROT_READ : 0) |
+        (True(prot & (MemoryProt::CpuWrite | MemoryProt::GpuWrite)) ? PROT_READ | PROT_WRITE : 0) |
+        (True(prot & MemoryProt::CpuExec) ? PROT_EXEC : 0);
+#endif
     auto mapped_addr = new_vma.base;
 
     // Delegate the actual mapping to the file backend.
@@ -1014,6 +1029,19 @@ s32 MemoryManager::UnmapMemoryImpl(VAddr virtual_addr, u64 size) {
     return ORBIS_OK;
 }
 
+#ifndef _WIN32
+bool MemoryManager::QueryHostRegion(VAddr addr, VAddr& start, VAddr& end, int& protection) {
+    std::shared_lock lock{mutex};
+    if (!IsValidMapping(addr)) return false;
+    const auto& vma = FindVMA(addr)->second;
+    if (!vma.Contains(addr, 1)) return false;
+    start = vma.base;
+    end = vma.base + vma.size;
+    protection = vma.IsMapped() ? vma.host_protection : PROT_NONE;
+    return true;
+}
+#endif
+
 s32 MemoryManager::QueryProtection(VAddr addr, void** start, void** end, u32* prot) {
     std::shared_lock lk{mutex};
     VAddr min_query_addr = impl.SystemManagedVirtualBase();
@@ -1092,6 +1120,13 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     const auto new_it = CarveVMA(addr, adjusted_size);
     auto& new_vma = new_it->second;
     new_vma.prot = prot;
+#ifndef _WIN32
+    if (new_vma.IsMapped() && new_prot != old_prot) {
+        new_vma.host_protection = (True(perms & MemoryPermission::Read) ? PROT_READ : 0) |
+            (True(perms & MemoryPermission::Write) ? PROT_WRITE : 0) |
+            (True(perms & MemoryPermission::Execute) ? PROT_EXEC : 0);
+    }
+#endif
     MergeAdjacent(vma_map, new_it);
 
     if (vma_base.type == VMAType::Reserved) {

@@ -14,7 +14,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <windows.h>
+#ifndef _WIN32
+#include <SDL3/SDL.h>
+#include <ctime>
+#endif
 #include "debug/dump_archive.h"
 #include "main/host.h"
 // Frame dump PNGs (F9).
@@ -44,7 +47,13 @@ void AddPng(std::string_view name, const Gpu::Image& img) {
 
 void Begin(Gpu::Stats& stats) {
     // Live frame dump: F9 traces the next 3 frames (what changes between them); draw lines and render targets go to dumps\trace.
+#ifdef _WIN32
     const bool f9 = GetAsyncKeyState(VK_F9) & 0x8000;
+#else
+    int num_keys = 0;
+    const bool* keys = SDL_GetKeyboardState(&num_keys);
+    const bool f9 = keys && num_keys > SDL_SCANCODE_F9 && keys[SDL_SCANCODE_F9];
+#endif
     if (f9 && !f9_down) f9_left = 3;
     f9_down = f9;
     // GOW3_TEMP_TRACE_EVERY=N traces every Nth frame into dumps\trace\draws-<frame>.txt (no images).
@@ -60,11 +69,19 @@ void Begin(Gpu::Stats& stats) {
 void End(Gpu::Renderer& r, Gpu::Stats& stats) {
     if (!stats.trace) return;
     // Each F9 dump in its own folder inside the session .dmp archive, named by its local time (trace/HHMMSS).
+#ifdef _WIN32
     SYSTEMTIME now;
     GetLocalTime(&now);
+    const int hour = now.wHour, minute = now.wMinute, second = now.wSecond;
+#else
+    const std::time_t now_t = std::time(nullptr);
+    std::tm now{};
+    localtime_r(&now_t, &now);
+    const int hour = now.tm_hour, minute = now.tm_min, second = now.tm_sec;
+#endif
     std::string dir = "trace";
     if (!every_nth) {
-        std::string stamp = std::format("trace/{:02}{:02}{:02}", now.wHour, now.wMinute, now.wSecond);
+        std::string stamp = std::format("trace/{:02}{:02}{:02}", hour, minute, second);
         dir = stamp;
         for (u32 suffix = 2; DumpArchive::Contains(dir + "/draws.txt"); ++suffix) dir = std::format("{}-{}", stamp, suffix);
     }

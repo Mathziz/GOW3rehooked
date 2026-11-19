@@ -244,7 +244,11 @@ bool Renderer::Impl::Setup(std::string& error) {
         for (auto& p : w.pool) vkCreateCommandPool(dev, &pci, nullptr, &p);
     for (u32 k = 0; k + 1 < recorders.size(); ++k)
         threads.emplace_back([this, k] {
+#ifdef _WIN32
             SetThreadDescription(GetCurrentThread(), std::format(L"GOW3 recorder {}", k).c_str());
+#else
+            Common::SetCurrentThreadName(std::format("GOW3 recorder {}", k).c_str());
+#endif
             Gow3::Cpu::Place(Gow3::Cpu::Role::Recorder, k);
             Gow3::CpuProbe::Register(2 + k);  // TEMP
             for (u64 seen = 0;;) {
@@ -1083,7 +1087,12 @@ void Renderer::Impl::RecordBlocks(u32 rec) {
         if (RenderProbe::current) {
             auto& p = *RenderProbe::current;
             ++p.blocks, p.block_ns += u64(b.us * 1000);
-            if (const DWORD cpu = GetCurrentProcessorNumber(); cpu < 64) p.cpu_mask |= 1ull << cpu;
+#ifdef _WIN32
+            const auto cpu = GetCurrentProcessorNumber();
+#else
+            const auto cpu = static_cast<unsigned>(sched_getcpu());
+#endif
+            if (cpu < 64) p.cpu_mask |= 1ull << cpu;
         }
         if (!own_writes.empty()) {
             std::scoped_lock lock(note_lock);

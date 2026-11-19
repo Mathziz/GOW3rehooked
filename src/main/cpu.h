@@ -8,7 +8,15 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fstream>
+#include <set>
+#include <thread>
+#include <sched.h>
+#include <sys/resource.h>
+#endif
 #include "debug/debug.h"
 
 // The processors this process may run on and what its threads make of them: read once, before main, and logged by
@@ -23,11 +31,14 @@ struct Plan {
     unsigned shader_threads = 0;                 // shader compilation and the scans of a shader build
     unsigned decode_threads = 0;                 // a cinematic's frame threads
     bool priority = true;                        // Game:Main and the GPU thread above the pools (GOW3_CPU_PRIORITY=0: as the rest)
+#ifdef _WIN32
     std::vector<PROCESSOR_NUMBER> seats;         // by Role (GOW3_CPU_SEATS=0: none)
+#endif
 };
 
 inline const Plan plan = [] {
     Plan p;
+#ifdef _WIN32
     struct Processor { PROCESSOR_NUMBER number; unsigned core, speed; };
     std::vector<Processor> all;
     DWORD_PTR mine = 0, system = 0;  // both zero when the process spans processor groups
@@ -65,6 +76,28 @@ inline const Plan plan = [] {
     // then the GPU thread's if still free, and Game:Main's last.
     std::ranges::stable_sort(second, {}, [&](const auto& s) { return s.first == 0 ? ~0u : s.first == 1 ? (p.cores > 6 ? ~0u - 1 : 0u) : s.first; });
     for (const auto& s : second) p.seats.push_back(s.second);
+#else
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        std::set<std::pair<int, int>> cores;
+        for (unsigned i = 0; i < CPU_SETSIZE; ++i) {
+            if (!CPU_ISSET(i, &allowed)) continue;
+            const auto topology = "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/topology/";
+            int package, core;
+            if ((std::ifstream(topology + "physical_package_id") >> package) &&
+                (std::ifstream(topology + "core_id") >> core) && package >= 0 && core >= 0)
+                cores.emplace(package, core);
+            else
+                ++p.cores;
+            ++p.logical;
+        }
+        p.cores += unsigned(cores.size());
+        p.limited = p.logical < std::thread::hardware_concurrency();
+    }
+    if (!p.logical) p.logical = p.cores = std::max(1u, std::thread::hardware_concurrency());
+    p.fast = p.cores;
+#endif
 
     // Recording: a thread per core. Each one past six costs the GPU ~0.06 ms at 4K (its blocks end and reopen passes)
     // for a recording time that only falls as 1/n, so the count stops at eight. GOW3_RECORD_THREADS forces it (1: serial).
@@ -75,7 +108,9 @@ inline const Plan plan = [] {
     p.decode_threads = std::clamp(p.logical, 2u, 16u);
     const auto off = [](const char* name) { const char* e = std::getenv(name); return e && !std::strcmp(e, "0"); };
     p.priority = !off("GOW3_CPU_PRIORITY");
+#ifdef _WIN32
     if (off("GOW3_CPU_SEATS")) p.seats.clear();
+#endif
     return p;
 }();
 
@@ -83,6 +118,7 @@ inline const Plan plan = [] {
 // seats run out, a thread shares one of the job workers' (from the last one back, then forth): Game:Main's and the GPU
 // thread's stay their own while there is another.
 enum class Role : unsigned { Main = 0, GpuThread = 1, Worker = 2, Recorder = 7 };
+#ifdef _WIN32
 inline PROCESSOR_NUMBER Seat(Role role, unsigned index = 0) {
     const unsigned n = unsigned(plan.seats.size()), s = unsigned(role) + index;
     if (s < n) return plan.seats[s];
@@ -116,4 +152,16 @@ inline std::string Describe() {
                        plan.cores, plan.fast, plan.logical, plan.limited ? " (process affinity)" : "", plan.recorders, plan.shader_threads,
                        plan.decode_threads, plan.priority ? "above normal" : "normal", seats);
 }
+#else
+inline void Place(Role role, unsigned = 0) {
+    if (plan.priority && (role == Role::Main || role == Role::GpuThread))
+        setpriority(PRIO_PROCESS, 0, -5); // best effort under the user's RLIMIT_NICE
+}
+
+inline std::string Describe() {
+    return std::format("CPU: {} cores, {} logical processors{}; {} recording threads, {} shader threads, {} video decode threads",
+                       plan.cores, plan.logical, plan.limited ? " (process affinity)" : "", plan.recorders,
+                       plan.shader_threads, plan.decode_threads);
+}
+#endif
 } // namespace Gow3::Cpu

@@ -4,6 +4,7 @@
 #include "gpu/shaders/shader_cache.h"
 #include "gpu/renderer_impl.h"
 #include "main/cpu.h"
+#include "orbis/common/thread.h"
 
 namespace Gpu {
 
@@ -162,7 +163,11 @@ std::shared_future<Compiled> Renderer::Impl::Async(Gcn::Stage stage, u64 prog, c
     auto task = std::make_shared<std::packaged_task<Compiled()>>([this, stage, prog, key = p.key, rec, in = p.in, waited,
                                                                    code = std::vector<u32>(p.in.code.begin(), p.in.code.end()),
                                                                    fetch = std::vector<u32>(p.in.fetch.begin(), p.in.fetch.end()), spec = p.spec]() mutable {
+#ifdef _WIN32
         if (waited) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);  // the worker sets its own again for the next task
+#else
+        if (waited) Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+#endif
         const auto t = std::chrono::steady_clock::now();
         Compiled c = Compile(stage, prog, key, in, std::move(code), std::move(fetch), std::move(spec));
         ShaderCache::Instance().Completed();
@@ -192,7 +197,11 @@ void Renderer::Impl::Queue(std::function<void()> task, u32 priority) {
                             next = std::move(queue.front()), queue.pop_front();
                         }
                         // Sync: the game waits for the shader. Async: it keeps running, and its threads come first.
+#ifdef _WIN32
                         SetThreadPriority(GetCurrentThread(), Jit::mode == Jit::Mode::Async ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL);
+#else
+                        Common::SetCurrentThreadPriority(Jit::mode == Jit::Mode::Async ? Common::ThreadPriority::Low : Common::ThreadPriority::Normal);
+#endif
                         next();
                     }
                 });

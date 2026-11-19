@@ -12,7 +12,6 @@
 #include <mutex>
 #include <thread>
 #include <vector>
-#include <windows.h>
 #include "orbis/common/thread.h"
 #include "orbis/common/util.h"
 #include "main/config.h"
@@ -24,6 +23,7 @@
 #include "gpu/piece_hash.h"
 #include "gpu/vk_gpu.h"
 #include "main/host.h"
+#include "orbis/common/futex.h"
 #include "gpu/device.h"
 #include "debug/cpu_probe.h"
 #include "debug/frame_dump.h"
@@ -225,7 +225,9 @@ Gpu::Renderer* Renderer() {
     }
     if (DebugEnabled()) Log(Gpu::PieceHash::UsesAes() ? "Renderer piece hash: AES-NI" : "Renderer piece hash: XXH3");
     r->SetAnisotropy(configured_anisotropy);
+#ifdef _WIN32
     GuestMemory::Install();
+#endif
     r->SetTracker([p = r.get()](u64 lo, u64 hi) { return GuestMemory::Track(*p, lo, hi); });
     r->SetReadback(GuestMemory::Store);
     live.store(r.get(), std::memory_order_release);
@@ -314,7 +316,14 @@ void Render(Gpu::Renderer& r, const std::vector<std::pair<const u32*, u32>>& buf
     r.SetMotionBlurFrameTime(mem.motion_blur_dt);
     // Once Submit has staged the deferred arenas, the game may reset them (AwaitCopies).
     r.Submit(chain, [](u64 a, u64 n) -> const void* { return GuestMemory::Readable(a, n) ? reinterpret_cast<const void*>(a) : nullptr; }, mem.deferred,
-             [n] { copied.store(n, std::memory_order_release), WakeByAddressAll(&copied); });
+             [n] {
+                 copied.store(n, std::memory_order_release);
+#ifdef _WIN32
+                 WakeByAddressAll(&copied);
+#else
+                 Common::FutexWakeAll(&copied);
+#endif
+             });
     RenderProbe::End();
     GOW3_DIAG {
         FrameDump::End(r, stats);
@@ -342,7 +351,7 @@ void LogTempStats() {
                     Libraries::VideoOut::temp_vblank_flips.exchange(0), temp_late.exchange(0)));
     const double* m = temp_render_ms;
     Log(std::format("TEMP render phases ms/frame: beginframe {:.2f} chain {:.2f} | setup {:.2f} walk {:.2f} blocks {:.2f} tail {:.2f} "
-                    "xfer-submit {:.2f} fence {:.2f} readback {:.2f} submit {:.2f}; VirtualQuery {}/s; GPU xfer {:.2f} copy {:.2f} "
+                    "xfer-submit {:.2f} fence {:.2f} readback {:.2f} submit {:.2f}; guest memory queries {}/s; GPU xfer {:.2f} copy {:.2f} "
                     "render {:.2f} readback-copy {:.2f} ms, staged {:.2f} MB, texture uploads {:.1f}",
                     m[0] / n, m[1] / n, m[2] / n, m[3] / n, m[4] / n, m[5] / n, m[6] / n, m[7] / n, m[8] / n, m[9] / n,
                     GuestMemory::temp_queries.exchange(0), m[10] / n, m[11] / n, m[12] / n, m[13] / n, m[14] / n, m[15] / n));
@@ -460,7 +469,11 @@ void Submit(std::span<const u32* const> buffers, std::span<const u32> dwords) {
               }
           } else {
               copied.store(n, std::memory_order_release);
+#ifdef _WIN32
               WakeByAddressAll(&copied);
+#else
+              Common::FutexWakeAll(&copied);
+#endif
           }
           Presenter::EndRender(reflex_frame);
           const auto t1 = DiagNow();
@@ -494,7 +507,11 @@ void AwaitCopies() {
             Log(std::format("GPU thread: submit {} not copied after 10 s (copied {}); the frame loop goes on", n, copied.load()));
             break;
         }
+#ifdef _WIN32
         WaitOnAddress(&copied, &done, sizeof(done), DWORD(std::chrono::ceil<std::chrono::milliseconds>(remaining).count()));
+#else
+        Common::FutexWait(copied, done, remaining);
+#endif
     }
     GOW3_DIAG temp_held.fetch_add(1, std::memory_order_relaxed),
         temp_held_us.fetch_add(u64(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);

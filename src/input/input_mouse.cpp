@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <list>
 
 #include "orbis/common/assert.h"
 #include "orbis/common/types.h"

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstring>
 #include <immintrin.h>
+#ifdef _WIN32
 #include <intrin.h>
+#endif
 #include <xxhash.h>
 
 namespace Gpu::PieceHash {
@@ -98,9 +100,13 @@ const Dispatch& Selected() {
 } // namespace
 
 bool HasAes() {
+#ifdef _WIN32
     int regs[4];
     __cpuid(regs, 1);
     return (regs[2] & (1 << 25)) != 0;
+#else
+    return __builtin_cpu_supports("aes");
+#endif
 }
 bool UsesAes() { return Selected().aes; }
 std::uint64_t Hash(const void* data, std::size_t size) { return Selected().hash(data, size); }

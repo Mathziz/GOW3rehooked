@@ -59,8 +59,10 @@ bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* 
 // Ends Game:Main's short guest sleeps at the GPU thread's next guest-memory write (NotifyGpuWrite); false if not one
 bool WaitGpuWrite(std::chrono::nanoseconds duration);
 void NotifyGpuWrite();
+#ifdef _WIN32
 // Ends an interruptible AccurateSleep of the thread with that native handle (now or at its next one)
 void InterruptSleep(void* thread);
+#endif
 
 class AccurateTimer {
     std::chrono::nanoseconds target_interval{};

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "gpu/shaders/shader_catalog.h"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "main/mapped_file.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <iterator>
@@ -12,6 +16,7 @@ namespace Gpu::Catalog {
 using s32 = std::int32_t;
 using s64 = std::int64_t;
 
+#ifdef _WIN32
 Mapping::Mapping(const std::filesystem::path& path_) : path(path_) {
     const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
     LARGE_INTEGER length{};
@@ -24,6 +29,13 @@ Mapping::Mapping(const std::filesystem::path& path_) : path(path_) {
     if (!data) { if (mapping) CloseHandle(mapping); CloseHandle(handle); throw std::runtime_error("Cannot map " + path.string()); }
 }
 Mapping::~Mapping() { UnmapViewOfFile(data); CloseHandle(mapping); CloseHandle(file); }
+#else
+Mapping::Mapping(const std::filesystem::path& path_) : path(path_) {
+    if (!Gow3::MapReadOnly(path, data, size, Gow3::FileAccess::Random))
+        throw std::runtime_error("Cannot map " + path.string());
+}
+Mapping::~Mapping() { Gow3::UnmapReadOnly(data, size); }
+#endif
 void Mapping::Range(size_t p, size_t n, size_t end) const {
     if (end > size || p > end || n > end - p) throw std::runtime_error("Asset range outside record");
 }
