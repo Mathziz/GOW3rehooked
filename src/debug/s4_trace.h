@@ -13,7 +13,7 @@ inline const bool enabled = DebugDeep("GOW3_S4");
 void Install();
 #endif
 void Start();                                                 // the access handler and the report thread
-void Stop();                                                  // stops the report thread and folds s4-gpu-written.txt into the session .dmp archive
+void Stop();                                                  // stops the report thread and folds s4-gpu-written.txt into the session dump archive
 void Packet(u32 header, const u32* p, u32 payload);           // each type 3 PM4 packet the GPU thread walks
 void Arm();                                                   // end of a submit: reopen the previous pages, arm this submit's surfaces
 } // namespace Gow3::S4

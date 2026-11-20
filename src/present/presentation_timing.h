@@ -17,7 +17,8 @@ public:
     void Attach(VkSwapchainKHR swapchain);
     void UpdateDisplay(SDL_Window* window);
     void Detach();
-    VkResult Acquire(VkSemaphore semaphore, u32* index);
+    VkResult Acquire(VkSemaphore semaphore, VkFence available, u32* index);
+    bool DisplaySlowerThanGuest() const { return nominal.load(std::memory_order_acquire) > period + period / 200; }
     VkResult Present(VkQueue queue, const VkPresentInfoKHR& info, std::mutex& queue_mutex);
     VkResult SubmitAndPresent(VkQueue queue, const VkSubmitInfo& submit, VkFence fence, const VkPresentInfoKHR& present,
                               u64 id, s64 latch, std::mutex& queue_mutex);

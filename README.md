@@ -82,7 +82,7 @@ Everything GOW3rehooked writes goes into `_rehooked_`:
 | `saves/` | Your saves |
 | `shader_cache/` | Translated shaders, and the shader recipes from the ZIP, which grow as you play |
 | `gow3.log` | A log, which grows with every launch |
-| `gow3-<date>-<time>.dmp` | Diagnostics of one session run with the debug launcher, see [Reporting bugs](#reporting-bugs) |
+| `gow3-<date>-<time>.zip` | Diagnostics of one session run with the debug launcher, split into `.part1.zip`, `.part2.zip` and so on past 24 MB, see [Reporting bugs](#reporting-bugs) |
 
 To update, extract the new ZIP over the old files and let it replace them. Your settings, saves and translated shaders are not in the ZIP and stay as they are. To uninstall, delete the two executables and `licenses`, and `_rehooked_` as well if you don't want to keep your saves.
 
@@ -213,12 +213,12 @@ Defaults are in bold.
 
 ## Reporting bugs
 
-Report problems on the [Issues](../../issues) page, after checking that yours isn't already there. A report that comes with diagnostic files is much easier to act on.
+Report problems on the [Issues](../../issues) page, after checking that yours isn't already there. The bug report form requires `gow3.log`, and a report that also comes with the debug dump is much easier to act on.
 
 1. Start the game with `gow3_debug.exe` on Windows or `gow3_debug.AppImage` on Linux. The game runs slower with diagnostics turned on.
 2. Reproduce the problem. If it is visual, press F9 while it is on screen. The game pauses for a moment while it records that frame.
 3. Quit from the title menu, or close the window.
-4. Open `_rehooked_` and find `gow3.log` and the newest `gow3-<date>-<time>.dmp` (a crash may leave only `gow3.log`).
+4. Open `_rehooked_` and find `gow3.log` and the newest `gow3-<date>-<time>.zip`, or all its `.part1.zip`, `.part2.zip`… files when the dump is larger than 24 MB (a crash may leave only `gow3.log`).
 5. Open an issue with those files attached, and describe:
    - what happened and what you expected;
    - where in the game it happens (a save from `_rehooked_/saves` made just before the problem helps);

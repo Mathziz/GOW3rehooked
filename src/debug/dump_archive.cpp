@@ -18,6 +18,7 @@ namespace Gow3::DumpArchive {
 namespace {
 constexpr int kZstdLevel = 3; // matches the project's zstd compression level (shader_cache.cpp)
 constexpr size_t kTarBlock = 512;
+constexpr size_t kPartBytes = 24'000'000;  // archive bytes per .zip: GitHub takes attachments up to 25 MB
 
 struct Entry {
     std::string name;
@@ -32,6 +33,9 @@ std::unordered_set<std::string> committed_names;
 std::filesystem::path session_path;
 bool session_written = false;
 
+// Part `n` (from 1) of an archive too big for one .zip: gow3-<stamp>.part<n>.zip.
+std::filesystem::path PartPath(std::filesystem::path archive, u32 n) { return archive.replace_extension(std::format(".part{}.zip", n)); }
+
 const std::filesystem::path& EnsureSessionPathLocked() {
     if (!session_path.empty()) return session_path;
     const std::time_t now = std::time(nullptr);
@@ -42,7 +46,7 @@ const std::filesystem::path& EnsureSessionPathLocked() {
     const std::filesystem::path dir = PortDirectory();
     std::error_code ec;
     std::filesystem::path candidate = dir / std::format("{}-{}{}", ArchivePrefix, stamp, ArchiveExtension);
-    for (u32 suffix = 2; std::filesystem::exists(candidate, ec); ++suffix)
+    for (u32 suffix = 2; std::filesystem::exists(candidate, ec) || std::filesystem::exists(PartPath(candidate, 1), ec); ++suffix)
         candidate = dir / std::format("{}-{}-{}{}", ArchivePrefix, stamp, suffix, ArchiveExtension);
     session_path = std::move(candidate);
     return session_path;
@@ -184,7 +188,7 @@ bool DecompressZstd(const std::vector<u8>& compressed, std::vector<u8>& out) {
     return true;
 }
 
-bool CompressZstdToFile(const std::vector<u8>& tar, const std::filesystem::path& archive_path) {
+bool CompressZstd(const std::vector<u8>& tar, std::vector<u8>& out) {
     struct CCtxGuard {
         ZSTD_CCtx* c = ZSTD_createCCtx();
         ~CCtxGuard() { ZSTD_freeCCtx(c); }
@@ -192,46 +196,78 @@ bool CompressZstdToFile(const std::vector<u8>& tar, const std::filesystem::path&
     if (!ctx.c) return false;
     if (ZSTD_isError(ZSTD_CCtx_setParameter(ctx.c, ZSTD_c_compressionLevel, kZstdLevel))) return false;
     if (ZSTD_isError(ZSTD_CCtx_setPledgedSrcSize(ctx.c, tar.size()))) return false;
+    out.clear();
+    std::vector<u8> out_buf(ZSTD_CStreamOutSize());
+    ZSTD_inBuffer in{tar.data(), tar.size(), 0};
+    while (true) {
+        ZSTD_outBuffer ob{out_buf.data(), out_buf.size(), 0};
+        const size_t remaining = ZSTD_compressStream2(ctx.c, &ob, &in, ZSTD_e_end);
+        if (ZSTD_isError(remaining)) return false;
+        out.insert(out.end(), out_buf.data(), out_buf.data() + ob.pos);
+        if (remaining == 0 && in.pos == in.size) return true;
+    }
+}
 
+bool WriteFileAtomic(const std::filesystem::path& path, const std::vector<u8>& bytes) {
     std::error_code ec;
-    std::filesystem::create_directories(archive_path.parent_path(), ec);
+    std::filesystem::create_directories(path.parent_path(), ec);
 #ifdef _WIN32
-    const std::filesystem::path temp = archive_path.wstring() + L".tmp";
+    const std::filesystem::path temp = path.wstring() + L".tmp";
     FILE* f = _wfopen(temp.c_str(), L"wb");
 #else
-    auto temp = archive_path;
+    auto temp = path;
     temp += ".tmp";
     FILE* f = std::fopen(temp.c_str(), "wb");
 #endif
     if (!f) return false;
-
-    std::vector<u8> out_buf(ZSTD_CStreamOutSize());
-    ZSTD_inBuffer in{tar.data(), tar.size(), 0};
-    bool ok = true;
-    while (true) {
-        ZSTD_outBuffer ob{out_buf.data(), out_buf.size(), 0};
-        const size_t remaining = ZSTD_compressStream2(ctx.c, &ob, &in, ZSTD_e_end);
-        if (ZSTD_isError(remaining)) {
-            ok = false;
-            break;
-        }
-        if (ob.pos > 0 && std::fwrite(out_buf.data(), 1, ob.pos, f) != ob.pos) {
-            ok = false;
-            break;
-        }
-        if (remaining == 0 && in.pos == in.size) break;
-    }
-    if (std::fflush(f) != 0) ok = false;
+    bool ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
     if (std::fclose(f) != 0) ok = false;
-    if (!ok) {
-        std::filesystem::remove(temp, ec);
-        return false;
-    }
-    if (!Gow3::ReplaceFile(temp, archive_path)) {
+    if (!ok || !Gow3::ReplaceFile(temp, path)) {
         std::filesystem::remove(temp, ec);
         return false;
     }
     return true;
+}
+
+u32 Crc32(std::span<const u8> bytes) {
+    static const auto table = [] {
+        std::array<u32, 256> t{};
+        for (u32 i = 0; i < 256; ++i) {
+            u32 c = i;
+            for (int k = 0; k < 8; ++k) c = c & 1 ? 0xEDB88320u ^ c >> 1 : c >> 1;
+            t[i] = c;
+        }
+        return t;
+    }();
+    u32 c = ~0u;
+    for (u8 b : bytes) c = table[(c ^ b) & 0xFF] ^ c >> 8;
+    return ~c;
+}
+
+// A .zip holding `data` as its one entry `name`, stored (the bytes are compressed already).
+std::vector<u8> StoredZip(const std::string& name, std::span<const u8> data) {
+    std::tm tm{};
+    Gow3::LocalTime(tm, std::time(nullptr));
+    const u32 time = u32(tm.tm_hour << 11 | tm.tm_min << 5 | tm.tm_sec / 2), date = u32((tm.tm_year - 80) << 9 | (tm.tm_mon + 1) << 5 | tm.tm_mday);
+    const u32 crc = Crc32(data), size = u32(data.size()), n = u32(name.size());
+    std::vector<u8> z;
+    z.reserve(30 + 46 + 22 + 2 * n + size);
+    const auto put = [&](u32 v, int bytes) {
+        for (int i = 0; i < bytes; ++i) z.push_back(u8(v >> 8 * i));
+    };
+    const auto header = [&](u32 signature, bool central) {  // local file header, or central directory record of the entry at 0
+        put(signature, 4);
+        if (central) put(10, 2);  // made by: version 1.0
+        put(10, 2), put(0, 2), put(0, 2), put(time, 2), put(date, 2), put(crc, 4), put(size, 4), put(size, 4), put(n, 2), put(0, 2);
+        if (central) put(0, 2), put(0, 2), put(0, 2), put(0, 4), put(0, 4);
+        z.insert(z.end(), name.begin(), name.end());
+    };
+    header(0x04034b50, false);
+    z.insert(z.end(), data.begin(), data.end());
+    const u32 central = u32(z.size());
+    header(0x02014b50, true);
+    put(0x06054b50, 4), put(0, 4), put(1, 2), put(1, 2), put(u32(z.size()) - central, 4), put(central, 4), put(0, 2);
+    return z;
 }
 
 bool ReadWholeFile(const std::filesystem::path& path, std::vector<u8>& out) {
@@ -261,6 +297,42 @@ bool ReadWholeFile(const std::filesystem::path& path, std::vector<u8>& out) {
     const size_t read = size > 0 ? std::fread(out.data(), 1, out.size(), f) : 0;
     std::fclose(f);
     return read == out.size();
+}
+
+// The compressed archive: gow3-<stamp>.dmp stored in gow3-<stamp>.zip or, past kPartBytes, its pieces gow3-<stamp>.dmp.001,
+// .002... stored one per part (joined back in order, they make the .dmp).
+bool WriteArchive(const std::vector<u8>& zst, const std::filesystem::path& archive) {
+    const size_t parts = std::max<size_t>(1, (zst.size() + kPartBytes - 1) / kPartBytes);
+    const std::string dmp = std::filesystem::path(archive).replace_extension(".dmp").filename().string();
+    for (size_t i = 0; i < parts; ++i) {
+        const std::span<const u8> piece(zst.data() + i * kPartBytes, std::min(kPartBytes, zst.size() - i * kPartBytes));
+        if (parts == 1) return WriteFileAtomic(archive, StoredZip(dmp, piece));
+        if (!WriteFileAtomic(PartPath(archive, u32(i + 1)), StoredZip(std::format("{}.{:03}", dmp, i + 1), piece))) return false;
+    }
+    std::error_code ec;
+    std::filesystem::remove(archive, ec);  // the single .zip of an earlier flush
+    return true;
+}
+
+bool ReadArchive(const std::filesystem::path& archive, std::vector<u8>& zst) {
+    zst.clear();
+    std::vector<u8> z;
+    const auto take = [&] {  // the stored entry of a .zip written by StoredZip
+        const auto at = [&](size_t o, int bytes) {
+            u32 v = 0;
+            for (int i = 0; i < bytes; ++i) v |= u32(z[o + i]) << 8 * i;
+            return v;
+        };
+        if (z.size() < 30 || at(0, 4) != 0x04034b50) return false;
+        const size_t begin = 30 + at(26, 2) + at(28, 2), size = at(18, 4);
+        if (begin + size > z.size()) return false;
+        zst.insert(zst.end(), z.begin() + begin, z.begin() + begin + size);
+        return true;
+    };
+    if (ReadWholeFile(archive, z)) return take();
+    for (u32 n = 1; ReadWholeFile(PartPath(archive, n), z); ++n)
+        if (!take()) return false;
+    return !zst.empty();
 }
 } // namespace
 
@@ -317,7 +389,7 @@ bool Flush() {
     std::vector<u8> tar;
     if (append_existing) {
         std::vector<u8> existing_zst;
-        if (ReadWholeFile(archive_path, existing_zst) && DecompressZstd(existing_zst, tar)) {
+        if (ReadArchive(archive_path, existing_zst) && DecompressZstd(existing_zst, tar)) {
             tar.resize(FindTarEndOffset(tar));
         } else {
             tar.clear();
@@ -330,7 +402,8 @@ bool Flush() {
     for (const Entry& e : batch) AppendTarEntry(tar, e);
     tar.resize(tar.size() + kTarBlock * 2, 0); // standard TAR end-of-archive (two 512-byte zero blocks)
 
-    if (!CompressZstdToFile(tar, archive_path)) {
+    std::vector<u8> zst;
+    if (!CompressZstd(tar, zst) || !WriteArchive(zst, archive_path)) {
         // Restore pending entries on failure so a subsequent flush can retry.
         std::scoped_lock lock(archive_mutex);
         pending.insert(pending.begin(), std::make_move_iterator(batch.begin()), std::make_move_iterator(batch.end()));

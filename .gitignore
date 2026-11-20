@@ -12,6 +12,7 @@
 !/build-fast.ps1
 !/build-fast.sh
 !/debug.ps1
+/audio.md
 /src/patches/reference/
 /patches/**/*.xml
 __pycache__/

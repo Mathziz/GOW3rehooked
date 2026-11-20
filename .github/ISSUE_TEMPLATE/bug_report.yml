@@ -1,0 +1,49 @@
+name: Bug report
+description: Something does not work or looks wrong. The gow3.log file is required.
+title: "[BUG] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check first that the problem is not reported already. For a report that can be acted on, follow [Reporting bugs](https://github.com/cuesta4/GOW3rehooked#reporting-bugs): run the game with the debug launcher (`gow3_debug.exe` on Windows, `gow3_debug.AppImage` on Linux), reproduce the problem (press F9 while a visual problem is on screen), then close the game. The files are in the `_rehooked_` folder next to `eboot.bin`.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you see, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: where
+    attributes:
+      label: How to reproduce
+      description: Where in the game it happens and what you did. A save from `_rehooked_/saves` made just before the problem helps.
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System and settings
+      description: CPU, GPU, driver version, operating system and its version, the Windows or Linux build, and any settings you changed.
+    validations:
+      required: true
+  - type: upload
+    id: log
+    attributes:
+      label: gow3.log
+      description: The `gow3.log` file from `_rehooked_`, after the run that shows the problem.
+    validations:
+      required: true
+  - type: upload
+    id: dump
+    attributes:
+      label: Debug dump
+      description: The session dump of a debug launcher run, `gow3-<date>-<time>.zip` in `_rehooked_`. A large dump is split into `.part1.zip`, `.part2.zip` and so on; attach every part.
+    validations:
+      required: false
+  - type: textarea
+    id: more
+    attributes:
+      label: Screenshots or anything else
+    validations:
+      required: false

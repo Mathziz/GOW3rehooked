@@ -68,7 +68,7 @@ void Begin(Gpu::Stats& stats) {
 
 void End(Gpu::Renderer& r, Gpu::Stats& stats) {
     if (!stats.trace) return;
-    // Each F9 dump in its own folder inside the session .dmp archive, named by its local time (trace/HHMMSS).
+    // Each F9 dump in its own folder inside the session dump archive, named by its local time (trace/HHMMSS).
 #ifdef _WIN32
     SYSTEMTIME now;
     GetLocalTime(&now);

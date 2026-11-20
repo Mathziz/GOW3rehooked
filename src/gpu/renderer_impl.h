@@ -136,14 +136,24 @@ struct Renderer::Impl {
     std::mutex* queue_lock = &own_queue_lock;  // every queue operation, shared with the presenter when live
 
     VkPhysicalDeviceMemoryProperties mem{};
+    // Integrated GPU with VK_EXT_memory_budget: its device-local heap is a carve-out of the same RAM (1 GiB by default on the
+    // Steam Deck), so DeviceType takes the largest heap once that budget is spent.
+    bool uma_budget = false;
+    std::atomic<bool> spilled{false};
+    // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp
+    // buffer. Mesa 26.0 RADV read zeros from it in buffer-to-image copies past 4 GB (issue #24: green video, black frame);
+    // buffer copies and storage buffer descriptors reach the whole mirror.
+    bool image_copy_via_temp = false;
     u32 Type(u32 bits, VkMemoryPropertyFlags want) const {
         for (u32 i = 0; i < mem.memoryTypeCount; ++i)
             if (bits >> i & 1 && (mem.memoryTypes[i].propertyFlags & want) == want) return i;
         return ~0u;
     }
+    u32 DeviceType(u32 bits, VkDeviceSize size);  // for `size` more bytes of device memory
     VkDeviceMemory Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address) {
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &flags : nullptr, r.size, Type(r.memoryTypeBits, want)};
+        const u32 type = want == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? DeviceType(r.memoryTypeBits, r.size) : Type(r.memoryTypeBits, want);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &flags : nullptr, r.size, type};
         VkDeviceMemory m = VK_NULL_HANDLE;
         if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS)
             Report(std::format("vkAllocateMemory {}: {} bytes, type {} of {:x}, want {:x}", (int)e, r.size, (int)ai.memoryTypeIndex, r.memoryTypeBits, (u32)want));
@@ -294,9 +304,10 @@ struct Renderer::Impl {
     VkBuffer mirror = VK_NULL_HANDLE;
     VkDeviceAddress mirror_addr = 0;
     u64 page = 0;
-    u32 mirror_type = 0;
+    u32 mirror_bits = 0;  // memory types its chunks may have (DeviceType picks one per chunk)
     std::vector<VkDeviceMemory> chunks;
     u64 chunk_used = kChunk;
+    bool chunk_failed = false;  // a chunk allocation failed (logged once)
     std::vector<u64> bound;  // bitmap of mirror pages with memory
     std::vector<VkSparseMemoryBind> pending_binds;
     std::atomic<u64> mirror_chunks{0}, device_buffers{0};  // debug: device memory held (bytes)
@@ -623,6 +634,7 @@ struct Renderer::Impl {
     void DispatchDetile(VkCommandBuffer c, u32 mip, u32 bytes, u32 bits);
     void Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buffer& buf, u64 reserve, bool frag = false);
     bool Store(VkCommandBuffer c, GuestTex& g, u32 m);
+    void ImageToMirror(VkCommandBuffer c, VkImage img, VkBufferImageCopy bc, u64 to, u64 row, u64 pitch, u32 slices);
     void Materialize(VkCommandBuffer c, const GpuWrite& w, bool learn);
     void WriteBack();
 

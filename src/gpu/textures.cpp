@@ -1696,12 +1696,12 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t) {
     if (r.size <= kImageBlock / 4 && type != ~0u) {
         std::scoped_lock lock(image_lock);
         if (image_free < kImageBlock / 2 && (!image_growing.valid() || image_growing.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
-            image_growing = std::async(std::launch::async, [this, type] {
-                const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, kImageBlock, type};
+            image_growing = std::async(std::launch::async, [this, bits = r.memoryTypeBits] {
+                const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, kImageBlock, DeviceType(bits, kImageBlock)};
                 VkDeviceMemory m = VK_NULL_HANDLE;
                 if (vkAllocateMemory(dev, &ai, nullptr, &m) != VK_SUCCESS) return;
                 std::scoped_lock lock(image_lock);
-                image_blocks.push_back({m, type, {{0, kImageBlock}}}), image_free += kImageBlock;
+                image_blocks.push_back({m, ai.memoryTypeIndex, {{0, kImageBlock}}}), image_free += kImageBlock;
             });
         for (auto& b : image_blocks) {
             if (!(r.memoryTypeBits >> b.type & 1)) continue;
@@ -2089,8 +2089,8 @@ void Renderer::Impl::WriteBackTarget(const Target& t, u32 pitch, VkRect2D area) 
     if (hi > kMirrorSize) return;
     EndRendering();
     BindPages(lo, hi);
-    const VkBufferImageCopy bc{lo, pitch, y1 - y0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int)x0, (int)y0, 0}, {x1 - x0, y1 - y0, 1}};
-    vkCmdCopyImageToBuffer(cmd, t.t.img, VK_IMAGE_LAYOUT_GENERAL, mirror, 1, &bc);
+    const VkBufferImageCopy bc{0, pitch, y1 - y0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int)x0, (int)y0, 0}, {x1 - x0, y1 - y0, 1}};
+    ImageToMirror(cmd, t.t.img, bc, lo, (x1 - x0) * tb, pitch * tb, 1);
     if (temp_copylog) std::fprintf(stderr, "COPY WBT %llx %ux%u rect %ux%u\n", (unsigned long long)t.base, t.w, t.h, x1 - x0, y1 - y0);
     Barrier(cmd, true);  // as in WriteBack
     const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
@@ -2565,6 +2565,7 @@ void Renderer::Impl::DispatchDetile(VkCommandBuffer c, u32 mip, u32 bytes, u32 b
 
 // Texture uploads: tiled non-block 2D/array textures are detiled directly into their image via `DETILE_TO_IMAGE`;
 // block-compressed and volume tiled textures detile into `buf` (grown to at least `reserve`) and then copy into the image.
+// Linear ones copy from the mirror, through `buf` when `image_copy_via_temp`.
 // `frag`: no vertex shader samples them before the next full barrier.
 void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buffer& buf, u64 reserve, bool frag) {
     struct Job {
@@ -2600,6 +2601,8 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
                     }
             }
             if (!j.direct) j.scratch = need, need = (need + g->size + 255) & ~255ull;
+        } else if (image_copy_via_temp) {
+            j.scratch = need, need = (need + g->size + 255) & ~255ull;
         }
         jobs.push_back(j);
     }
@@ -2611,9 +2614,14 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
     if (jobs.empty()) return;
     if (buf.size < need) FreeBuffer(buf), buf = MakeBuffer(std::max(need, reserve), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, prologue ? "scratch" : "upload temp");
     bool detiled_buf = false;
+    std::vector<VkBufferCopy> linear;  // linear textures into `buf`
     for (auto& j : jobs) {
         if (j.scratch == ~0ull && !j.direct) continue;
         GuestTex& g = *j.g;
+        if (g.tile == 8 || g.tile == 31) {
+            linear.push_back({g.base, j.scratch, g.size});
+            continue;
+        }
         const VkPipeline p = Detiler(g.tile, g.bits, j.direct ? 2 : 0);
         if (!p) continue;
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, p);
@@ -2637,8 +2645,10 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
         PushDescriptors(c, VK_PIPELINE_BIND_POINT_COMPUTE, tiling_layout, 0, 3, w);
         for (u32 m = 0; m < g.levels; ++m) DispatchDetile(c, m, g.mips[m].size, g.bits);
     }
-    if (detiled_buf)
-        StageBarrier(c, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    if (!linear.empty()) vkCmdCopyBuffer(c, mirror, buf.buf, (u32)linear.size(), linear.data());
+    if (detiled_buf || !linear.empty())  // one barrier for both ways into `buf`
+        StageBarrier(c, (detiled_buf ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : 0) | (linear.empty() ? 0 : VK_PIPELINE_STAGE_2_COPY_BIT),
+                     (detiled_buf ? VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT : 0) | (linear.empty() ? 0 : VK_ACCESS_2_TRANSFER_WRITE_BIT),
                      VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     for (auto& j : jobs) {
         if (j.direct) continue;
@@ -2661,8 +2671,8 @@ bool Renderer::Impl::Store(VkCommandBuffer c, GuestTex& g, u32 m) {
     const bool linear = g.tile == 8 || g.tile == 31;
     BindPages(g.base + l.offset, g.base + l.offset + l.size);
     const VkExtent3D ext{std::max(g.w >> m, 1u), std::max(g.h >> m, 1u), std::max(g.d >> m, 1u)};
-    VkBufferImageCopy bc{linear ? g.base + l.offset : 0, l.pitch, l.height, {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, g.layers}, {}, ext};
-    if (linear) return vkCmdCopyImageToBuffer(c, g.t.img, VK_IMAGE_LAYOUT_GENERAL, mirror, 1, &bc), true;
+    VkBufferImageCopy bc{0, l.pitch, l.height, {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, g.layers}, {}, ext};
+    if (linear) return ImageToMirror(c, g.t.img, bc, g.base + l.offset, (u64)ext.width * g.bits / 8, (u64)l.pitch * g.bits / 8, ext.depth * g.layers), true;
     VkImageView view = MipView(g, m, false);
     VkPipeline p = view ? Detiler(g.tile, g.bits, 3) : VK_NULL_HANDLE;
     if (!p) view = VK_NULL_HANDLE, p = Detiler(g.tile, g.bits, 1);  // through a buffer when the image tiler is missing
@@ -2696,6 +2706,26 @@ bool Renderer::Impl::Store(VkCommandBuffer c, GuestTex& g, u32 m) {
     }
     DispatchDetile(c, m, l.size, g.bits);
     return true;
+}
+
+// An image copy to the mirror at `to` (`bc` laid out from offset 0: rows of `pitch` bytes, `bc.bufferImageHeight` rows a
+// slice). Through a temp buffer (image_copy_via_temp) only the `row` bytes of each row the copy wrote go on to the mirror:
+// what lies between them there stays.
+void Renderer::Impl::ImageToMirror(VkCommandBuffer c, VkImage img, VkBufferImageCopy bc, u64 to, u64 row, u64 pitch, u32 slices) {
+    if (!image_copy_via_temp) return bc.bufferOffset = to, vkCmdCopyImageToBuffer(c, img, VK_IMAGE_LAYOUT_GENERAL, mirror, 1, &bc);
+    std::scoped_lock res(res_lock);
+    const u32 rows = bc.imageExtent.height, height = bc.bufferImageHeight;
+    Buffer& tmp = Temp(((u64)(slices - 1) * height + rows - 1) * pitch + row);
+    vkCmdCopyImageToBuffer(c, img, VK_IMAGE_LAYOUT_GENERAL, tmp.buf, 1, &bc);
+    StageBarrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    std::vector<VkBufferCopy> r;
+    for (u32 s = 0; s < slices; ++s) {
+        const u64 at = (u64)s * height * pitch;
+        if (row == pitch) r.push_back({at, to + at, (rows - 1) * pitch + row});
+        else
+            for (u32 y = 0; y < rows; ++y) r.push_back({at + y * pitch, to + at + y * pitch, row});
+    }
+    vkCmdCopyBuffer(c, tmp.buf, mirror, (u32)r.size(), r.data());
 }
 
 // A write left in its image (WriteBack `lazy`) to the mirror, for a view that reads the memory another way: everything

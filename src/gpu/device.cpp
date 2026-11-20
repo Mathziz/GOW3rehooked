@@ -107,6 +107,7 @@ void Initialize(SDL_Window* window) {
     std::vector<VkPhysicalDevice> devices(count);
     vkEnumeratePhysicalDevices(context.instance, &count, devices.data());
     int best = -1;
+    std::string lacking;  // presenting devices skipped for a required extension
 #ifdef __linux__
     constexpr u32 amd_vendor_id = 0x1002;
     bool best_radeon = false, best_radv = false, missing_radeon_maintenance5 = false;
@@ -123,6 +124,10 @@ void Initialize(SDL_Window* window) {
             VkBool32 presents{};
             vkGetPhysicalDeviceSurfaceSupportKHR(candidate, i, context.surface, &presents);
             if (!presents) continue;
+            if (const auto missing = Gpu::MissingExtensions(candidate); !missing.empty()) {
+                lacking += std::format("{}{} lacks{}", lacking.empty() ? "" : "; ", info.deviceName, missing);
+                break;
+            }
 
             bool preferred = score > best;
 #ifdef __linux__
@@ -145,6 +150,8 @@ void Initialize(SDL_Window* window) {
             break;
         }
     }
+    if (best < 0 && !lacking.empty())
+        throw std::runtime_error(lacking + ". Update the GPU's Vulkan driver (on Linux, Mesa 24.1 or newer).");
 #ifdef __linux__
     if (best < 0 && missing_radeon_maintenance5)
         throw std::runtime_error("Radeon requires VK_KHR_maintenance5. Install or update the Mesa Vulkan driver (RADV).");
@@ -160,12 +167,16 @@ void Initialize(SDL_Window* window) {
     context.full_screen_exclusive = caps2 && has(device_available, "VK_EXT_full_screen_exclusive");
     if (context.full_screen_exclusive) device_extensions.push_back("VK_EXT_full_screen_exclusive");
 #endif
-    Check(Gpu::CreateDevice(context.physical, context.family, device_extensions, &context.device, &context.present_wait, &context.reflex, &unified_layouts), "Create Vulkan device");
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    vkGetPhysicalDeviceProperties2(context.physical, &properties);
+    std::string requested;
+    const VkResult created = Gpu::CreateDevice(context.physical, context.family, device_extensions, &context.device, &context.present_wait,
+                                               &context.reflex, &unified_layouts, &requested);
+    Log(std::format("Vulkan device: {} ({} {}); extensions:{}", properties.properties.deviceName, driver.driverName, driver.driverInfo, requested));
+    Check(created, "Create Vulkan device");
     Log(std::format("Vulkan Unified Image Layouts: {}", unified_layouts ? "supported and enabled" : "not supported (disabled)"));
     vkGetDeviceQueue(context.device, context.family, 0, &context.queue);
-    VkPhysicalDeviceProperties properties{};
-    vkGetPhysicalDeviceProperties(context.physical, &properties);
-    if (DebugEnabled()) Log(std::format("Vulkan device: {}", properties.deviceName));
 }
 } // namespace Gow3::Vulkan
 #endif
@@ -202,6 +213,9 @@ bool SupportsMaintenance5(VkPhysicalDevice pd, std::span<const VkExtensionProper
     return m5.maintenance5;
 }
 
+constexpr const char* kRequiredExtensions[]{VK_EXT_SHADER_OBJECT_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+                                            VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
+
 const auto temp_bind_t0 = std::chrono::steady_clock::now();
 double TempBindMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - temp_bind_t0).count(); }
 } // namespace
@@ -232,7 +246,16 @@ u32 CopyFamily(std::span<const VkQueueFamilyProperties> fp) {
 bool SupportsBlendInterlock(VkPhysicalDevice pd) { return SupportsBlendInterlock(pd, DeviceExtensions(pd)); }
 bool SupportsMaintenance5(VkPhysicalDevice pd) { return SupportsMaintenance5(pd, DeviceExtensions(pd)); }
 
-VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* const> extensions, VkDevice* device, bool* present_wait, bool* reflex, bool* unified_layouts) {
+std::string MissingExtensions(VkPhysicalDevice pd) {
+    const auto available = DeviceExtensions(pd);
+    std::string missing;
+    for (const char* name : kRequiredExtensions)
+        if (!HasExtension(available, name)) missing += std::format(" {}", name);
+    return missing;
+}
+
+VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* const> extensions, VkDevice* device, bool* present_wait, bool* reflex, bool* unified_layouts,
+                      std::string* requested) {
     VkPhysicalDeviceDepthClipControlFeaturesEXT dcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, nullptr, VK_TRUE};
     VkPhysicalDeviceConditionalRenderingFeaturesEXT cr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT, &dcc, VK_TRUE};  // predication
     const bool temp_stats = DebugDeep("GOW3_TEMP_STATS");  // driver statistics of each program (Compile)
@@ -264,8 +287,7 @@ VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* con
     VkDeviceQueueCreateInfo qci[2]{{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, family, std::min(2u, fp[family].queueCount), prio}};
     u32 queue_infos = 1;
     if (const u32 cf = CopyFamily(fp); cf != ~0u) qci[queue_infos++] = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, cf, std::min(2u, fp[cf].queueCount), prio};
-    std::vector<const char*> ext{VK_EXT_SHADER_OBJECT_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-                                 VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
+    std::vector<const char*> ext(std::begin(kRequiredExtensions), std::end(kRequiredExtensions));
     const auto available = DeviceExtensions(pd);
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
     if (HasExtension(available, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
@@ -339,6 +361,8 @@ VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* con
         std::fprintf(stderr, "TEMP fault: device_fault %d checkpoints %d diagnostics %d binding report %d\n",
                      has_fault, has_ckpt, has_diag && DebugDeep("GOW3_TEMP_FAULT"), has_abr);
     }
+    if (requested)
+        for (const char* name : ext) *requested += std::format(" {}{}", name, HasExtension(available, name) ? "" : " (MISSING)");
     return vkCreateDevice(pd, &dci, nullptr, device);
 }
 
@@ -348,6 +372,11 @@ void Renderer::Impl::LoadDeviceFunctions() {
     const auto available = DeviceExtensions(pd);
     blend_interlock = SupportsBlendInterlock(pd, available);
     vkGetPhysicalDeviceMemoryProperties(pd, &mem);
+    VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
+    vkGetPhysicalDeviceProperties2(pd, &props);
+    uma_budget = props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && HasExtension(available, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    image_copy_via_temp = p13.maxBufferSize < kMirrorSize;
 #define LOAD(var, name) var = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
     LOAD(CreateShaders, vkCreateShadersEXT);
     LOAD(GetShaderBinary, vkGetShaderBinaryDataEXT);
@@ -451,8 +480,9 @@ void Renderer::Impl::TempDeviceReport(std::span<const VkQueueFamilyProperties> f
     Report(std::format("Subgroup: size {} (from {} to {}) stages {:x} sized stages {:x} operations {:x} quad in all stages {}", p11.subgroupSize, p13.minSubgroupSize,
                        p13.maxSubgroupSize, (u32)p11.subgroupSupportedStages, (u32)p13.requiredSubgroupSizeStages, (u32)p11.subgroupSupportedOperations,
                        p11.subgroupQuadOperationsInAllStages));
-    Report(std::format("Sparse: binding {} residency buffer {} aliased {} non-resident strict {}; mirror page {:x} memory type {}", f.sparseBinding, f.sparseResidencyBuffer,
-                       f.sparseResidencyAliased, p.sparseProperties.residencyNonResidentStrict, page, (int)mirror_type));
+    Report(std::format("Sparse: binding {} residency buffer {} aliased {} non-resident strict {}; mirror page {:x} memory types {:x}, integrated with budget {}, image copies through a temp buffer {}",
+                       f.sparseBinding, f.sparseResidencyBuffer, f.sparseResidencyAliased, p.sparseProperties.residencyNonResidentStrict, page, mirror_bits, uma_budget,
+                       image_copy_via_temp));
     std::string s;
     for (u32 i = 0; i < fp.size(); ++i)
         s += std::format(" [{}: flags {:x} x{} timestamp bits {} granularity {}x{}x{}]", i, (u32)fp[i].queueFlags, fp[i].queueCount, fp[i].timestampValidBits,

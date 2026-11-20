@@ -889,15 +889,17 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     const u32 inst = std::max(1u, instances);
     u32 first_index = 0;
     if (op != 0x2D) {
-        // The mirror is bound once per 4 GB window (BindIndex2); the draw starts at its own index inside it. Indices that run
-        // past the window get a window of their own.
+        // ANV stores the byte count in 32 bits. Leave four bytes out to keep the size aligned for both index types.
+        // A draw that runs past the bound range starts a window at its own address.
         const u64 addr = op == 0x27 ? ((u64)b[1] | (u64)(b[2] & 0xFFFF) << 32) : index_base + (u64)b[1] * index_size;
-        const u64 bytes = (u64)(op == 0x27 ? b[3] : b[2]) * index_size, window = addr + bytes > (addr >> 32 << 32) + kIndexWindow ? addr : addr >> 32 << 32;
+        const u64 bytes = (u64)(op == 0x27 ? b[3] : b[2]) * index_size;
+        const u64 window_base = addr & ~(kIndexWindow - 1), bind_size = BindIndex2 ? kIndexWindow - 4 : kIndexWindow;
+        const u64 window = addr + bytes > window_base + bind_size ? addr : window_base;
         Track(addr, addr + bytes), NoteRead(addr, addr + bytes);
         const VkIndexType type = index_size == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
         auto bind_index = [&] {
             RenderProbe::Cmd(RenderProbe::Index);
-            if (BindIndex2) BindIndex2(cmd, mirror, window, std::min(kMirrorSize - window, kIndexWindow), type);
+            if (BindIndex2) BindIndex2(cmd, mirror, window, std::min(kMirrorSize - window, bind_size), type);
             else vkCmdBindIndexBuffer(cmd, mirror, window, type);
         };
         if (dyn.index != window || dyn.index_type != type) dyn.index = window, dyn.index_type = type, bind_index();

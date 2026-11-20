@@ -37,6 +37,7 @@ VkQueue queue;
 VkSurfaceFormatKHR format;
 VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
 VkSwapchainKHR swapchain{};
+VkFence fifo_available{};
 VkExtent2D extent{};
 std::vector<VkImage> images;
 std::vector<VkImageView> views;
@@ -57,9 +58,8 @@ bool reflex_requested{};
 // (composed, the NVIDIA DXGI layer copies every frame). Windowed never goes exclusive (the NVIDIA native present method
 // otherwise makes a full-screen window exclusive by itself).
 // Lost (taken away by the driver, e.g. on Alt+Tab): NVIDIA then fails every acquire with it until it is taken again, so no
-// frames are drawn meanwhile.
-bool exclusive_mode{}, exclusive_held{}, exclusive_refused{}, exclusive_lost{};
-std::chrono::steady_clock::time_point exclusive_retry{};
+// frames are drawn meanwhile. Refused: composed for the rest of the run (retrying it left the screen black).
+bool exclusive_mode{}, exclusive_held{}, exclusive_lost{};
 PFN_vkAcquireFullScreenExclusiveModeEXT acquire_exclusive;
 PFN_vkReleaseFullScreenExclusiveModeEXT release_exclusive;
 #endif
@@ -353,26 +353,26 @@ bool CreateSwapchain() {
 }
 
 #ifdef _WIN32
-// Exclusive mode: taken while the window is full screen with the input focus (retried once a second while the driver refuses),
-// given back when it loses either.
+// Exclusive mode: taken while the window is full screen with the input focus, given back when it loses either. Refused: exclusive
+// mode ends, and the swapchain is remade without it when the driver next fails it (NVIDIA: on the next acquire).
 void HoldExclusive() {
     const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
     const bool want = (flags & SDL_WINDOW_INPUT_FOCUS) && (flags & SDL_WINDOW_FULLSCREEN);
-    if (want == exclusive_held || (want && std::chrono::steady_clock::now() < exclusive_retry)) return;
+    if (want == exclusive_held) return;
     if (!want) return release_exclusive(device, swapchain), exclusive_held = false, Log("Presentation: exclusive full screen released");
     const VkResult result = acquire_exclusive(device, swapchain);
-    exclusive_held = result == VK_SUCCESS;
-    exclusive_lost = false;  // frames again: exclusive, or composed while the driver refuses
-    if (!exclusive_held) exclusive_retry = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    if (exclusive_held || !std::exchange(exclusive_refused, true))
-        Log(exclusive_held ? "Presentation: exclusive full screen acquired" : "Presentation: exclusive full screen refused (" + std::to_string(int(result)) + ")");
+    exclusive_mode = exclusive_held = result == VK_SUCCESS;
+    exclusive_lost = false;  // frames again
+    Log(exclusive_held ? "Presentation: exclusive full screen acquired"
+                       : "Presentation: exclusive full screen refused (" + std::to_string(int(result)) + "); composed from now on");
 }
 
 // The swapchain must be remade: out of date, or its exclusive access taken away (taken again as soon as the window has the focus;
-// a retry delay here was pushed on by every failing frame, so it never came: black screen after Alt+Tab).
+// a retry delay here was pushed on by every failing frame, so it never came: black screen after Alt+Tab). Out of exclusive mode
+// (refused) it is only remade, without exclusive access.
 bool Remake(VkResult result) {
     if (result != VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) return result == VK_ERROR_OUT_OF_DATE_KHR;
-    if (!std::exchange(exclusive_lost, true)) Log("Presentation: exclusive full screen lost");
+    if (exclusive_mode && !std::exchange(exclusive_lost, true)) Log("Presentation: exclusive full screen lost");
     exclusive_held = false;
     return true;
 }
@@ -428,10 +428,23 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
     }
     u32 index{};
     auto* t = timing.load(std::memory_order_acquire);
-    const auto acquired = t->Acquire(frame.acquired, &index);
-    const auto t_acquired = std::chrono::steady_clock::now();
+    const bool take_latest = latch && fifo_available && t->DisplaySlowerThanGuest();
+    const auto acquired = t->Acquire(frame.acquired, take_latest ? fifo_available : VK_NULL_HANDLE, &index);
     if (Remake(acquired)) { CreateSwapchain(); return; }
     Check(acquired, "Acquire swapchain image");
+    if (take_latest) {
+        // Acquire can return before the image is usable. Wait here so the shared GPU queue stays free.
+        Check(vkWaitForFences(device, 1, &fifo_available, VK_TRUE, UINT64_MAX), "Wait for FIFO image");
+        Check(vkResetFences(device, 1, &fifo_available), "Reset FIFO image fence");
+        std::scoped_lock lock(flip_mutex);
+        if (std::exchange(flipped, false)) {
+            latch = flip_time;
+            address = display;
+            bgra = display_bgra;
+            guest_frame = flipped_frame;
+        }
+    }
+    const auto t_acquired = std::chrono::steady_clock::now();
     vkResetFences(device, 1, &frame.fence);
     vkResetCommandBuffer(frame.cmd, 0);
     const VkCommandBufferBeginInfo begin{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -738,14 +751,6 @@ void Initialize(SDL_Window* sdl_window, const Config& config) {
     device = vk.device;
     queue = vk.queue;
     reflex_requested = config.nvidia_reflex;
-#ifdef _WIN32
-    exclusive_mode = vk.full_screen_exclusive && config.display_mode != DisplayMode::Windowed;
-    if (exclusive_mode) {
-        acquire_exclusive = reinterpret_cast<PFN_vkAcquireFullScreenExclusiveModeEXT>(vkGetDeviceProcAddr(device, "vkAcquireFullScreenExclusiveModeEXT"));
-        release_exclusive = reinterpret_cast<PFN_vkReleaseFullScreenExclusiveModeEXT>(vkGetDeviceProcAddr(device, "vkReleaseFullScreenExclusiveModeEXT"));
-        exclusive_mode = acquire_exclusive && release_exclusive;
-    }
-#endif
     if (reflex_requested && !vk.reflex) Log("NVIDIA Reflex unavailable; using normal presentation pacing");
     timing.store(new PresentationTiming(device, window, FramePeriodNs(config.fps), vk.present_wait, vk.reflex && reflex_requested), std::memory_order_release);
     u32 format_count{};
@@ -762,6 +767,21 @@ void Initialize(SDL_Window* sdl_window, const Config& config) {
     std::vector<VkPresentModeKHR> modes(mode_count);
     vkGetPhysicalDeviceSurfacePresentModesKHR(vk.physical, vk.surface, &mode_count, modes.data());
     if (std::ranges::find(modes, wanted) != modes.end()) present_mode = wanted;
+#ifdef _WIN32
+    // Mailbox presents composed: exclusive full screen with it was refused (-3), which left the screen black.
+    const bool full_screen = vk.full_screen_exclusive && config.display_mode != DisplayMode::Windowed;
+    exclusive_mode = full_screen && present_mode != VK_PRESENT_MODE_MAILBOX_KHR;
+    if (exclusive_mode) {
+        acquire_exclusive = reinterpret_cast<PFN_vkAcquireFullScreenExclusiveModeEXT>(vkGetDeviceProcAddr(device, "vkAcquireFullScreenExclusiveModeEXT"));
+        release_exclusive = reinterpret_cast<PFN_vkReleaseFullScreenExclusiveModeEXT>(vkGetDeviceProcAddr(device, "vkReleaseFullScreenExclusiveModeEXT"));
+        exclusive_mode = acquire_exclusive && release_exclusive;
+    }
+    if (full_screen && present_mode == VK_PRESENT_MODE_MAILBOX_KHR) Log("Presentation: Mailbox presents composed, without exclusive full screen");
+#endif
+    if (present_mode == VK_PRESENT_MODE_FIFO_KHR) {
+        const VkFenceCreateInfo fence{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        Check(vkCreateFence(device, &fence, nullptr, &fifo_available), "Create FIFO image fence");
+    }
 
     const VkCommandPoolCreateInfo pool_info{.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk.family};

@@ -20,7 +20,20 @@ if ($Seconds) { $null = $g.WaitForExit($Seconds * 1000) } else { $g.WaitForExit(
 if (!$g.HasExited) { $null = $g.CloseMainWindow(); if (!$g.WaitForExit(8000)) { Stop-Process -Id $g.Id -Force } }
 $r.WaitForExit()
 $log = Get-ChildItem "$game\_rehooked_\draws-*.bin" -ErrorAction SilentlyContinue | Where-Object LastWriteTime -gt $start | Sort-Object LastWriteTime | Select-Object -Last 1
-$dump = Get-ChildItem "$game\_rehooked_\gow3*.dmp", "$game\_rehooked_\gow3*.dump" -ErrorAction SilentlyContinue | Where-Object LastWriteTime -gt $start | Sort-Object LastWriteTime | Select-Object -Last 1
+$zip = Get-ChildItem "$game\_rehooked_\gow3-*.zip" -ErrorAction SilentlyContinue | Where-Object LastWriteTime -gt $start | Sort-Object LastWriteTime | Select-Object -Last 1
+$dump = $null
+if (!$log -and $zip) {  # the session's .dmp, stored whole in gow3-<stamp>.zip or in pieces .dmp.001... across its .partN.zip files
+    $stem = $zip.Name -replace '(\.part\d+)?\.zip$'
+    Get-ChildItem "$game\_rehooked_\$stem.zip", "$game\_rehooked_\$stem.part*.zip" -ErrorAction SilentlyContinue | ForEach-Object { & tar -xf $_.FullName -C $dir }
+    $dump = Get-Item (Join-Path $dir "$stem.dmp") -ErrorAction SilentlyContinue
+    $pieces = Get-ChildItem (Join-Path $dir "$stem.dmp.*") -ErrorAction SilentlyContinue | Sort-Object Name
+    if (!$dump -and $pieces) {
+        $out = [IO.File]::Create((Join-Path $dir "$stem.dmp"))
+        foreach ($p in $pieces) { $in = [IO.File]::OpenRead($p.FullName); $in.CopyTo($out); $in.Dispose() }
+        $out.Dispose()
+        $dump = Get-Item (Join-Path $dir "$stem.dmp")
+    }
+}
 if (!$log -and $dump) {
     $entry = (& tar -tf $dump.FullName 2>$null | Where-Object { $_ -match '^draws-.*\.bin$' } | Sort-Object | Select-Object -Last 1)
     if ($entry) {

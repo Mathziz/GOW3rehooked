@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <span>
+#include <string>
 #include <vector>
 #include "orbis/common/types.h"
 struct SDL_Window;
@@ -18,8 +19,11 @@ std::uint32_t CopyFamily(std::span<const VkQueueFamilyProperties> fp);
 bool SupportsBlendInterlock(VkPhysicalDevice pd);
 // VK_KHR_maintenance5 is there: the mirror is bound as index buffer with a size (vkCmdBindIndexBuffer2KHR).
 bool SupportsMaintenance5(VkPhysicalDevice pd);
-// Vulkan 1.3 device with every feature and extension the renderer uses, plus `extensions` (e.g. the swapchain).
-VkResult CreateDevice(VkPhysicalDevice pd, std::uint32_t family, std::span<const char* const> extensions, VkDevice* device, bool* present_wait = nullptr, bool* reflex = nullptr, bool* unified_layouts = nullptr);
+// The extensions the renderer cannot run without that `pd` lacks, each after a space (empty: none).
+std::string MissingExtensions(VkPhysicalDevice pd);
+// Vulkan 1.3 device with every feature and extension the renderer uses, plus `extensions` (e.g. the swapchain);
+// `requested` receives each extension asked for, " (MISSING)" after those the device does not list.
+VkResult CreateDevice(VkPhysicalDevice pd, std::uint32_t family, std::span<const char* const> extensions, VkDevice* device, bool* present_wait = nullptr, bool* reflex = nullptr, bool* unified_layouts = nullptr, std::string* requested = nullptr);
 // TEMP fault (debug runs): a VK_EXT_device_address_binding_report message, searched when the device is lost.
 void TempAddressBinding(const VkDebugUtilsMessengerCallbackDataEXT* data);
 } // namespace Gpu

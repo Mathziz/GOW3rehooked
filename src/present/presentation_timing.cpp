@@ -103,9 +103,9 @@ u64 PresentationTiming::EndSimulation() {
     Marker(id, VK_LATENCY_MARKER_SIMULATION_END_NV);
     return id;
 }
-VkResult PresentationTiming::Acquire(VkSemaphore semaphore, u32* index) {
+VkResult PresentationTiming::Acquire(VkSemaphore semaphore, VkFence available, u32* index) {
     std::scoped_lock guard(handle_mutex);
-    return vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, index);
+    return vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, semaphore, available, index);
 }
 VkResult PresentationTiming::Present(VkQueue queue, const VkPresentInfoKHR& info, std::mutex& queue_mutex) {
     std::scoped_lock guard(handle_mutex);
