@@ -104,7 +104,9 @@ jobs:
           Set-Content -LiteralPath CMakeLists.txt -Value $cmake
           foreach ($variant in ($env:BUILD_VARIANTS -split ',')) {
             $ivyBridge = $variant -eq 'ivybridge'
-            ./build-fast.ps1 -Release -NoDeploy -IvyBridge:$ivyBridge
+            $releaseArgs = @{}
+            if ($env:GITHUB_REF_TYPE -eq 'tag') { $releaseArgs.ReleaseTag = $env:GITHUB_REF_NAME }
+            ./build-fast.ps1 @releaseArgs -Release -NoDeploy -IvyBridge:$ivyBridge
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $buildDir = if ($ivyBridge) { 'build-fast/Release-ivybridge' } else { 'build-fast/Release' }
             $commands = Get-Content -LiteralPath "$buildDir/compile_commands.json" -Raw
@@ -164,7 +166,8 @@ jobs:
           foreach ($variant in ($env:BUILD_VARIANTS -split ',')) {
             $binaries = if ($variant -eq 'ivybridge') { 'build/ivybridge' } else { 'build' }
             $suffix = if ($variant -eq 'ivybridge') { '-AVX1' } else { '' }
-            Copy-Item "$binaries/gow3.exe", "$binaries/gow3_debug.exe" $package -Force
+            Copy-Item "$binaries/gow3.exe", "$binaries/gow3_debug.exe", "$binaries/gow3.dll" $package -Force
+            if ($env:GITHUB_REF_TYPE -eq 'tag') { Copy-Item "$binaries/gow3_update.exe" $package -Force }
             Compress-Archive -Path "$package/*" -DestinationPath "build/GOW3rehooked-Windows-x86_64$suffix.zip" -CompressionLevel Optimal
           }
       - name: Upload standard Windows ZIP
@@ -246,7 +249,7 @@ jobs:
             glslc libshaderc-dev glslang-dev glslang-tools spirv-tools libvulkan-dev libunwind-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libdecor-0-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev \
-            libxkbcommon-dev libwayland-dev wayland-protocols desktop-file-utils zip
+            libxkbcommon-dev libwayland-dev wayland-protocols desktop-file-utils zip golang-go
           headers="$RUNNER_TEMP/vulkan-headers"
           mkdir -p "$headers"
           curl --fail --silent --show-error --location --retry 3 \
@@ -281,7 +284,9 @@ jobs:
           if [[ "$VARIANT" == ivybridge ]]; then build+=-ivybridge; zip+=-AVX1; fi
           zip+=.zip
           mkdir -p build
-          bash ./tools/appimage/package.sh "$build/bin" "$zip" "$SOURCE_URL"
+          tag=
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then tag=$GITHUB_REF_NAME; fi
+          bash ./tools/appimage/package.sh "$build/bin" "$zip" "$SOURCE_URL" "$tag"
           printf 'file=%s\n' "$zip" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

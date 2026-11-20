@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 #include <psapi.h>
+extern "C" IMAGE_DOS_HEADER __ImageBase;
 #else
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
@@ -235,7 +236,7 @@ void WriteBlocks(const std::string& path, u64 from, u64 to) {
     const HANDLE proc = GetCurrentProcess();
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
     SymInitialize(proc, nullptr, TRUE);
-    const u64 ours = u64(GetModuleHandleW(nullptr));
+    const u64 ours = u64(&__ImageBase);
 #else
     const u64 ours = FindModule(reinterpret_cast<u64>(&WriteBlocks)).base;
 #endif

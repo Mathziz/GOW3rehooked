@@ -7,6 +7,7 @@ namespace Gow3::Window {
 // Opens the SDL window that receives keyboard, mouse and gamepad input and shows the system dialogs, with the splash screen
 // unless `splash` is false.
 void Open(const Config& config, bool splash = true);
+[[noreturn]] void OfferUpdate(const std::string& tag);
 // The game folder cannot be started: no eboot.bin there (NoGame), only a packaged .fpkg (Packaged), or an eboot.bin of another
 // version than 1.02 (WrongVersion). Shows the message screen and ends the process once it is dismissed.
 enum class StartupError { NoGame, Packaged, WrongVersion };

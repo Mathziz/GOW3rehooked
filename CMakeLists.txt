@@ -42,19 +42,34 @@ set(ARCHITECTURE x86_64)
 set(SRC ${CMAKE_SOURCE_DIR}/src)
 add_subdirectory(src/externals)
 
-# gow3.exe, one executable: main (launcher, bootstrap, game icon), orbis (emulated PS4: core and HLE libraries), gpu (Vulkan
+# The game runtime: main (launcher, bootstrap, game icon), orbis (emulated PS4: core and HLE libraries), gpu (Vulkan
 # renderer and shaders), present (window, swapchain, scalers), ui (ImGui screens), input, patches (EBOOT patches and hooks)
 # and debug (the diagnostics that GOW3_DEBUG turns on). The GPU thread (gpu/gpu_thread.cpp) draws each submit with the Vulkan renderer (vk_gpu.cpp), then applies its fences
 # and memory writes. patches/reference holds the former engine hooks (gnm_hooks.cpp) for reference; it is not built.
 file(GLOB_RECURSE gow3_sources CONFIGURE_DEPENDS ${SRC}/main/*.cpp ${SRC}/orbis/*.cpp ${SRC}/gpu/*.cpp ${SRC}/present/*.cpp
      ${SRC}/ui/*.cpp ${SRC}/input/*.cpp ${SRC}/patches/*.cpp ${SRC}/debug/*.cpp)
 list(FILTER gow3_sources EXCLUDE REGEX "/src/(patches/reference|gpu/shaders/legacy)/|/src/main/gow3_debug\\.cpp$")
-if(NOT WIN32)
+if(WIN32 AND (GOW3_RELEASE_TAG OR CMAKE_BUILD_TYPE STREQUAL "Release"))
+    set(gow3_shared_runtime ON)
+endif()
+if(NOT WIN32 OR gow3_shared_runtime)
     list(FILTER gow3_sources EXCLUDE REGEX "/src/main/exe_icon\\.cpp$")
 endif()
-add_executable(gow3 WIN32 ${gow3_sources})
 # The debug launcher starts the same game with GOW3_DEBUG=1.
 add_executable(gow3_debug WIN32 ${SRC}/main/gow3_debug.cpp)
+if(gow3_shared_runtime)
+    # The launchers keep their identity across updates. Gow3Main is their stable runtime entry point.
+    add_library(gow3 SHARED ${gow3_sources})
+    set_property(SOURCE src/main/game.cpp APPEND PROPERTY COMPILE_DEFINITIONS GOW3_RUNTIME_DLL)
+    set_target_properties(gow3 PROPERTIES ARCHIVE_OUTPUT_NAME gow3_runtime PDB_NAME gow3_runtime)
+    add_executable(gow3_launcher WIN32 ${SRC}/main/launcher.c)
+    set_target_properties(gow3_launcher PROPERTIES OUTPUT_NAME gow3)
+    target_link_libraries(gow3_launcher PRIVATE gow3)
+    target_link_options(gow3_launcher PRIVATE /Brepro /DEPENDENTLOADFLAG:0xA00) # application directory and System32
+    target_link_options(gow3_debug PRIVATE /Brepro)
+else()
+    add_executable(gow3 WIN32 ${gow3_sources})
+endif()
 set(easu_dir ${SRC}/present/fsr)
 set(easu_spv ${CMAKE_CURRENT_BINARY_DIR}/easu_spv.inc)
 add_custom_command(OUTPUT ${easu_spv}
@@ -83,8 +98,11 @@ if(WIN32)
     file(GLOB clang_builtins "$ENV{LLVM_ROOT}/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
     list(SORT clang_builtins COMPARE NATURAL ORDER DESCENDING)
     list(GET clang_builtins 0 clang_builtins_library)
+    if(GOW3_RELEASE_TAG)
+        set_property(SOURCE src/main/game.cpp APPEND PROPERTY COMPILE_DEFINITIONS "GOW3_RELEASE_TAG=L\"${GOW3_RELEASE_TAG}\"")
+    endif()
     target_link_libraries(gow3_debug PRIVATE user32)
-    set_source_files_properties(src/main/game.cpp src/main/exe_icon.cpp PROPERTIES COMPILE_DEFINITIONS "UNICODE;_UNICODE")
+    set_property(SOURCE src/main/game.cpp src/main/exe_icon.cpp APPEND PROPERTY COMPILE_DEFINITIONS "UNICODE;_UNICODE")
     target_compile_definitions(gow3 PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE _SCL_SECURE_NO_WARNINGS)
     target_compile_options(gow3 PRIVATE /Gy /Gw /GS- /clang:-Wno-unknown-warning-option)
     target_link_libraries(gow3 PRIVATE ${clang_builtins_library} OneCore ws2_32 Psapi

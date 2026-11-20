@@ -6,6 +6,7 @@ root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 bin=$(realpath -- "$1")
 output=$(realpath -s -- "$2")
 source_url=$3
+tag=${4:-}
 work=$(mktemp -d -- "$(dirname -- "$output")/.appimage.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 
@@ -29,6 +30,15 @@ EOF
     APPIMAGE_EXTRACT_AND_RUN=1 linuxdeploy --appdir "$appdir" --executable "$bin/$exe" \
         --desktop-file "$work/$exe.desktop" --icon-file "$root/tools/appimage/gow3.svg" \
         --exclude-library 'libvulkan.so*'
+    if [[ "$exe" == gow3 && -n "$tag" ]]; then
+        [[ "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}(-(alpha|beta|rc)(\.[0-9]+)?)?$ ]]
+        asset=$(basename -- "$output")
+        [[ "$asset" == GOW3rehooked-Linux-x86_64.zip || "$asset" == GOW3rehooked-Linux-x86_64-AVX1.zip ]]
+        mv -- "$appdir/AppRun" "$appdir/AppRun.game"
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.currentTag=$tag -X main.assetName=$asset" \
+            -o "$appdir/AppRun" "$root/tools/appimage/update.go"
+    fi
     ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 appimagetool --no-appstream "$appdir" "$package/$exe.AppImage"
 done
 
@@ -45,6 +55,11 @@ done
     printf '\n=== Intel CMAA2, Copyright Intel Corporation ===\n\n'
     cat licenses/Apache-2.0.txt
     printf '\n=== AppImage Type 2 runtime ===\n%s\n' 'https://github.com/AppImage/type2-runtime#license'
+    if [[ -n "$tag" ]]; then
+        printf '\n=== Go standard library ===\n'
+        goroot=$(go env GOROOT)
+        if [[ -f "$goroot/LICENSE" ]]; then cat "$goroot/LICENSE"; else cat "$goroot/src/vendor/golang.org/x/net/LICENSE"; fi
+    fi
     {
         printf '%s\n' libshaderc-dev glslang-dev spirv-tools libvulkan-dev
         find "$work" -path '*/usr/lib/*.so*' -printf '%f\n' | sort -u | while read -r name; do

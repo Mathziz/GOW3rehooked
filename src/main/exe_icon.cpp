@@ -101,6 +101,11 @@ bool WriteResources(const std::wstring& file, const std::vector<std::vector<uint
 
 void EmbedGameIcon(const std::filesystem::path& icon_png) {
     try {
+        // Rewriting PE resources invalidates an Authenticode signature.
+        const auto base = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
+        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size) return;
         const std::wstring exe = ExecutablePath(), copy = exe + L".icon", old = exe + L".old";
         DeleteFileW(old.c_str()); // left by the previous patch, which could not delete the image it was running from
         std::error_code error;

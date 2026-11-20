@@ -14,6 +14,7 @@
 #include <vector>
 #ifndef _WIN32
 #include <linux/close_range.h>
+#include <poll.h>
 #endif
 #include "orbis/common/elf_info.h"
 #include "orbis/core/emulator_settings.h"
@@ -291,6 +292,38 @@ Prompt::Answer Ask(const Prompt::Content& content) {
     return answer;
 }
 } // namespace
+
+void OfferUpdate(const std::string& tag) {
+    const auto answer = Ask({"UPDATE AVAILABLE", "INSTALL " + tag + "?",
+                             {"Yes downloads the update and restarts the game.", "No skips this release."}, true});
+    const char reply = answer == Prompt::Answer::Yes ? 'Y' : 'N';
+#ifdef _WIN32
+    DWORD written{};
+    if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), &reply, 1, &written, nullptr) || reply == 'N')
+        ExitImmediately(0);
+#else
+    if (write(STDOUT_FILENO, &reply, 1) != 1) ExitImmediately(1);
+#endif
+    if (reply == 'Y')
+        Prompt::Show({"UPDATING", "INSTALLING " + tag, {"The game will reopen automatically."}, false, {}, true});
+    // The updater closes its pipe when installation finishes or fails.
+#ifdef _WIN32
+    while (PeekNamedPipe(GetStdHandle(STD_INPUT_HANDLE), nullptr, 0, nullptr, nullptr, nullptr)) {
+#else
+    pollfd input{STDIN_FILENO, POLLIN, 0};
+    while (poll(&input, 1, 0) == 0) {
+#endif
+        SDL_Event event;
+        if (SDL_WaitEventTimeout(&event, 16)) ImGui::Core::ProcessEvent(event);
+        ImGui::Core::NewFrame();
+    }
+#ifndef _WIN32
+    char error[1024]{};
+    if (read(STDIN_FILENO, error, sizeof(error) - 1) > 0)
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "GOW3rehooked update", error, window);
+#endif
+    ExitImmediately(0);
+}
 
 void ReportStartupError(StartupError error) {
     static constexpr const char* text[][3]{

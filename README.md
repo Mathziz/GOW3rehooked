@@ -57,6 +57,8 @@ Only use the AVX1 build if your CPU doesn't meet the requirements for the standa
    ├── EXEC\ ...
    ├── gow3.exe
    ├── gow3_debug.exe
+   ├── gow3.dll
+   ├── gow3_update.exe
    ├── licenses\
    └── _rehooked_\      the shader recipes; everything else is created on first launch
    ```
@@ -64,17 +66,23 @@ Only use the AVX1 build if your CPU doesn't meet the requirements for the standa
 3. Run `gow3.exe`. The first few launches may show the [shader preparation screen](#shaders-prepared-in-advance).
 4. Choose your settings under Rehooked in the title menu.
 
+Windows releases check for updates at startup. Choose **Yes** to install the same CPU variant and reopen the game, or **No** to skip that release. To see the offer again, delete `_rehooked_/settings/skipped-release.txt`. Updates keep your existing `gow3.exe` and `gow3_debug.exe` and replace the runtime they start. The previous runtime is saved as `gow3.update.old`.
+
+When installing another Windows build manually over one that already has `gow3.dll`, keep the two existing launchers and extract the new runtime and the other files.
+
 ### Linux
 
 1. Download `GOW3rehooked-Linux-x86_64.zip` (standard) or `GOW3rehooked-Linux-x86_64-AVX1.zip` (AVX1) from the [Releases](../../releases/latest) page.
 2. Extract the ZIP into the game folder, next to `eboot.bin`.
 3. Run `./gow3.AppImage`.
 
+On startup, release AppImages offer to install the latest version for your CPU variant. Choose **Yes** to update both AppImages and restart, or **No** to skip that release. The previous game AppImage is kept as `gow3.AppImage.old`. To see a skipped release again, delete `_rehooked_/settings/skipped-release.txt` from the game folder.
+
 If your extractor dropped the executable bits, run `chmod +x gow3*.AppImage`. On systems without FUSE, run `APPIMAGE_EXTRACT_AND_RUN=1 ./gow3.AppImage`. For [diagnostics](#reporting-bugs), use `./gow3_debug.AppImage` with the same prefix if needed.
 
 For a source build, use Clang and LLD, a C++23 standard library such as libstdc++ 14, CMake, Ninja, NASM, Vulkan headers 1.4.328 or newer, `glslc`, shaderc, glslang, SPIRV-Tools, and libunwind. The [workflow](.github/workflows/windows.yml) lists the Ubuntu 24.04 packages. Run `bash build-fast.sh --release`, then `build-fast/Linux/Release/bin/gow3 --game-dir /path/to/game`. Add `--ivy-bridge` to build for AVX1.
 
-Everything GOW3rehooked writes goes into `_rehooked_`:
+The game stores its settings, saves and diagnostics in `_rehooked_`:
 
 | Path | Contents |
 | --- | --- |
