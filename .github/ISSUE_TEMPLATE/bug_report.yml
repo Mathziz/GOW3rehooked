@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Check first that the problem is not reported already. For a report that can be acted on, follow [Reporting bugs](https://github.com/cuesta4/GOW3rehooked#reporting-bugs): run the game with the debug launcher (`gow3_debug.exe` on Windows, `gow3_debug.AppImage` on Linux), reproduce the problem (press F9 while a visual problem is on screen), then close the game. The files are in the `_rehooked_` folder next to `eboot.bin`.
+        Check first that the problem is not reported already. For a report that can be acted on, follow [Reporting bugs](https://github.com/cuesta4/GOW3rehooked#reporting-bugs): run the game with the debug launcher (`gow3_debug.exe` on Windows, `gow3_debug.AppImage` on Linux), reproduce the problem (press F9 while a visual problem is on screen, and wait for **DEBUG DUMP SAVED** in the bottom-left corner), then close the game. The files are in the `_rehooked_` folder next to `eboot.bin`.
   - type: textarea
     id: what
     attributes:

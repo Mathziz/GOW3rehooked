@@ -20,6 +20,7 @@
 #endif
 #include "debug/dump_archive.h"
 #include "main/host.h"
+#include "present/dump_toast.h"
 // Frame dump PNGs (F9).
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
@@ -54,7 +55,10 @@ void Begin(Gpu::Stats& stats) {
     const bool* keys = SDL_GetKeyboardState(&num_keys);
     const bool f9 = keys && num_keys > SDL_SCANCODE_F9 && keys[SDL_SCANCODE_F9];
 #endif
-    if (f9 && !f9_down) f9_left = 3;
+    if (f9 && !f9_down) {
+        if (!f9_left) DumpToast::Begin();  // the traced frames, until the last one's End
+        f9_left = 3;
+    }
     f9_down = f9;
     // GOW3_TEMP_TRACE_EVERY=N traces every Nth frame into dumps\trace\draws-<frame>.txt (no images).
     static const u64 every = [] { const char* e = DebugOption("GOW3_TEMP_TRACE_EVERY"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
@@ -98,7 +102,9 @@ void End(Gpu::Renderer& r, Gpu::Stats& stats) {
     } else {
         // The images encode on a thread of their own, so the next traced frames don't wait for them; flushed once encoded.
         // Textures (GOW3_DEBUG=2, or GOW3_DUMP_TEX=1): the guest textures the frame bound (mip 0, layer 0, alpha kept), and
-        // each one's channel range in textures.txt.
+        // each one's channel range in textures.txt. The toast spins until the last frame's images are in the archive.
+        DumpToast::Begin();
+        if (!f9_left) DumpToast::End();  // the F9 dump's last traced frame
         std::thread([dir, targets = r.ReadTargets(), textures = DebugDeep("GOW3_DUMP_TEX") ? r.ReadTextures(true) : std::vector<Gpu::Image>{}] {
             std::scoped_lock lock(encoding);
             for (const auto& t : targets)
@@ -116,6 +122,7 @@ void End(Gpu::Renderer& r, Gpu::Stats& stats) {
             stbi_write_png_compression_level = 8;
             if (!list.empty()) DumpArchive::Add(dir + "/textures.txt", list);
             DumpArchive::Flush();
+            DumpToast::End();
         }).detach();
     }
     constexpr u64 kLuminance = 0x2b9a02c00;  // 1x1 R16G16F the CPU reads for exposure
