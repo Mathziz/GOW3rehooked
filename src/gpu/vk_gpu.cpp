@@ -264,6 +264,11 @@ bool Renderer::Impl::Setup(std::string& error) {
                 if (--pool_busy == 0) pool_cv.notify_all();
             }
         });
+    {
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(pd, &pp);
+        tick_ms = pp.limits.timestampPeriod * 1e-6;
+    }
     if (prof) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * kProfQueries};
         vkCreateQueryPool(dev, &qi, nullptr, &prof_pool);
@@ -1162,15 +1167,15 @@ void Renderer::Impl::Retire() {
     }
     flight.back.clear();
     if (u64 q[6]; temp_qp && vkGetQueryPoolResults(dev, temp_qp, flight.slot * 6, 6, sizeof(q), q, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
-        for (int k = 0; k < 4; ++k) stats.temp_ms[8 + k] = (q[k + 1 + (k > 0)] - q[k + (k > 0)]) * 1e-6;
+        for (int k = 0; k < 4; ++k) stats.temp_ms[8 + k] = (q[k + 1 + (k > 0)] - q[k + (k > 0)]) * tick_ms;
     if (prof) {
         std::vector<u64> ts(3 + flight.prof_n);
         vkGetQueryPoolResults(dev, prof_pool, flight.prof_base, (u32)ts.size(), ts.size() * 8, ts.data(), 8, VK_QUERY_RESULT_64_BIT);
-        std::fprintf(stderr, "PROF gpu copy %.3f ms render %.3f ms\n", (ts[1] - ts[0]) * 1e-6, (ts[2] - ts[1]) * 1e-6);
+        std::fprintf(stderr, "PROF gpu copy %.3f ms render %.3f ms\n", (ts[1] - ts[0]) * tick_ms, (ts[2] - ts[1]) * tick_ms);
         static u32 retired = 0;
         if (++retired % 20 == 0)
             for (u32 i = 0; i < flight.prof_n; i += 2)
-                std::fprintf(stderr, "PROF %.4f ms %s\n", (ts[4 + i] - ts[3 + i]) * 1e-6, flight.prof_label[i / 2].c_str());
+                std::fprintf(stderr, "PROF %.4f ms %s\n", (ts[4 + i] - ts[3 + i]) * tick_ms, flight.prof_label[i / 2].c_str());
     }
 }
 

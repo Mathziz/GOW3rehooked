@@ -885,6 +885,7 @@ struct Renderer::Impl {
     void CopyQueries(std::pair<u32, u32> range);
     double temp_fence_ms = 0;  // debug: Retire's fence wait
     VkQueryPool temp_qp = VK_NULL_HANDLE;  // debug: per frame slot, 6 timestamps: xfer begin/end, copy begin/end, render end, readback end
+    double tick_ms = 1e-6;                 // a GPU timestamp tick in ms: timestampPeriod ns (1 on NVIDIA, 40 on RADV Raven, issue #37)
     // TEMP perf: GPU timestamps (GOW3_GPU_PROF=1: copy, render and each rendering pass; 2: also each draw), read when the
     // frame retires. Queries per frame: copy start, copy end, frame end, then begin/end pairs.
     static constexpr u32 kProfQueries = 16384;
