@@ -90,11 +90,12 @@ template <class T> T Guest(u64 rva) { return reinterpret_cast<T>(guest_base + rv
 u64 spare_arenas[2];  // descriptors resting this pass: the half, the 1 MB arena (game main thread)
 bool MapSpareArenas() {
     constexpr u64 kHalf = 0xf80000, kSmall = 0x100000, kDescs = 0x10000, kSize = kDescs + kHalf + kSmall;  // sizes as 011F0DF0
-    // A System mapping: guest memory inside the renderer's mirror (below 32 GB) outside the game's flexible and direct budgets.
+    // A System mapping: guest memory inside the renderer's mirror outside the game's flexible and direct budgets. Below 16 GB,
+    // the smallest mirror (Gpu::kMirrorMin): this runs once, maybe before the renderer picks its size.
     void* block = nullptr;
     if (Core::Memory::Instance()->MapMemory(&block, 0, kSize, Core::MemoryProt::CpuReadWrite | Core::MemoryProt::GpuReadWrite,
                                             Core::MemoryMapFlags::NoFlags, Core::VMAType::System, "gow3 spare arenas") ||
-        reinterpret_cast<u64>(block) + kSize > (32ull << 30))
+        reinterpret_cast<u64>(block) + kSize > (16ull << 30))
         return Log("Frame arenas: no guest memory for the spares; each pass waits for the last submit's copy"), false;
     const u64 b = reinterpret_cast<u64>(block);
     const auto init = Guest<void(PS4_SYSV_ABI*)(u64, u64, u32)>(0x1aab70);

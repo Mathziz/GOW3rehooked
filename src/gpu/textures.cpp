@@ -2086,7 +2086,7 @@ void Renderer::Impl::WriteBackTarget(const Target& t, u32 pitch, VkRect2D area) 
     const u32 x0 = (u32)area.offset.x, y0 = (u32)area.offset.y, x1 = std::min(t.w, x0 + area.extent.width), y1 = std::min(t.h, y0 + area.extent.height);
     if (t.samples > 1 || x1 <= x0 || y1 <= y0) return;
     const u64 tb = TexelBytes(t.fmt), lo = t.base + ((u64)y0 * pitch + x0) * tb, hi = t.base + ((u64)(y1 - 1) * pitch + x1) * tb;
-    if (hi > kMirrorSize) return;
+    if (hi > mirror_size) return;
     EndRendering();
     BindPages(lo, hi);
     const VkBufferImageCopy bc{0, pitch, y1 - y0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int)x0, (int)y0, 0}, {x1 - x0, y1 - y0, 1}};
@@ -2163,7 +2163,7 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
         g.mips[mip] = {u32(s * mip_d * g.layers), p, h, u32(g.size)};
         g.size += g.mips[mip].size;
     }
-    if (g.base + g.size > kMirrorSize) return Note("T# beyond the mirror (guest addresses below 32 GB)"), false;
+    if (g.base + g.size > mirror_size) return Note(std::format("T# beyond the mirror (guest addresses below {} GB)", mirror_size >> 30)), false;
     g.img_levels = std::min<u32>(g.levels, std::bit_width(std::max({g.w, g.h, g.d})));
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |  // src: ReadTextures
                                     (g.storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);

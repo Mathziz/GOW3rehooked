@@ -376,7 +376,7 @@ void Renderer::Impl::LoadDeviceFunctions() {
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
     vkGetPhysicalDeviceProperties2(pd, &props);
     uma_budget = props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && HasExtension(available, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-    image_copy_via_temp = p13.maxBufferSize < kMirrorSize;
+    image_copy_via_temp = p13.maxBufferSize < kMirrorMax;  // before SetupMirror: against the largest mirror
 #define LOAD(var, name) var = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
     LOAD(CreateShaders, vkCreateShadersEXT);
     LOAD(GetShaderBinary, vkGetShaderBinaryDataEXT);
@@ -466,8 +466,8 @@ void Renderer::Impl::TempDeviceReport(std::span<const VkQueueFamilyProperties> f
                        "maxMemoryAllocationCount {} maxSamplerAllocationCount {} maxDrawIndexedIndexValue {:x} maxImageDimension2D {} maxColorAttachments {} "
                        "maxBoundDescriptorSets {} maxUniformBufferRange {:x} maxStorageBufferRange {:x} minUniformBufferOffsetAlignment {} "
                        "minStorageBufferOffsetAlignment {} bufferImageGranularity {} nonCoherentAtomSize {} timestampPeriod {} maxSamplerAnisotropy {}",
-                       l.maxPushConstantsSize, sizeof(Push), l.maxPushConstantsSize < sizeof(Push) ? ": TOO SMALL" : "", p13.maxBufferSize, kMirrorSize,
-                       p13.maxBufferSize < kMirrorSize ? ": TOO SMALL" : "", p11.maxMemoryAllocationSize, l.sparseAddressSpaceSize, l.maxMemoryAllocationCount,
+                       l.maxPushConstantsSize, sizeof(Push), l.maxPushConstantsSize < sizeof(Push) ? ": TOO SMALL" : "", p13.maxBufferSize, mirror_size,
+                       p13.maxBufferSize < mirror_size ? ": TOO SMALL" : "", p11.maxMemoryAllocationSize, l.sparseAddressSpaceSize, l.maxMemoryAllocationCount,
                        l.maxSamplerAllocationCount, l.maxDrawIndexedIndexValue, l.maxImageDimension2D, l.maxColorAttachments, l.maxBoundDescriptorSets,
                        l.maxUniformBufferRange, l.maxStorageBufferRange, l.minUniformBufferOffsetAlignment, l.minStorageBufferOffsetAlignment, l.bufferImageGranularity,
                        l.nonCoherentAtomSize, l.timestampPeriod, l.maxSamplerAnisotropy));
@@ -532,7 +532,7 @@ void Renderer::Impl::TempLost(const char* where, VkResult r) {  // TEMP fault
         for (auto& a : addr) {
             const u64 g = a.reportedAddress - mirror_addr;
             note(std::format("address type {} {:#x} precision {:#x}{}", (int)a.addressType, a.reportedAddress, a.addressPrecision,
-                             a.reportedAddress >= mirror_addr && g < kMirrorSize ? std::format(" = guest {:#x}, page bound {}", g, bound[g / page / 64] >> (g / page % 64) & 1) : ""));
+                             a.reportedAddress >= mirror_addr && g < mirror_size ? std::format(" = guest {:#x}, page bound {}", g, bound[g / page / 64] >> (g / page % 64) & 1) : ""));
             // Every binding over the faulting range, then the nearest ones below and above it, with the resource still holding the handle.
             auto name = [&](u64 h) -> std::string {
                 auto is = [&](auto x) { return x && (u64)x == h; };

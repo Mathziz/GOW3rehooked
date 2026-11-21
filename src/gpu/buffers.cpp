@@ -83,19 +83,31 @@ void Renderer::Impl::FreeBuffer(Buffer& b) {
     b = {};
 }
 
-// Mirror: sparse, resident only where guest memory was written.
+// Mirror: sparse, resident only where guest memory was written. 32 GB first; a driver that cannot reserve that much address
+// space at once gets 16 GB (RADV on GFX8 with 16 GB of RAM: the kernel's 64 GB VM, half of it kept for sparse buffers,
+// issue #35). Guest memory above the mirror is not uploaded, bound or drawn from.
 bool Renderer::Impl::SetupMirror(std::string& error) {
     VkBufferCreateInfo mci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT,
-                           kMirrorSize,
+                           kMirrorMax,
                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
     const u32 both[]{family, copy_family};  // the copy engine uploads it
     if (copy_family != ~0u) mci.sharingMode = VK_SHARING_MODE_CONCURRENT, mci.queueFamilyIndexCount = 2, mci.pQueueFamilyIndices = both;
-    if (vkCreateBuffer(dev, &mci, nullptr, &mirror) != VK_SUCCESS) return error = "sparse mirror buffer failed", false;
+    VkResult made = vkCreateBuffer(dev, &mci, nullptr, &mirror);
+    if (made != VK_SUCCESS) {
+        const VkResult full = made;
+        mirror = VK_NULL_HANDLE, mci.size = kMirrorMin;
+        made = vkCreateBuffer(dev, &mci, nullptr, &mirror);
+        Gow3::Log(made == VK_SUCCESS ? std::format("Renderer: sparse mirror of {} GB failed ({}); using {} GB", kMirrorMax >> 30, (int)full, kMirrorMin >> 30)
+                                     : std::format("Renderer: sparse mirror of {} GB failed ({}), of {} GB too ({})", kMirrorMax >> 30, (int)full,
+                                                   kMirrorMin >> 30, (int)made));
+    }
+    if (made != VK_SUCCESS) return mirror = VK_NULL_HANDLE, error = std::format("sparse mirror buffer failed ({})", (int)made), false;
+    mirror_size = mci.size;
     VkMemoryRequirements mr;
     vkGetBufferMemoryRequirements(dev, mirror, &mr);
     page = mr.alignment, mirror_bits = mr.memoryTypeBits;
-    bound.assign(kMirrorSize / page / 64 + 1, 0);
+    bound.assign(mirror_size / page / 64 + 1, 0);
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, mirror};
     mirror_addr = vkGetBufferDeviceAddress(dev, &bai);
     return true;
@@ -142,7 +154,7 @@ void Renderer::Impl::SetupTables() {
 // Gives memory to every mirror page in [lo, hi) that has none.
 void Renderer::Impl::BindPages(u64 lo, u64 hi) {
     std::scoped_lock bind(bind_lock);
-    for (u64 p = lo / page * page; p < std::min(hi, kMirrorSize); p += page) {
+    for (u64 p = lo / page * page; p < std::min(hi, mirror_size); p += page) {
         u64& word = bound[p / page / 64];
         const u64 bit = 1ull << (p / page % 64);
         if (word & bit) continue;
@@ -285,8 +297,9 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     pieces.clear();
     u64 capture_size = 0;
     for (WriteRange& w : ranges) {
-        if (w.addr + w.size > kMirrorSize) d->Note(std::format("TEMP write beyond the mirror {:#x}+{:#x}", w.addr, w.size));  // TEMP fault
-        const u64 end = w.addr < kMirrorSize ? std::min(w.addr + w.size, kMirrorSize) : w.addr;  // the mirror holds guest addresses below 32 GB
+        const u64 top = d->mirror_size;  // the mirror holds guest addresses below it (32 GB, or 16 GB)
+        if (w.addr + w.size > top) d->Note(std::format("TEMP write beyond the mirror {:#x}+{:#x}", w.addr, w.size));  // TEMP fault
+        const u64 end = w.addr < top ? std::min(w.addr + w.size, top) : w.addr;
         for (u64 a = w.addr, n; a < end; a += n) {
             n = std::min<u64>(0x1000 - (a & 0xFFF), end - a);
             const u32 want = w.blocks && n == 0x1000 ? u32(w.blocks[(a - w.addr) >> 15] >> ((a - w.addr) >> 9 & 63) & 0xFF) : 0xFF;

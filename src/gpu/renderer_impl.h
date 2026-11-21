@@ -52,7 +52,9 @@ using u8 = std::uint8_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
-inline constexpr u64 kMirrorSize = 1ull << 35;         // guest addresses below 32 GB (heap, ring and arenas are below 16 GB)
+// The mirror holds guest addresses below 32 GB (heap, ring and arenas are below 16 GB). A driver that cannot reserve that
+// much sparse address space at once gets 16 GB instead (SetupMirror; RADV on GFX8 with 16 GB of RAM, issue #35).
+inline constexpr u64 kMirrorMax = 1ull << 35, kMirrorMin = 1ull << 34;
 inline constexpr u64 kChunk = 256ull << 20;            // device memory behind the mirror, allocated in chunks
 inline constexpr u64 kTableBytes = 64ull << 20;        // per-frame draw tables
 inline constexpr u64 kTableRange = 16 << 10;           // a draw table's uniform buffer window (the prelude's Table0/Table1)
@@ -198,7 +200,7 @@ struct Renderer::Impl {
     PFN_vkDestroyShaderEXT DestroyShader = nullptr;
     // The mirror as index buffer, bound once per 4 GB window with the window's size (VK_KHR_maintenance5; null without it: bound to
     // the buffer's end). A driver that keeps the index count of a binding in 32 bits (AMD: its maxBufferSize is 2 GB, the mirror
-    // 32 GB) finds none after a window at an even multiple of 4 GB, and every index reads as 0.
+    // 16 or 32 GB) finds none after a window at an even multiple of 4 GB, and every index reads as 0.
     PFN_vkCmdBindIndexBuffer2KHR BindIndex2 = nullptr;
     static constexpr u64 kIndexWindow = 1ull << 32;
     // Diagnostic (debug runs, GOW3_TEMP_LABELS=0 off): pass, block and copy labels for Nsight GPU Trace; the entry points stay
@@ -303,6 +305,7 @@ struct Renderer::Impl {
     // Guest memory mirror: one sparse buffer, device address of byte 0 = guest address 0.
     VkBuffer mirror = VK_NULL_HANDLE;
     VkDeviceAddress mirror_addr = 0;
+    u64 mirror_size = 0;  // kMirrorMax, or kMirrorMin when the driver could not reserve that (set once by SetupMirror)
     u64 page = 0;
     u32 mirror_bits = 0;  // memory types its chunks may have (DeviceType picks one per chunk)
     std::vector<VkDeviceMemory> chunks;

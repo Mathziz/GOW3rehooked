@@ -893,13 +893,15 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         // A draw that runs past the bound range starts a window at its own address.
         const u64 addr = op == 0x27 ? ((u64)b[1] | (u64)(b[2] & 0xFFFF) << 32) : index_base + (u64)b[1] * index_size;
         const u64 bytes = (u64)(op == 0x27 ? b[3] : b[2]) * index_size;
+        // Indices past the mirror's end (above 16 GB when the driver could not reserve 32) cannot be bound.
+        if (addr + bytes > mirror_size) return stores.clear(), Count(stats.skipped), Note("indices beyond the mirror skipped");
         const u64 window_base = addr & ~(kIndexWindow - 1), bind_size = BindIndex2 ? kIndexWindow - 4 : kIndexWindow;
         const u64 window = addr + bytes > window_base + bind_size ? addr : window_base;
         Track(addr, addr + bytes), NoteRead(addr, addr + bytes);
         const VkIndexType type = index_size == 4 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
         auto bind_index = [&] {
             RenderProbe::Cmd(RenderProbe::Index);
-            if (BindIndex2) BindIndex2(cmd, mirror, window, std::min(kMirrorSize - window, bind_size), type);
+            if (BindIndex2) BindIndex2(cmd, mirror, window, std::min(mirror_size - window, bind_size), type);
             else vkCmdBindIndexBuffer(cmd, mirror, window, type);
         };
         if (dyn.index != window || dyn.index_type != type) dyn.index = window, dyn.index_type = type, bind_index();
@@ -1021,7 +1023,7 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
             const u32* v = stored >> k & 1 ? prep.fdesc[k] : nullptr;
             if (!v) continue;
             const u64 lo = (u64)(v[1] & 0xFFFF) << 32 | v[0], stride = v[1] >> 16 & 0x3FFF, hi = lo + std::min<u64>(stride ? stride * v[2] : v[2], 1ull << 30);
-            if (hi <= lo || hi > kMirrorSize) continue;
+            if (hi <= lo || hi > mirror_size) continue;
             BindPages(lo, hi);
             (in_worker ? own_writes : gpu_writes).push_back({lo, hi, std::atomic_ref(write_seq).fetch_add(1) + 1, nullptr});
         }
