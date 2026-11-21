@@ -18,18 +18,24 @@ $BuildDirectory = Join-Path $Root "build-fast\$BuildType$BuildSuffix"
 $GameDirectory = $env:GOW3_GAME_DIR  # the binaries are also copied there when set
 $SdkDirectory = $env:GOW3_SDK_DIR    # EWDK, VulkanSDK, vcpkg and sccache-cache, when set
 $Names = @('gow3.exe', 'gow3_debug.exe')
-$gameTarget = 'gow3'
+$Targets = @('gow3', 'gow3_debug')
 if ($Release -or $ReleaseTag) {
     $Names += 'gow3.dll'
-    $gameTarget = 'gow3_launcher'
+    $Targets[0] = 'gow3_launcher'
 }
-if ($ReleaseTag) { $Names += 'gow3_update.exe' }
+# Release ZIPs carry a stand-in gow3_update.exe for the updaters of v0.1.5 and v0.1.6. The game folder gets none: the
+# runtime would delete it on its next start.
+$StandIn = 'gow3_update.exe'
+if ($ReleaseTag) {
+    $Names += $StandIn
+    $Targets += 'gow3_update'
+}
 
 function Assert-Exit([string]$Action) {
     if ($LASTEXITCODE -ne 0) { throw "$Action failed with exit code $LASTEXITCODE." }
 }
 
-function Publish-Binaries([string]$Source, [string]$Destination) {
+function Publish-Binaries([string]$Source, [string]$Destination, [string[]]$Names) {
     $new = @{}
     foreach ($name in $Names) {
         $bytes = [IO.File]::ReadAllBytes((Join-Path $Source $name))
@@ -154,17 +160,12 @@ try {
     & cmake @configure
     Assert-Exit 'Configuration'
     if ($ConfigureOnly) { exit 0 }
-    & cmake --build $BuildDirectory --parallel $Jobs --target $gameTarget gow3_debug -- -k 0
+    & cmake --build $BuildDirectory --parallel $Jobs --target $Targets -- -k 0
     Assert-Exit 'Incremental build'
-    if ($ReleaseTag) {
-        $csc = Join-Path $env:SystemRoot 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-        & $csc /nologo /target:winexe /optimize+ /platform:x64 /reference:System.IO.Compression.dll /reference:System.Net.Http.dll /reference:System.Web.Extensions.dll /reference:System.Windows.Forms.dll "/out:$BuildDirectory\bin\gow3_update.exe" "$Root\src\main\update.cs"
-        Assert-Exit 'Windows updater build'
-    }
     $output = Join-Path $Root $(if ($IvyBridge) { 'build\ivybridge' } else { 'build' })
     New-Item -ItemType Directory -Path $output -Force | Out-Null
-    Publish-Binaries (Join-Path $BuildDirectory 'bin') $output
-    if (-not $NoDeploy -and $GameDirectory) { Publish-Binaries $output $GameDirectory }
+    Publish-Binaries (Join-Path $BuildDirectory 'bin') $output $Names
+    if (-not $NoDeploy -and $GameDirectory) { Publish-Binaries $output $GameDirectory ($Names -ne $StandIn) }
     Write-Output "BUILD SUCCEEDED: $($Names -join ', ')"
     exit 0
 } catch {

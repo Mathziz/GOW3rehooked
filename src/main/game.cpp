@@ -6,31 +6,10 @@
 #include <cstdlib>
 #ifdef _WIN32
 #include "exe_icon.h"
+#include "main/update.h"
 #include <shellapi.h>
 #ifdef GOW3_RELEASE_TAG
 #include "present/window.h"
-
-static bool RunUpdater(const std::filesystem::path& app, const std::filesystem::path& game) {
-    const auto helper = app / L"gow3_update.exe";
-#ifdef GOW3_IVY_BRIDGE
-    constexpr auto variant = L"AVX1";
-#else
-    constexpr auto variant = L"standard";
-#endif
-    // A trailing dot keeps a directory's final backslash away from the closing quote.
-    std::wstring command = L"gow3_update " GOW3_RELEASE_TAG L" " + std::wstring(variant) +
-                           L" \"" + (std::filesystem::absolute(game) / L".").wstring() + L"\"";
-    STARTUPINFOW startup{sizeof(startup)};
-    PROCESS_INFORMATION child{};
-    if (!CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &child))
-        return false;
-    CloseHandle(child.hThread);
-    WaitForSingleObject(child.hProcess, INFINITE);
-    DWORD code{};
-    GetExitCodeProcess(child.hProcess, &code);
-    CloseHandle(child.hProcess);
-    return code == 10; // update relaunched, or the player closed the offer
-}
 #endif
 
 #ifdef GOW3_RUNTIME_DLL
@@ -111,11 +90,14 @@ int main(int count, char** args) {
             if (result == WAIT_OBJECT_0) return 0;
             if (result != WAIT_OBJECT_0 + 1) throw std::runtime_error(Gow3::HostError("Wait for previous game"));
         }
+        if (!parent && !inspect && !validate_runtime) {
+            Gow3::Update::RemoveRetiredUpdater(app);
 #ifdef GOW3_RELEASE_TAG
-        if (!parent && !inspect && !validate_runtime && RunUpdater(app, game)) return 0;
+            if (Gow3::Update::OfferAndInstall(app, game, GOW3_RELEASE_TAG)) return 0;
 #elif !defined(GOW3_RUNTIME_DLL)
-        if (!parent && !inspect && !validate_runtime) Gow3::EmbedGameIcon(game / L"sce_sys" / L"icon0.png");
+            Gow3::EmbedGameIcon(game / L"sce_sys" / L"icon0.png");
 #endif
+        }
 #endif
         const auto result = Gow3Run(app.c_str(), game.c_str(), inspect ? Gow3Inspect :
                                     validate_runtime ? Gow3ValidateRuntime : 0);

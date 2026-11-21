@@ -58,7 +58,6 @@ Only use the AVX1 build if your CPU doesn't meet the requirements for the standa
    ├── gow3.exe
    ├── gow3_debug.exe
    ├── gow3.dll
-   ├── gow3_update.exe
    ├── licenses\
    └── _rehooked_\      the shader recipes; everything else is created on first launch
    ```
@@ -66,7 +65,7 @@ Only use the AVX1 build if your CPU doesn't meet the requirements for the standa
 3. Run `gow3.exe`. The first few launches may show the [shader preparation screen](#shaders-prepared-in-advance).
 4. Choose your settings under Rehooked in the title menu.
 
-Windows releases check for updates at startup. Choose **Yes** to install the same CPU variant and reopen the game, or **No** to skip that release. To see the offer again, delete `_rehooked_/settings/skipped-release.txt`. Updates keep your existing `gow3.exe` and `gow3_debug.exe` and replace the runtime they start. The previous runtime is saved as `gow3.update.old`.
+Windows releases check for updates at startup. Choose **Yes** to install the same CPU variant and reopen the game, or **No** to skip that release. To see the offer again, delete `_rehooked_/settings/skipped-release.txt`. Updates keep your existing `gow3.exe` and `gow3_debug.exe` and replace the runtime they start. The previous runtime is saved as `gow3.update.old`. Release ZIPs also contain a `gow3_update.exe`, which lets v0.1.5 and v0.1.6 install them; the game deletes it when it starts.
 
 When installing another Windows build manually over one that already has `gow3.dll`, keep the two existing launchers and extract the new runtime and the other files.
 

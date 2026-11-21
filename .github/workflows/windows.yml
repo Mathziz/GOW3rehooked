@@ -167,8 +167,11 @@ jobs:
             $binaries = if ($variant -eq 'ivybridge') { 'build/ivybridge' } else { 'build' }
             $suffix = if ($variant -eq 'ivybridge') { '-AVX1' } else { '' }
             Copy-Item "$binaries/gow3.exe", "$binaries/gow3_debug.exe", "$binaries/gow3.dll" $package -Force
+            # The stand-in for the updaters of v0.1.5 and v0.1.6, which refuse a release without gow3_update.exe.
             if ($env:GITHUB_REF_TYPE -eq 'tag') { Copy-Item "$binaries/gow3_update.exe" $package -Force }
-            Compress-Archive -Path "$package/*" -DestinationPath "build/GOW3rehooked-Windows-x86_64$suffix.zip" -CompressionLevel Optimal
+            $zip = "build/GOW3rehooked-Windows-x86_64$suffix.zip"
+            Compress-Archive -Path "$package/*" -DestinationPath $zip -CompressionLevel Optimal
+            ./tools/release/check-windows-zip.ps1 -Zip $zip -Release:($env:GITHUB_REF_TYPE -eq 'tag')
           }
       - name: Upload standard Windows ZIP
         if: contains(env.BUILD_VARIANTS, 'standard')

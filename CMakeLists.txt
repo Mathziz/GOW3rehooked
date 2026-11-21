@@ -18,8 +18,8 @@ if(WIN32)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4> $<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
     # Omitted aggregate members are value-initialized on purpose (designated initializers).
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/clang:-Wno-missing-field-initializers> $<$<COMPILE_LANGUAGE:CXX>:/clang:-Wno-missing-designated-field-initializers>)
-    # Keep implicit FMA contraction off and use a ThinLTO cache for incremental builds.
-    add_compile_options(/clang:-march=${GOW3_CPU_ARCH} /clang:-ffp-contract=off -flto=thin)
+    # Keep implicit FMA contraction off and use a ThinLTO cache for incremental builds. The resource compiler gets none of it.
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/clang:-march=${GOW3_CPU_ARCH};/clang:-ffp-contract=off;-flto=thin>")
     add_link_options(/lldltocache:${CMAKE_BINARY_DIR}/lto-cache)
     find_package(Vulkan REQUIRED) # gpu/device.cpp
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -55,20 +55,90 @@ endif()
 if(NOT WIN32 OR gow3_shared_runtime)
     list(FILTER gow3_sources EXCLUDE REGEX "/src/main/exe_icon\\.cpp$")
 endif()
+if(NOT WIN32)
+    list(FILTER gow3_sources EXCLUDE REGEX "/src/main/update\\.cpp$") # the AppImage updates itself (tools/appimage/update.go)
+endif()
+
+# Each Windows binary names itself and its release in a version resource (Explorer's file properties). Antivirus
+# heuristics also distrust executables without one.
+function(gow3_version_resource target file_name description)
+    if(NOT WIN32)
+        return()
+    endif()
+    set(numbers 0,0,0,0)
+    set(text "development build")
+    set(flags 0)
+    if(GOW3_RELEASE_TAG MATCHES "^v([0-9]+)\\.([0-9]+)(\\.([0-9]+))?")
+        set(patch 0)
+        if(CMAKE_MATCH_4)
+            set(patch ${CMAKE_MATCH_4})
+        endif()
+        set(numbers "${CMAKE_MATCH_1},${CMAKE_MATCH_2},${patch},0")
+        string(SUBSTRING "${GOW3_RELEASE_TAG}" 1 -1 text)
+        if(GOW3_RELEASE_TAG MATCHES "-")
+            set(flags VS_FF_PRERELEASE)
+        endif()
+    endif()
+    set(type VFT_APP)
+    if(file_name MATCHES "\\.dll$")
+        set(type VFT_DLL)
+    endif()
+    file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/version/${target}.rc CONTENT [[
+#include <winver.h>
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION @numbers@
+PRODUCTVERSION @numbers@
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS @flags@
+FILEOS VOS_NT_WINDOWS32
+FILETYPE @type@
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "GOW3rehooked"
+            VALUE "FileDescription", "@description@"
+            VALUE "FileVersion", "@text@"
+            VALUE "InternalName", "@file_name@"
+            VALUE "LegalCopyright", "GPL-2.0-or-later, https://github.com/cuesta4/GOW3rehooked"
+            VALUE "OriginalFilename", "@file_name@"
+            VALUE "ProductName", "GOW3rehooked"
+            VALUE "ProductVersion", "@text@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+]] @ONLY)
+    target_sources(${target} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/version/${target}.rc)
+endfunction()
+
 # The debug launcher starts the same game with GOW3_DEBUG=1.
 add_executable(gow3_debug WIN32 ${SRC}/main/gow3_debug.cpp)
+gow3_version_resource(gow3_debug gow3_debug.exe "GOW3rehooked with diagnostics")
 if(gow3_shared_runtime)
     # The launchers keep their identity across updates. Gow3Main is their stable runtime entry point.
     add_library(gow3 SHARED ${gow3_sources})
     set_property(SOURCE src/main/game.cpp APPEND PROPERTY COMPILE_DEFINITIONS GOW3_RUNTIME_DLL)
     set_target_properties(gow3 PROPERTIES ARCHIVE_OUTPUT_NAME gow3_runtime PDB_NAME gow3_runtime)
+    gow3_version_resource(gow3 gow3.dll "GOW3rehooked runtime")
     add_executable(gow3_launcher WIN32 ${SRC}/main/launcher.c)
     set_target_properties(gow3_launcher PROPERTIES OUTPUT_NAME gow3)
     target_link_libraries(gow3_launcher PRIVATE gow3)
     target_link_options(gow3_launcher PRIVATE /Brepro /DEPENDENTLOADFLAG:0xA00) # application directory and System32
     target_link_options(gow3_debug PRIVATE /Brepro)
+    gow3_version_resource(gow3_launcher gow3.exe "GOW3rehooked")
+    # Release ZIPs keep a gow3_update.exe for the updaters of v0.1.5 and v0.1.6 (main/update_stand_in.c).
+    add_executable(gow3_update WIN32 ${SRC}/main/update_stand_in.c)
+    target_link_options(gow3_update PRIVATE /Brepro)
+    gow3_version_resource(gow3_update gow3_update.exe "GOW3rehooked update stand-in")
 else()
     add_executable(gow3 WIN32 ${gow3_sources})
+    gow3_version_resource(gow3 gow3.exe "GOW3rehooked")
 endif()
 set(easu_dir ${SRC}/present/fsr)
 set(easu_spv ${CMAKE_CURRENT_BINARY_DIR}/easu_spv.inc)
@@ -104,9 +174,9 @@ if(WIN32)
     target_link_libraries(gow3_debug PRIVATE user32)
     set_property(SOURCE src/main/game.cpp src/main/exe_icon.cpp APPEND PROPERTY COMPILE_DEFINITIONS "UNICODE;_UNICODE")
     target_compile_definitions(gow3 PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE _SCL_SECURE_NO_WARNINGS)
-    target_compile_options(gow3 PRIVATE /Gy /Gw /GS- /clang:-Wno-unknown-warning-option)
+    target_compile_options(gow3 PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:/Gy;/Gw;/GS-;/clang:-Wno-unknown-warning-option>")
     target_link_libraries(gow3 PRIVATE ${clang_builtins_library} OneCore ws2_32 Psapi
-        Synchronization dbghelp bcrypt shell32 user32 windowsapp)
+        Synchronization dbghelp bcrypt shell32 user32 windowsapp winhttp)
     set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
     set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL Release)
     find_package(unofficial-shaderc CONFIG REQUIRED)
