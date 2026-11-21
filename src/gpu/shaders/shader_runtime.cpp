@@ -102,6 +102,46 @@ static std::span<const u32> Program(u64 addr, const CpuRead& cpu) {
     const u32* code = (const u32*)cpu(addr, bytes);
     return code ? std::span<const u32>(code, bytes / 4) : std::span<const u32>{};
 }
+
+static u64 ReadOrbFooterHash(u64 addr, u64 code_bytes, const CpuRead& cpu) {
+    const u8* f = code_bytes ? (const u8*)cpu(addr + code_bytes, 24) : nullptr;
+    if (!f) return 0;
+    constexpr char kMagic[] = "OrbShdr";
+    for (size_t i = 0; i < 7; ++i)
+        if (f[i] != (u8)kMagic[i]) return 0;
+    u64 hash = 0;
+    for (size_t i = 0; i < 8; ++i) hash |= (u64)f[16 + i] << (i * 8);
+    return hash;
+}
+
+u64 Renderer::Impl::OrbShaderHash(u64 prog, const CpuRead& cpu) {
+    const u32* h = (const u32*)cpu(prog, 8);
+    if (!h || h[0] != 0xBEEB03FF) return 0;
+    return ReadOrbFooterHash(prog, ((u64)h[1] + 1) * 8, cpu);
+}
+
+bool Renderer::Impl::ShouldSkipMotionBlur(const CpuRead& cpu) {
+    if (!skip_motion_blur) {
+        mb_seen_blur = false;
+        return false;
+    }
+    const u32 mode = ctx[0x202] >> 4 & 7;
+    const u64 ps_addr = (u64)(sh[0x08] | (u64)sh[0x09] << 32) << 8;
+    if (mode != 1 || (ctx[0x000] & 3) || !ps_addr || query_open || query_next != ~0u || pred) {
+        mb_seen_blur = false;
+        return false;
+    }
+    auto [it, fresh] = orb_hash_cache.try_emplace(ps_addr, 0);
+    if (fresh) it->second = OrbShaderHash(ps_addr, cpu);
+    const u64 hash = it->second;
+    if (hash == kMotionBlurPassOrbHash) {
+        mb_seen_blur = true;
+        return true;
+    }
+    const bool skip = hash == kMotionBlurCompositeOrbHash && mb_seen_blur && ((ctx[0x1E0] >> 30) & 1);
+    mb_seen_blur = false;
+    return skip;
+}
 // Where a descriptor or pointer of `n` dwords lies: user data, then 64-bit pointers loaded from memory (null: unreadable).
 static const u32* Locate(const Gcn::Path& path, u32 n, const u32* user, const CpuRead& cpu) {
     const u32* w = path.reg + (path.depth ? 2 : n) <= 16 ? user + path.reg : nullptr;
@@ -183,9 +223,29 @@ ShaderRef Renderer::Impl::Shader(Gcn::Stage stage, u64 prog, const u32* user, co
         table.resize(at + n);
         const u32* w = Locate(c.path, c.buffer ? 4 : 2, user, cpu);
         if (!w) continue;
-        const u64 base = ((u64)(w[1] & 0xFFFF) << 32 | w[0]) + c.lo;
-        if (const u64 stride = w[1] >> 16 & 0x3FFF, lim = stride ? stride * w[2] : w[2]; c.buffer) n = c.lo >= lim ? 0 : std::min(n, (lim - c.lo + 3) / 4);
+        const u64 buf_addr = (u64)(w[1] & 0xFFFF) << 32 | w[0];
+        const u64 base = buf_addr + c.lo;
+        u64 lim = 0;
+        if (c.buffer) {
+            const u64 stride = w[1] >> 16 & 0x3FFF;
+            lim = stride ? stride * w[2] : w[2];
+            n = c.lo >= lim ? 0 : std::min(n, (lim - c.lo + 3) / 4);
+        }
         if (const u32* s = n ? (const u32*)cpu(base, n * 4) : nullptr) std::copy_n(s, n, table.data() + at);
+        if (p.dof_composite && skip_dof_spartan && c.buffer && lim == 80 && n) {
+            if (const auto* f = (const float*)cpu(buf_addr, 80);
+                f && f[4] < 0.0f && f[5] < 0.0f && f[6] < 0.0f && f[7] > 0.0f && f[8] > 0.99f && f[8] < 1.01f) {
+                for (const u64 d : {0ULL, 1ULL, 4ULL, 5ULL, 6ULL, 7ULL}) {
+                    const u64 byte_off = d * 4;
+                    if (byte_off >= c.lo && byte_off - c.lo < n * 4 && ((byte_off - c.lo) & 3) == 0)
+                        table[at + (byte_off - c.lo) / 4] = 0;
+                }
+                if (static std::atomic<bool> logged{false};
+                    Gow3::DebugEnabled() && !logged.exchange(true, std::memory_order_relaxed)) {
+                    Gow3::Log("DOF composite CB0 constants zeroed (SpartanPort)");
+                }
+            }
+        }
         if (stats.trace && n)  // TEMP: constants the GPU wrote (the CPU's copy would be stale)
             for (auto* list : {&gpu_writes, &last_writes})
                 for (auto& g : *list)
@@ -343,6 +403,7 @@ bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const
     if (stale(pm, prog)) {
         pm.code = Program(prog, cpu);
         pm.hash = ::Gpu::PieceHash::ShaderCode(pm.code.data(), pm.code.size_bytes());
+        pm.orb_hash = pm.code.empty() ? 0 : ReadOrbFooterHash(prog, pm.code.size_bytes(), cpu);
         pm.fetch_sgpr = stage == Gcn::Stage::Vertex ? FetchSgpr(pm.code) : -1;
         pm.ver = Version(prog, pm.code.size_bytes());
     }
@@ -359,6 +420,7 @@ bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const
     p.spec.clear(), p.desc.clear(), p.fdesc.clear(), p.in = {}, p.rect = rect;
     p.motion_blur = stage == Gcn::Stage::Pixel && pm.hash == Gcn::MotionBlurCodeHash();
     p.stencil_resolve = stage == Gcn::Stage::Pixel && pm.hash == Gcn::MotionVectorResolveCodeHash();
+    p.dof_composite = stage == Gcn::Stage::Pixel && pm.orb_hash == kDofCompositeOrbHash;
     Gcn::Input& in = p.in;
     in.stage = stage, in.code = code, in.fetch = fetch, in.rsrc1 = rsrc1, in.rsrc2 = rsrc2, in.probe = stats.trace && stage == Gcn::Stage::Vertex;
     in.boom = boom_on && !in.probe && stage == Gcn::Stage::Vertex;

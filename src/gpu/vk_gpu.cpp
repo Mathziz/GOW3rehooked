@@ -6,6 +6,7 @@
 #include "gpu/shaders/shader_recipes.h"
 #include "gpu/shaders/gcn_internal.h"
 #include "main/cpu.h"
+#include "patches/extras.h"
 #include "debug/cpu_probe.h"  // TEMP blocks sampling
 #include <limits>
 
@@ -1190,8 +1191,10 @@ void Renderer::Impl::RecordBlocks(u32 rec) {
         TempCheck(cmd, 2, k);
         if (b.copy.second) CopyQueries(b.copy);
         Walk(chain_now, b.from, b.to, [&](u32 op, const u32* p, size_t si, size_t i) {
-            if (op == 0x27 || op == 0x2D || op == 0x35) walk_seg = si, walk_pos = i, Draw(op, p, *cpu_now);
-            else if (op == 0x46 && MeshDump(p)) MeshQuery(p, true);
+            if (op == 0x27 || op == 0x2D || op == 0x35) {
+                if (!std::binary_search(skipped_draws.begin(), skipped_draws.end(), Pos{si, i}))
+                    walk_seg = si, walk_pos = i, Draw(op, p, *cpu_now);
+            } else if (op == 0x46 && MeshDump(p)) MeshQuery(p, true);
         });
         // A pass still open ends without its barrier: Submit orders it against the next block.
         if (rendering) b.open = true, b.tail.depth = bound_depth, std::copy(bound_color, bound_color + 8, b.tail.color);
@@ -1297,6 +1300,11 @@ bool Renderer::Retired() {
 void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::span<const std::pair<u64, u64>> deferred,
                       const std::function<void()>& staged) {
     Impl& r = *d;
+    r.skip_motion_blur = Gow3::Extras::Enabled(Gow3::Extras::Toggle::RemoveMotionBlur);
+    r.skip_dof_spartan = Gow3::Extras::Enabled(Gow3::Extras::Toggle::RemoveDofSpartan);
+    r.mb_seen_blur = false;
+    r.skipped_draws.clear();
+    r.orb_hash_cache.clear();
     // The deferred spans out to whole pages (the game's arenas are 128-byte aligned), merged where they meet, as far as the
     // recording threads' bitmaps reach (any other span is staged whole after recording).
     std::vector<std::pair<u64, u64>> spans;
@@ -1403,6 +1411,10 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
             case 0x27:
             case 0x2D:
             case 0x35:
+                if (r.ShouldSkipMotionBlur(cpu)) {
+                    r.Count(r.stats.skipped);
+                    break;
+                }
                 if (const auto c = r.CopyRange(); c.second) r.CopyQueries(c);
                 r.RegisterStencil();
                 r.walk_seg = si, r.walk_pos = i, r.Draw(op, b, cpu);
@@ -1469,6 +1481,11 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         r.Walk(chain, {0, 0}, end, [&](u32 op, const u32* b, size_t si, size_t i) {
             if (Impl::Effect(op)) return r.Collect(op, b);
             const bool draw = op == 0x27 || op == 0x2D || op == 0x35;
+            if (draw && r.ShouldSkipMotionBlur(cpu)) {
+                r.skipped_draws.push_back({si, i});
+                r.Count(r.stats.skipped);
+                return;
+            }
             if (draw) r.RegisterStencil();
             const u64 query = op == 0x46 ? r.QueryBlock(b) : 0;
             if (op == 0x46 && r.MeshDump(b)) return r.MeshQuery(b, !r.blocks.empty() && r.blocks.back().serial);

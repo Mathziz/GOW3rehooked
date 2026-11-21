@@ -129,7 +129,7 @@ private:
 
     // SetVibration() from the game, sent by PollState(): small motor << 8 | large motor.
     std::atomic<u16> m_rumble{};
-    u16 m_rumble_sent{};
+    u32 m_rumble_sent{};
     u64 m_rumble_time{};
 };
 

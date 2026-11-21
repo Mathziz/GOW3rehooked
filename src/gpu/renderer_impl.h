@@ -132,6 +132,13 @@ struct Renderer::Impl {
     float motion_blur_rate = 1;
     bool blend_interlock = false;
     DynamicCaps caps{};
+    bool skip_motion_blur = false;
+    bool skip_dof_spartan = false;
+    bool mb_seen_blur = false;
+    std::vector<Pos> skipped_draws;
+    std::unordered_map<u64, u64> orb_hash_cache;
+    static u64 OrbShaderHash(u64 prog, const CpuRead& cpu);
+    bool ShouldSkipMotionBlur(const CpuRead& cpu);
     VkDevice dev = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     u32 family = 0;
@@ -741,6 +748,7 @@ struct Renderer::Impl {
         Gcn::Input in;
         bool motion_blur = false;
         bool stencil_resolve = false;
+        bool dof_composite = false;
         std::vector<Gcn::SlotSpec> spec;
         std::vector<const u32*> desc;   // descriptor of each slot (null: unreadable)
         std::vector<const u32*> fdesc;  // V# of each format load (null: unreadable)

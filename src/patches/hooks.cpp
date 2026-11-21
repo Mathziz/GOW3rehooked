@@ -6,6 +6,7 @@
 #include "gpu/device.h"
 #include "gpu/gpu_thread.h"
 #include "ui/controls_ui.h"
+#include "patches/extras.h"
 #include "patches/memory_patcher.h"
 #include "main/host.h"
 #ifndef _WIN32
@@ -818,8 +819,8 @@ constexpr u32 kMainItemSize = 0x34, kRehookedState = kMainShellSize - 4, kHelpSt
               kContinueLoadState = kContinueState + kMainItemSize,
               kSettingsState = kContinueLoadState + 0x40, kFirstRow = kSettingsState + 0x1c;
 enum MainRow : u32 { ContinueRow, NewGameRow, LoadRow, OptionsRow, TreasuresRow, RehookedRow, HelpRow, QuitRow, kMainRows };
-constexpr char kMainLabels[kMainRows][sizeof("Help and Controls")] = {
-    "Continue", "[msg_A[8001]]", "[msg_A[8002]]", "[msg_A[8003]]", "[msg_A[8004]]", "Rehooked", "Help and Controls", "[msg_A[4012]]",
+constexpr char kMainLabels[kMainRows][sizeof("Controls and Extras")] = {
+    "Continue", "[msg_A[8001]]", "[msg_A[8002]]", "[msg_A[8003]]", "[msg_A[8004]]", "Rehooked", "Controls and Extras", "[msg_A[4012]]",
 };
 constexpr char kSelectClip[] = "menuItem0Select";
 // String pool offsets (from the code base) already in the script.
@@ -927,6 +928,7 @@ Config SelectedConfig() {
     config.shader_recompilation = ShaderRecompilation(settings[Recompilation].index);
     config.shader_mechanism = ShaderMechanism(settings[Mechanism].index);
     config.lazy_aot = settings[LazyAot].index;
+    Extras::WriteToConfig(config);
     return config;
 }
 void Configure(const Config& config) {
@@ -1183,7 +1185,7 @@ void PS4_SYSV_ABI Init(u8* script) {
             if (!patched.empty()) {
                 WriteRows();
             }
-            if (DebugEnabled()) Log(patched.empty() ? "Title menu: script not recognized" : "Title menu: Rehooked, Help and Controls and Quit entries added");
+            if (DebugEnabled()) Log(patched.empty() ? "Title menu: script not recognized" : "Title menu: Rehooked, Controls and Extras and Quit entries added");
         }
         if (!patched.empty()) {
             WriteMainRows(Libraries::SaveData::Dialog::HasContinueSave());
@@ -1542,6 +1544,7 @@ void InstallHooks(Core::Module& eboot, const Config& config) {
     Log("Job queue patched: spin loops at 011A5910, 011A59D0, 011A5D70 and 011A5E30 pause and yield; 011A5DF6 unlocks before "
         "signaling; 01166003 keeps unchanged color correction LUT halves");
     if (DebugEnabled()) Log(std::format("Installed {} game detours", detours.size()));
+    Extras::InstallHooks(eboot);
 }
 
 void StopDiagnosticHooks() {

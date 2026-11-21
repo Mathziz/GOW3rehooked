@@ -412,4 +412,126 @@ inline void DrawBasaltBackground(ImDrawList* list, ImVec2 pos, ImVec2 size) {
     });
 }
 
+inline ImU32 LerpColor(ImU32 a, ImU32 b, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    const auto ch = [&](int shift) {
+        const float ca = static_cast<float>((a >> shift) & 0xFF);
+        const float cb = static_cast<float>((b >> shift) & 0xFF);
+        return static_cast<ImU32>(std::lround(ca + (cb - ca) * t));
+    };
+    return IM_COL32(ch(IM_COL32_R_SHIFT), ch(IM_COL32_G_SHIFT), ch(IM_COL32_B_SHIFT), ch(IM_COL32_A_SHIFT));
+}
+
+inline void DrawDpadHorizontalGlyph(ImDrawList* list, ImVec2 c, float h) {
+    const float r = h * 0.5f, arm = h * 0.36f;
+    for (const auto& [grow, color] : {std::pair{1.4f, Theme::PS4BtnBorder}, std::pair{0.0f, Theme::PS4BtnBg}}) {
+        list->AddRectFilled({c.x - r - grow, c.y - arm * 0.5f - grow}, {c.x + r + grow, c.y + arm * 0.5f + grow}, color, 2.0f);
+        list->AddRectFilled({c.x - arm * 0.5f - grow, c.y - r - grow}, {c.x + arm * 0.5f + grow, c.y + r + grow}, color, 2.0f);
+    }
+    list->AddTriangleFilled({c.x - r * 0.82f, c.y}, {c.x - r * 0.42f, c.y - arm * 0.30f},
+                            {c.x - r * 0.42f, c.y + arm * 0.30f}, Theme::GoldLight);
+    list->AddTriangleFilled({c.x + r * 0.82f, c.y}, {c.x + r * 0.42f, c.y + arm * 0.30f},
+                            {c.x + r * 0.42f, c.y - arm * 0.30f}, Theme::GoldLight);
+}
+
+struct SliderHits {
+    ImVec2 left_min, left_max;
+    ImVec2 right_min, right_max;
+    ImVec2 track_min, track_max;
+};
+
+inline SliderHits DrawDiamondSlider(ImDrawList* draw, ImVec2 box_min, ImVec2 box_max, float S, float focus_t,
+                                    unsigned value, ImFont* font) {
+    value = std::min(value, 100u);
+    const float mid_y = (box_min.y + box_max.y) * 0.5f;
+    const float pad = 10.0f * S, gap = 8.0f * S, tri_w = 9.0f * S, tri_hh = 6.0f * S, val_w = 46.0f * S;
+    const float lx0 = box_min.x + pad, lx1 = lx0 + tri_w;
+    const float rx1 = box_max.x - pad, rx0 = rx1 - tri_w;
+
+    const ImU32 arrow_col = LerpColor(Fade(Theme::GoldBronze, 0.55f), Theme::GoldLight, focus_t);
+    draw->AddTriangleFilled({lx0, mid_y}, {lx1, mid_y - tri_hh}, {lx1, mid_y + tri_hh}, arrow_col);
+    draw->AddTriangleFilled({rx1, mid_y}, {rx0, mid_y + tri_hh}, {rx0, mid_y - tri_hh}, arrow_col);
+
+    const std::string val_text = value == 0 ? "OFF" : std::to_string(value) + "%";
+    const float val_size = 15.0f * S;
+    const ImVec2 val_ext = font->CalcTextSizeA(val_size, FLT_MAX, 0.0f, val_text.c_str());
+    const ImU32 val_col = value == 0 ? IM_COL32(221, 106, 109, 255) : Theme::GoldLight;
+    draw->AddText(font, val_size, {rx0 - gap - val_ext.x, mid_y - val_ext.y * 0.5f}, val_col, val_text.c_str());
+
+    const float tx0 = lx1 + gap + 4.0f * S;
+    const float tx1 = std::max(tx0 + 16.0f * S, rx0 - gap - val_w - gap - 4.0f * S);
+    const float half_h = 3.5f * S, ty0 = mid_y - half_h, ty1 = mid_y + half_h;
+    const float frac = static_cast<float>(value) / 100.0f;
+    const float fill_x = tx0 + (tx1 - tx0) * frac;
+
+    for (int i = 0; i <= 10; ++i) {
+        const float x = tx0 + (tx1 - tx0) * (static_cast<float>(i) / 10.0f);
+        draw->AddLine({x, ty1 + 2.0f * S}, {x, ty1 + 6.0f * S}, Fade(Theme::GoldBronze, 0.35f), std::max(1.0f, 1.0f * S));
+    }
+    draw->AddRectFilled({tx0, ty0}, {tx1, ty1}, Theme::BloodTrenchDark, half_h);
+    if (value > 0 && fill_x > tx0 + 1.0f) {
+        draw->AddRectFilledMultiColor({tx0, ty0}, {fill_x, ty1}, IM_COL32(124, 90, 36, 255), IM_COL32(226, 187, 106, 255),
+                                      IM_COL32(226, 187, 106, 255), IM_COL32(124, 90, 36, 255));
+    }
+    draw->AddRect({tx0, ty0}, {tx1, ty1}, Fade(Theme::GoldBronze, 0.35f), half_h, 0, std::max(1.0f, 1.0f * S));
+
+    const ImVec2 tc{fill_x, mid_y};
+    const float r = 9.2f * S;
+    const ImVec2 top{tc.x, tc.y - r}, right{tc.x + r, tc.y}, bottom{tc.x, tc.y + r}, left{tc.x - r, tc.y};
+    if (value > 0) {
+        DrawSoftGlow(draw, tc, 14.0f * S, Theme::GoldBronze & ~IM_COL32_A_MASK, 28.0f + 42.0f * focus_t);
+    }
+    if (focus_t > 0.01f) {
+        const float hr = r + 2.2f * S;
+        draw->AddQuad({tc.x, tc.y - hr}, {tc.x + hr, tc.y}, {tc.x, tc.y + hr}, {tc.x - hr, tc.y},
+                      Fade(Theme::GoldLight, 0.35f * focus_t), std::max(1.5f, 2.0f * S));
+    }
+    if (value == 0) {
+        draw->AddQuadFilled(top, right, bottom, left, LerpColor(IM_COL32(74, 58, 34, 255), IM_COL32(107, 85, 48, 255), focus_t));
+    } else {
+        draw->AddTriangleFilled(left, top, right, IM_COL32(246, 220, 152, 255));
+        draw->AddTriangleFilled(left, right, bottom, IM_COL32(182, 138, 63, 255));
+    }
+    draw->AddQuad(top, right, bottom, left, IM_COL32(58, 26, 12, 255), std::max(1.0f, 1.2f * S));
+
+    return {
+        {box_min.x, box_min.y}, {lx1 + gap * 0.5f, box_max.y},
+        {rx0 - gap * 0.5f, box_min.y}, {box_max.x, box_max.y},
+        {tx0, box_min.y}, {tx1, box_max.y},
+    };
+}
+
+struct SelectorHits {
+    ImVec2 left_min, left_max;
+    ImVec2 right_min, right_max;
+};
+
+inline SelectorHits DrawToggleSelector(ImDrawList* draw, ImVec2 box_min, ImVec2 box_max, float S, float focus_t,
+                                       bool on, bool available, ImFont* font) {
+    const float mid_y = (box_min.y + box_max.y) * 0.5f;
+    const float pad = 10.0f * S, gap = 8.0f * S, tri_w = 9.0f * S, tri_hh = 6.0f * S;
+    const float lx0 = box_min.x + pad, lx1 = lx0 + tri_w;
+    const float rx1 = box_max.x - pad, rx0 = rx1 - tri_w;
+
+    const float arrow_alpha = available ? 1.0f : 0.38f;
+    const ImU32 arrow_col = Fade(LerpColor(Fade(Theme::GoldBronze, 0.55f), Theme::GoldLight, focus_t), arrow_alpha);
+    draw->AddTriangleFilled({lx0, mid_y}, {lx1, mid_y - tri_hh}, {lx1, mid_y + tri_hh}, arrow_col);
+    draw->AddTriangleFilled({rx1, mid_y}, {rx0, mid_y + tri_hh}, {rx0, mid_y - tri_hh}, arrow_col);
+
+    const char* label = on ? "ON" : "OFF";
+    const float text_size = 16.0f * S;
+    const ImVec2 ext = font->CalcTextSizeA(text_size, FLT_MAX, 0.0f, label);
+    const ImVec2 center{(lx1 + rx0) * 0.5f, mid_y};
+    if (on && available) {
+        DrawSoftGlow(draw, center, 26.0f * S, Theme::GoldBronze & ~IM_COL32_A_MASK, 20.0f);
+    }
+    const ImU32 text_col = !available ? Fade(Theme::TextMuted, 0.38f) : on ? Theme::GoldLight : Theme::TextMuted;
+    draw->AddText(font, text_size, {center.x - ext.x * 0.5f, center.y - ext.y * 0.5f}, text_col, label);
+
+    return {
+        {box_min.x, box_min.y}, {lx1 + gap, box_max.y},
+        {rx0 - gap, box_min.y}, {box_max.x, box_max.y},
+    };
+}
+
 } // namespace Gow3::UI

@@ -13,6 +13,7 @@
 #include "orbis/core/file_sys/fs.h"
 #include "orbis/internals/libs.h"
 #include "orbis/core/linker.h"
+#include "patches/extras.h"
 #include "patches/hooks.h"
 #include "patches/memory_patcher.h"
 #include "present/window.h"
@@ -128,6 +129,7 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
         SetUnhandledExceptionFilter(ReportUnhandledCrash);
 #endif
         const auto config = LoadConfig(app / PortDir::Settings / "config.cfg");
+        Extras::LoadFromConfig(config);
         GpuThread::Configure(config.anisotropy);
         if (DebugEnabled()) Log(std::format("Configuration: {} at {:.2f} fps, skip intro {}, skip videos {}, mode {}",
                         Resolutions[config.resolution].name, GameFrameRate(config.fps), config.skip_intro, config.skip_videos,

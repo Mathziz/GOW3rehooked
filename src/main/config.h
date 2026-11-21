@@ -76,7 +76,20 @@ struct Config {
     ShaderRecompilation shader_recompilation = ShaderRecompilation::Async;
     ShaderMechanism shader_mechanism = ShaderMechanism::Aot;
     bool lazy_aot = true;                   // AOT builds a fixed quarter of all WAD variants per eligible launch
+    unsigned vibration = 100;               // 0..100 controller vibration strength percentage
+    bool cheat_infinite_health = false;
+    bool cheat_infinite_magic = false;
+    bool cheat_infinite_item = false;
+    bool cheat_infinite_rage = false;
+    bool cheat_max_red_orbs = false;
+    bool cheat_infinite_double_jumps = false;
+    bool cheat_unlock_chaos = false;
+    bool cheat_auto_qte = false;
+    bool remove_motion_blur = false;
+    bool remove_dof_spartan = false;
+    bool remove_dof_erick = false;
 };
 Config LoadConfig(const std::filesystem::path& path);
 void SaveMenuConfig(const std::filesystem::path& path, const Config& config);
+void SaveExtrasConfig(const std::filesystem::path& path, const Config& config);
 }

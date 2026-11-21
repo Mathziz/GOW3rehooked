@@ -16,6 +16,7 @@
 #include "orbis/internals/system/userservice.h"
 #include "orbis/internals/save_data/user.h"
 #include "input/controller.h"
+#include "patches/extras.h"
 
 namespace Input {
 
@@ -120,10 +121,14 @@ void GameController::UpdateAcceleration(const float acceleration[3]) {
 void GameController::PollState() {
     // A steady rumble is resent well before SDL's longest duration (65 s) runs out.
     const u16 rumble = m_rumble.load(std::memory_order_relaxed);
+    const u32 strength = Gow3::Extras::Vibration();
+    const u16 low = static_cast<u16>(((rumble >> 8) * 257u * strength + 50u) / 100u);
+    const u16 high = static_cast<u16>(((rumble & 0xffu) * 257u * strength + 50u) / 100u);
+    const u32 scaled = static_cast<u32>(low) << 16 | high;
     const u64 now = Libraries::Kernel::sceKernelGetProcessTime();
-    if (m_sdl_gamepad && (rumble != m_rumble_sent || (rumble && now - m_rumble_time > 30'000'000))) {
-        SDL_RumbleGamepad(m_sdl_gamepad, (rumble >> 8) * 257, (rumble & 0xff) * 257, -1);
-        m_rumble_sent = rumble, m_rumble_time = now;
+    if (m_sdl_gamepad && (scaled != m_rumble_sent || (scaled && now - m_rumble_time > 30'000'000))) {
+        SDL_RumbleGamepad(m_sdl_gamepad, low, high, -1);
+        m_rumble_sent = scaled, m_rumble_time = now;
     }
     std::lock_guard lock{m_state_mutex};
     PushStateLocked(now);
