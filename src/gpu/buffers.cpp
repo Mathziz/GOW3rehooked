@@ -296,9 +296,13 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     std::vector<Piece>& pieces = own;  // the caller's, on every thread
     pieces.clear();
     u64 capture_size = 0;
+    static std::atomic<bool> above_fallback{false};  // logged once, outside debug runs too
     for (WriteRange& w : ranges) {
         const u64 top = d->mirror_size;  // the mirror holds guest addresses below it (32 GB, or 16 GB)
         if (w.addr + w.size > top) d->Note(std::format("TEMP write beyond the mirror {:#x}+{:#x}", w.addr, w.size));  // TEMP fault
+        if (w.addr + w.size > top && top < kMirrorMax && !above_fallback.exchange(true, std::memory_order_relaxed))
+            Gow3::Log(std::format("Renderer: guest memory {:#x}+{:#x} reaches past the {} GB mirror; draws that read it will be wrong", w.addr,
+                                  w.size, top >> 30));
         const u64 end = w.addr < top ? std::min(w.addr + w.size, top) : w.addr;
         for (u64 a = w.addr, n; a < end; a += n) {
             n = std::min<u64>(0x1000 - (a & 0xFFF), end - a);
