@@ -742,6 +742,13 @@ struct Renderer::Impl {
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
     std::atomic<u32> pipeline_cache_dirty{0};
     std::unordered_map<u64, CompiledPipeline> pipelines;   // GraphicsPipelineKey::Hash() -> main/square VkPipeline (under prog_lock)
+    // Tier 2 (Gpl): 4-part Graphics Pipeline Library caches + LTO upgrade dedup set (under prog_lock).
+    VkPipeline gpl_vi[3]{};                              // Vertex Input Interface: POINT_LIST, LINE_LIST, TRIANGLE_LIST
+    VkPipeline gpl_empty_fs = VK_NULL_HANDLE;            // Fragment Shader library (samples=1, no PS)
+    std::unordered_map<u64, VkPipeline> gpl_prerast;     // Pre-Rasterization library cache (VS+GS or non-default static flags)
+    std::unordered_map<u64, VkPipeline> gpl_frag_msaa;   // Fragment Shader library cache for samples > 1 when !caps.rasterization_samples
+    std::unordered_map<u64, VkPipeline> gpl_foi;         // Fragment Output Interface library cache
+    std::unordered_set<u64> gpl_lto_queued;              // GraphicsPipelineKey hashes already queued for background LTO
     // A program's translation input and key under the current registers (no GPU work).
     struct Prepared {
         Gcn::Input in;
@@ -819,6 +826,15 @@ struct Renderer::Impl {
                                          const FixedPipelineState& state, bool fail_on_compile, bool square_pass);
     CompiledPipeline CreateMonolithicPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                               const FixedPipelineState& state, bool fail_on_compile);
+    void SetupGplGlobals();
+    VkPipeline CreateGplPreRaster(VkShaderModule vs_mod, VkShaderModule gs_mod, bool neg_one, bool depth_clamp);
+    VkPipeline CreateGplFragShader(VkShaderModule ps_mod, u32 samples);
+    VkPipeline CreateGplFragOutput(const FixedPipelineState& state, bool square_pass);
+    VkPipeline GetGplPreRaster(const ShaderRef& vs, const ShaderRef& gs, const FixedPipelineState& state);
+    VkPipeline GetGplFragShader(const ShaderRef& ps, const FixedPipelineState& state);
+    VkPipeline GetGplFragOutput(const FixedPipelineState& state, bool square_pass);
+    VkPipeline LinkGplPipeline(const VkPipeline (&libs)[4], bool lto, bool fail_on_compile);
+    CompiledPipeline LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, bool lto, bool fail_on_compile);
     CompiledPipeline GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                          const FixedPipelineState& raw_state);
     VkPipeline IndexProbePipeline(const FixedPipelineState& state);

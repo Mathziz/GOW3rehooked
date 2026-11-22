@@ -31,9 +31,15 @@ void main() {
         clear_rect_ref = {kClearRectVsKey, Create(clear_rect_spirv, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT),
                           VK_NULL_HANDLE, VK_NULL_HANDLE};
     } else {
-        clear_rect_ref = {kClearRectVsKey, VK_NULL_HANDLE, CreateShaderModule(clear_rect_spirv), VK_NULL_HANDLE};
+        const VkShaderModule mod = CreateShaderModule(clear_rect_spirv);
+        const VkPipeline lib = (caps.path == ShaderPath::Gpl && mod) ? CreateGplPreRaster(mod, VK_NULL_HANDLE, false, false) : VK_NULL_HANDLE;
+        clear_rect_ref = {kClearRectVsKey, VK_NULL_HANDLE, mod, lib};
     }
-    if (!clear_rect_ref) return error = "SDK clear vertex shader creation failed", false;
+    if (!clear_rect_ref || (caps.path == ShaderPath::Gpl && !clear_rect_ref.pl)) {
+        DestroyShaderRef(clear_rect_ref);
+        clear_rect_ref = {};
+        return error = "SDK clear vertex shader creation failed", false;
+    }
     return true;
 }
 
@@ -720,6 +726,281 @@ CompiledPipeline Renderer::Impl::CreateMonolithicPipeline(const ShaderRef& vs, c
     return pl;
 }
 
+void Renderer::Impl::SetupGplGlobals() {
+    static constexpr VkPipelineCreateFlags kLibFlags =
+        VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+    static constexpr VkPrimitiveTopology kTopos[3]{
+        VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    static constexpr VkDynamicState kViDyns[2]{
+        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, 2, kViDyns};
+    VkGraphicsPipelineLibraryCreateInfoEXT lib_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, nullptr,
+                                                  VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT};
+    for (u32 k = 0; k < 3; ++k) {
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, nullptr, 0, kTopos[k], VK_FALSE};
+        VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib_ci, kLibFlags};
+        gi.pVertexInputState = &vi, gi.pInputAssemblyState = &ia, gi.pDynamicState = &dsi;
+        if (const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &gpl_vi[k]); e != VK_SUCCESS)
+            Report(std::format("vkCreateGraphicsPipelines GPL VI[{}] {}", k, (int)e)), gpl_vi[k] = VK_NULL_HANDLE;
+    }
+    // Default samples=1 depth-only FS library; MSAA depth-only variants go into gpl_frag_msaa on demand.
+    gpl_empty_fs = CreateGplFragShader(VK_NULL_HANDLE, 1);
+}
+
+VkPipeline Renderer::Impl::CreateGplPreRaster(VkShaderModule vs_mod, VkShaderModule gs_mod, bool neg_one, bool depth_clamp) {
+    if (!vs_mod) return VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo stages[2]{
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs_mod, "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT, gs_mod, "main"},
+    };
+    VkPipelineViewportDepthClipControlCreateInfoEXT dcc{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, nullptr,
+                                                       neg_one ? VK_TRUE : VK_FALSE};
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                          caps.depth_clip_negative_one_to_one ? nullptr : &dcc};
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.depthClampEnable = (!caps.depth_clamp_enable && depth_clamp) ? VK_TRUE : VK_FALSE;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.lineWidth = 1.0f;
+
+    std::vector<VkDynamicState> dyns{
+        VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
+        VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
+        VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
+        VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE,
+        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,
+    };
+    if (caps.depth_clip_negative_one_to_one) dyns.push_back(VK_DYNAMIC_STATE_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT);
+    if (caps.depth_clamp_enable) dyns.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, u32(dyns.size()), dyns.data()};
+    VkGraphicsPipelineLibraryCreateInfoEXT lib_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, nullptr,
+                                                  VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT};
+    VkGraphicsPipelineCreateInfo gi{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib_ci,
+        VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT,
+        gs_mod ? 2u : 1u, stages};
+    gi.pViewportState = &vps, gi.pRasterizationState = &rs, gi.pDynamicState = &dsi, gi.layout = layout;
+    VkPipeline pl = VK_NULL_HANDLE;
+    if (const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl); e != VK_SUCCESS) {
+        Report(std::format("vkCreateGraphicsPipelines GPL PreRaster {}", (int)e));
+        return VK_NULL_HANDLE;
+    }
+    return pl;
+}
+
+VkPipeline Renderer::Impl::CreateGplFragShader(VkShaderModule ps_mod, u32 samples) {
+    VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, "main"};
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VkSampleCountFlagBits(std::max<u32>(1, samples));
+
+    std::vector<VkDynamicState> dyns{
+        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+        VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_BOUNDS,
+        VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+        VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+    };
+    if (caps.rasterization_samples) dyns.push_back(VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, u32(dyns.size()), dyns.data()};
+    VkGraphicsPipelineLibraryCreateInfoEXT lib_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, nullptr,
+                                                  VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT};
+    VkGraphicsPipelineCreateInfo gi{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib_ci,
+        VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT,
+        ps_mod ? 1u : 0u, ps_mod ? &st : nullptr};
+    gi.pMultisampleState = &ms, gi.pDepthStencilState = &ds, gi.pDynamicState = &dsi, gi.layout = layout;
+    VkPipeline pl = VK_NULL_HANDLE;
+    if (const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl); e != VK_SUCCESS) {
+        Report(std::format("vkCreateGraphicsPipelines GPL FragShader {}", (int)e));
+        return VK_NULL_HANDLE;
+    }
+    return pl;
+}
+
+VkPipeline Renderer::Impl::CreateGplFragOutput(const FixedPipelineState& state, bool square_pass) {
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VkSampleCountFlagBits(std::max<u32>(1, state.samples));
+    ms.alphaToCoverageEnable = (!caps.alpha_to_coverage_enable && (state.flags & FixedPipelineState::kAlphaToCoverage)) ? VK_TRUE : VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState cba[8]{};
+    const u32 count = std::min<u32>(state.color_count, 8);
+    for (u32 k = 0; k < count; ++k) {
+        auto& a = cba[k];
+        if (square_pass) {
+            const bool active = state.color_formats[k] != VK_FORMAT_UNDEFINED && state.blend[k].write_mask != 0;
+            const bool sq_c = (state.square_color_mask >> k & 1) != 0;
+            const bool sq_a = (state.square_alpha_mask >> k & 1) != 0;
+            a.blendEnable = (!caps.color_blend_enable && active) ? VK_TRUE : VK_FALSE;
+            a.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+            a.dstColorBlendFactor = sq_c ? VK_BLEND_FACTOR_DST_COLOR : VK_BLEND_FACTOR_ONE;
+            a.colorBlendOp = VK_BLEND_OP_ADD;
+            a.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            a.dstAlphaBlendFactor = sq_a ? VK_BLEND_FACTOR_DST_ALPHA : VK_BLEND_FACTOR_ONE;
+            a.alphaBlendOp = VK_BLEND_OP_ADD;
+        } else {
+            const auto& b = state.blend[k];
+            a.blendEnable = (!caps.color_blend_enable && b.blend_enable) ? VK_TRUE : VK_FALSE;
+            a.srcColorBlendFactor = VkBlendFactor(b.src_color);
+            a.dstColorBlendFactor = VkBlendFactor(b.dst_color);
+            a.colorBlendOp = VkBlendOp(b.color_op);
+            a.srcAlphaBlendFactor = VkBlendFactor(b.src_alpha);
+            a.dstAlphaBlendFactor = VkBlendFactor(b.dst_alpha);
+            a.alphaBlendOp = VkBlendOp(b.alpha_op);
+        }
+        a.colorWriteMask = caps.color_write_mask ? VkColorComponentFlags(0xF) : VkColorComponentFlags(state.blend[k].write_mask);
+    }
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, nullptr, 0, VK_FALSE, VK_LOGIC_OP_COPY,
+                                           count, count ? cba : nullptr};
+
+    std::vector<VkDynamicState> dyns{VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    if (caps.rasterization_samples) dyns.push_back(VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
+    if (caps.alpha_to_coverage_enable) dyns.push_back(VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT);
+    if (caps.color_blend_enable) dyns.push_back(VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT);
+    if (caps.color_blend_equation) dyns.push_back(VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT);
+    if (caps.color_write_mask) dyns.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, u32(dyns.size()), dyns.data()};
+    VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, nullptr, 0, count,
+                                      count ? state.color_formats : nullptr, state.depth_format, state.stencil_format};
+    VkGraphicsPipelineLibraryCreateInfoEXT lib_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &rci,
+                                                  VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
+    VkGraphicsPipelineCreateInfo gi{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib_ci,
+        VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT};
+    gi.pMultisampleState = &ms, gi.pColorBlendState = &cb, gi.pDynamicState = &dsi;
+    VkPipeline pl = VK_NULL_HANDLE;
+    if (const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl); e != VK_SUCCESS) {
+        Report(std::format("vkCreateGraphicsPipelines GPL FragOutput {}", (int)e));
+        return VK_NULL_HANDLE;
+    }
+    return pl;
+}
+
+VkPipeline Renderer::Impl::GetGplPreRaster(const ShaderRef& vs, const ShaderRef& gs, const FixedPipelineState& state) {
+    const bool neg_one = !caps.depth_clip_negative_one_to_one && (state.flags & FixedPipelineState::kNegOne);
+    const bool depth_clamp = !caps.depth_clamp_enable && (state.flags & FixedPipelineState::kDepthClamp);
+    const bool has_gs = (state.flags & FixedPipelineState::kHasGs) != 0;
+    if (!has_gs && !neg_one && !depth_clamp && vs.pl) return vs.pl;
+    if (!vs.mod || (has_gs && !gs.mod)) return VK_NULL_HANDLE;
+    struct PreKey {
+        u64 vs, gs;
+        u32 flags, pad;
+    } pk{vs.key, has_gs ? gs.key : 0ull, u32(neg_one) | u32(depth_clamp) << 1 | u32(has_gs) << 2, 0};
+    const u64 h = ::Gpu::PieceHash::Stable64(&pk, sizeof(pk));
+    {
+        std::shared_lock lock(prog_lock);
+        if (auto it = gpl_prerast.find(h); it != gpl_prerast.end()) return it->second;
+    }
+    const VkPipeline created = CreateGplPreRaster(vs.mod, has_gs ? gs.mod : VK_NULL_HANDLE, neg_one, depth_clamp);
+    if (!created) return VK_NULL_HANDLE;
+    std::unique_lock lock(prog_lock);
+    auto [it, inserted] = gpl_prerast.try_emplace(h, created);
+    if (!inserted) vkDestroyPipeline(dev, created, nullptr);
+    return it->second;
+}
+
+VkPipeline Renderer::Impl::GetGplFragShader(const ShaderRef& ps, const FixedPipelineState& state) {
+    const bool has_ps = (state.flags & FixedPipelineState::kHasPs) != 0;
+    const u32 samples = caps.rasterization_samples ? 1u : std::max<u32>(1, state.samples);
+    if (!has_ps && samples == 1 && gpl_empty_fs) return gpl_empty_fs;
+    if (has_ps && samples == 1 && ps.pl) return ps.pl;
+    if (has_ps && !ps.mod) return VK_NULL_HANDLE;
+    struct FragKey {
+        u64 ps;
+        u32 samples, has_ps;
+    } fk{has_ps ? ps.key : 0ull, samples, has_ps ? 1u : 0u};
+    const u64 h = ::Gpu::PieceHash::Stable64(&fk, sizeof(fk));
+    {
+        std::shared_lock lock(prog_lock);
+        if (auto it = gpl_frag_msaa.find(h); it != gpl_frag_msaa.end()) return it->second;
+    }
+    const VkPipeline created = CreateGplFragShader(has_ps ? ps.mod : VK_NULL_HANDLE, samples);
+    if (!created) return VK_NULL_HANDLE;
+    std::unique_lock lock(prog_lock);
+    auto [it, inserted] = gpl_frag_msaa.try_emplace(h, created);
+    if (!inserted) vkDestroyPipeline(dev, created, nullptr);
+    return it->second;
+}
+
+VkPipeline Renderer::Impl::GetGplFragOutput(const FixedPipelineState& state, bool square_pass) {
+    struct FoiKey {
+        VkFormat color_formats[8];
+        VkFormat depth_format;
+        VkFormat stencil_format;
+        u8 color_count;
+        u8 samples;
+        u8 a2c;
+        u8 square_pass;
+        u8 square_color_mask;
+        u8 square_alpha_mask;
+        u8 pad[2];
+        FixedAttachmentBlend blend[8];
+    } fk{};
+    static_assert(sizeof(FoiKey) == 112);
+    std::copy_n(state.color_formats, 8, fk.color_formats);
+    fk.depth_format = state.depth_format;
+    fk.stencil_format = state.stencil_format;
+    fk.color_count = state.color_count;
+    fk.samples = caps.rasterization_samples ? 1 : std::max<u8>(1, state.samples);
+    fk.a2c = (!caps.alpha_to_coverage_enable && (state.flags & FixedPipelineState::kAlphaToCoverage)) ? 1 : 0;
+    fk.square_pass = square_pass ? 1 : 0;
+    fk.square_color_mask = square_pass ? state.square_color_mask : 0;
+    fk.square_alpha_mask = square_pass ? state.square_alpha_mask : 0;
+    std::copy_n(state.blend, 8, fk.blend);
+    const u64 h = ::Gpu::PieceHash::Stable64(&fk, sizeof(fk));
+    {
+        std::shared_lock lock(prog_lock);
+        if (auto it = gpl_foi.find(h); it != gpl_foi.end()) return it->second;
+    }
+    const VkPipeline created = CreateGplFragOutput(state, square_pass);
+    if (!created) return VK_NULL_HANDLE;
+    std::unique_lock lock(prog_lock);
+    auto [it, inserted] = gpl_foi.try_emplace(h, created);
+    if (!inserted) vkDestroyPipeline(dev, created, nullptr);
+    return it->second;
+}
+
+VkPipeline Renderer::Impl::LinkGplPipeline(const VkPipeline (&libs)[4], bool lto, bool fail_on_compile) {
+    if (fail_on_compile && !caps.cache_control) return VK_NULL_HANDLE;
+    VkPipelineLibraryCreateInfoKHR lib_ci{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, nullptr, 4, libs};
+    VkPipelineCreateFlags flags = 0;
+    if (lto) flags |= VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
+    if (fail_on_compile) flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib_ci, flags};
+    gi.layout = layout;
+    VkPipeline pl = VK_NULL_HANDLE;
+    const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl);
+    if (e == VK_SUCCESS) {
+        if (lto && !fail_on_compile) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+        return pl;
+    }
+    if (e < 0) Report(std::format("vkCreateGraphicsPipelines GPL Link(lto={}) {}", lto, (int)e));
+    return VK_NULL_HANDLE;
+}
+
+CompiledPipeline Renderer::Impl::LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, bool lto, bool fail_on_compile) {
+    CompiledPipeline pl{};
+    pl.main = LinkGplPipeline(main_libs, lto, fail_on_compile);
+    if (!pl.main) return {};
+    if (foi_square) {
+        const VkPipeline sq_libs[4]{main_libs[0], main_libs[1], main_libs[2], foi_square};
+        pl.square = LinkGplPipeline(sq_libs, lto, fail_on_compile);
+        if (!pl.square) {
+            vkDestroyPipeline(dev, pl.main, nullptr);
+            return {};
+        }
+    }
+    pl.is_lto = lto;
+    return pl;
+}
+
 CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                                      const FixedPipelineState& raw_state) {
     GraphicsPipelineKey gkey{vs.key, ps ? ps.key : 0ull, (raw_state.flags & FixedPipelineState::kHasGs) ? gs.key : 0ull, raw_state};
@@ -730,6 +1011,59 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
     {
         std::shared_lock lock(prog_lock);
         if (auto it = pipelines.find(h); it != pipelines.end()) return pm[h] = it->second;
+    }
+    if (caps.path == ShaderPath::Gpl) {
+        const VkPipeline vi = gpl_vi[std::min<u8>(gkey.state.topology_class, 2)];
+        const VkPipeline prerast = GetGplPreRaster(vs, gs, gkey.state);
+        const VkPipeline fs = GetGplFragShader(ps, gkey.state);
+        const VkPipeline foi = GetGplFragOutput(gkey.state, false);
+        const bool need_sq = gkey.state.NeedsSquarePipeline(caps);
+        const VkPipeline foi_sq = need_sq ? GetGplFragOutput(gkey.state, true) : VK_NULL_HANDLE;
+        if (vi && prerast && fs && foi && (!need_sq || foi_sq)) {
+            const VkPipeline libs[4]{vi, prerast, fs, foi};
+            CompiledPipeline pl = LinkGplPair(libs, foi_sq, true, true);
+            if (!pl.main) pl = LinkGplPair(libs, foi_sq, false, false);
+            if (pl.main) {
+                bool queue_lto = false;
+                CompiledPipeline ret{};
+                {
+                    std::unique_lock lock(prog_lock);
+                    auto [it, inserted] = pipelines.try_emplace(h, pl);
+                    if (!inserted) {
+                        vkDestroyPipeline(dev, pl.main, nullptr);
+                        if (pl.square) vkDestroyPipeline(dev, pl.square, nullptr);
+                    }
+                    ret = it->second;
+                    if (!ret.is_lto && !stats.trace) queue_lto = gpl_lto_queued.insert(h).second;
+                }
+                if (queue_lto) {
+                    Queue([this, h, vi, prerast, fs, foi, foi_sq] {
+                        const VkPipeline lto_libs[4]{vi, prerast, fs, foi};
+                        const CompiledPipeline lto = LinkGplPair(lto_libs, foi_sq, true, false);
+                        if (!lto.main) return;
+                        CompiledPipeline old{};
+                        bool used = false;
+                        {
+                            std::unique_lock lock(prog_lock);
+                            if (auto it = pipelines.find(h); it != pipelines.end() && !it->second.is_lto) {
+                                old = it->second;
+                                it->second = lto;
+                                std::atomic_ref(pipeline_epoch).fetch_add(1, std::memory_order_release);
+                                used = true;
+                            }
+                        }
+                        if (used) {
+                            RetirePipeline(old.main);
+                            RetirePipeline(old.square);
+                        } else {
+                            vkDestroyPipeline(dev, lto.main, nullptr);
+                            if (lto.square) vkDestroyPipeline(dev, lto.square, nullptr);
+                        }
+                    }, 1);
+                }
+                return pm[h] = ret;
+            }
+        }
     }
     const CompiledPipeline created = CreateMonolithicPipeline(vs, ps, gs, gkey.state, false);
     if (!created.main) return {};

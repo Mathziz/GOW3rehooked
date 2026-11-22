@@ -298,6 +298,7 @@ bool Renderer::Impl::Setup(std::string& error) {
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 2, layouts, 1, &pcr};
     if (const VkResult e = vkCreatePipelineLayout(dev, &plci, nullptr, &layout); e != VK_SUCCESS) Report(std::format("vkCreatePipelineLayout {}", (int)e));
     if (caps.path != ShaderPath::Objects) CreatePipelineCache();
+    if (caps.path == ShaderPath::Gpl) SetupGplGlobals();
     if (!SetupClearRect(error)) return false;
     GOW3_DIAG TempDeviceReport(fp);
     ShaderCache::Instance().prepare = [this](u64 key, u64 binary, u32 stage) { return Prepare(key, binary, stage); };
@@ -342,6 +343,15 @@ Renderer::~Renderer() {
             if (p) vkDestroyPipeline(d->dev, p, nullptr);
         d->retired_pipelines.clear();
     }
+    for (auto p : d->gpl_vi)
+        if (p) vkDestroyPipeline(d->dev, p, nullptr);
+    if (d->gpl_empty_fs) vkDestroyPipeline(d->dev, d->gpl_empty_fs, nullptr);
+    for (auto& [k, p] : d->gpl_prerast)
+        if (p) vkDestroyPipeline(d->dev, p, nullptr);
+    for (auto& [k, p] : d->gpl_frag_msaa)
+        if (p) vkDestroyPipeline(d->dev, p, nullptr);
+    for (auto& [k, p] : d->gpl_foi)
+        if (p) vkDestroyPipeline(d->dev, p, nullptr);
     for (auto p : d->graves.pipelines)
         if (p) vkDestroyPipeline(d->dev, p, nullptr);
     for (auto p : d->dying.pipelines)

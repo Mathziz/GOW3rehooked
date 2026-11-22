@@ -15,9 +15,17 @@ Compiled Renderer::Impl::Compile(Gcn::Stage stage, u64 prog, u64 key, Gcn::Input
     ShaderCache& cache = ShaderCache::Instance();
     Compiled c;
     auto make_stage = [&](std::span<const u32> words) {
-        if (caps.path == ShaderPath::Objects) c.s = Create({words.begin(), words.end()}, vk_stage[(int)stage], next);
-        else if (stage == Gcn::Stage::Compute) c.pl = CreateComputePipeline(words);
-        else c.mod = CreateShaderModule(words);
+        if (caps.path == ShaderPath::Objects) {
+            c.s = Create({words.begin(), words.end()}, vk_stage[(int)stage], next);
+        } else if (stage == Gcn::Stage::Compute) {
+            c.pl = CreateComputePipeline(words);
+        } else {
+            c.mod = CreateShaderModule(words);
+            if (caps.path == ShaderPath::Gpl && c.mod) {
+                if (stage == Gcn::Stage::Vertex) c.pl = CreateGplPreRaster(c.mod, VK_NULL_HANDLE, false, false);
+                else if (stage == Gcn::Stage::Pixel) c.pl = CreateGplFragShader(c.mod, 1);
+            }
+        }
     };
     // Debug flags: the probe variant (traced frames only) neither reads nor writes the cache; the exploded-vertex one is cached
     // under its own key (ProgramKey's boom bit), every debug run has it. One they only observe (TEMP_STATS) translates again.
