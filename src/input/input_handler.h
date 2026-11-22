@@ -463,6 +463,9 @@ public:
     s16 old_param;
     s16* new_param;
     bool old_button_state, new_button_state, state_changed, positive_axis;
+    // Whether a key or button drives this axis now / drove its last sent value: only those jumps get eased,
+    // a stick's own motion goes through as is.
+    bool digital_axis{}, old_digital_axis{};
 
     ControllerOutput(const u32 b, u32 a = SDL_GAMEPAD_AXIS_INVALID, bool p = true) {
         button = b;

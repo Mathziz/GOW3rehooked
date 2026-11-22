@@ -776,6 +776,7 @@ void ToggleKeyInList(InputID input) {
 void ControllerOutput::ResetUpdate() {
     state_changed = false;
     new_button_state = false;
+    digital_axis = false;
     *new_param = 0; // bruh
 }
 void ControllerOutput::AddUpdate(InputEvent event) {
@@ -801,6 +802,7 @@ void ControllerOutput::AddUpdate(InputEvent event) {
 
     } else if (axis != static_cast<u32>(SDL_GAMEPAD_AXIS_INVALID)) {
         *new_param = (event.active ? event.axis_value : 0) + *new_param;
+        digital_axis |= event.active && event.input.type != InputType::Axis;
     }
 }
 
@@ -819,6 +821,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     }
     old_button_state = new_button_state;
     old_param = *new_param;
+    // A key's press and its release ease over State::axis_smoothing_time; a stick's values are sent unsmoothed.
+    const bool smooth = digital_axis || old_digital_axis;
+    old_digital_axis = digital_axis;
     GameController* controller;
     if (gamepad_index < 5)
         controller = controllers[gamepad_index];
@@ -934,18 +939,18 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case Axis::TriggerLeft:
             ApplyDeadzone(new_param, lefttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
+            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param), smooth);
             controller->Button(OrbisPadButtonDataOffset::L2, *new_param > 0x20);
             return;
         case Axis::TriggerRight:
             ApplyDeadzone(new_param, righttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
+            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param), smooth);
             controller->Button(OrbisPadButtonDataOffset::R2, *new_param > 0x20);
             return;
         default:
             break;
         }
-        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier));
+        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier), smooth);
     }
 }
 
