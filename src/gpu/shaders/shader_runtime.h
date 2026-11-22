@@ -7,13 +7,29 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
+#include "gpu/device.h"
 #include "gpu/shaders/gcn_translator.h"
 
 namespace Gpu {
 using u8 = std::uint8_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
+
+inline constexpr u64 kClearRectVsKey = 0x474F5733434C5231ull;
+
+// Unified handle returned by Shader()/Translated()/RectGs() across all 3 ShaderPath tiers:
+// - Objects: `obj` is VkShaderEXT.
+// - Gpl/Monolithic: `mod` is VkShaderModule (VS/PS/GS), `pl` is Compute VkPipeline (CS).
+struct ShaderRef {
+    u64 key = 0;
+    VkShaderEXT obj = VK_NULL_HANDLE;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkPipeline pl = VK_NULL_HANDLE;
+    explicit operator bool() const { return obj != VK_NULL_HANDLE || mod != VK_NULL_HANDLE || pl != VK_NULL_HANDLE; }
+    bool operator==(const ShaderRef&) const = default;
+};
 
 struct ProgSlots {
     std::vector<Gcn::Slot> slots;
@@ -32,9 +48,75 @@ struct ProgMemo {
     u64 ver = 0;  // Version of the code's pages when it was read (0: read it again every frame)
 };
 struct Compiled {
-    VkShaderEXT s = VK_NULL_HANDLE;
-    u64 out_mask = 0;  // VS: exported parameters
+    VkShaderEXT s = VK_NULL_HANDLE;        // Tier 1 (Objects)
+    VkShaderModule mod = VK_NULL_HANDLE;   // Tiers 2/3 graphics stage
+    VkPipeline pl = VK_NULL_HANDLE;        // Tiers 2/3 compute pipeline
+    u64 out_mask = 0;                      // VS: exported parameters
     std::string err;
+    bool Ready(ShaderPath path, Gcn::Stage stage) const {
+        if (path == ShaderPath::Objects) return s != VK_NULL_HANDLE;
+        if (stage == Gcn::Stage::Compute) return pl != VK_NULL_HANDLE;
+        return mod != VK_NULL_HANDLE;
+    }
+    ShaderRef Ref(u64 key) const { return {key, s, mod, pl}; }
+};
+
+struct FixedAttachmentBlend {
+    u8 blend_enable = 0;
+    u8 write_mask = 0xF;
+    u8 src_color = 0;
+    u8 dst_color = 0;
+    u8 color_op = 0;
+    u8 src_alpha = 0;
+    u8 dst_alpha = 0;
+    u8 alpha_op = 0;
+    bool operator==(const FixedAttachmentBlend&) const = default;
+};
+static_assert(sizeof(FixedAttachmentBlend) == 8);
+
+// Non-dynamic graphics pipeline state. Raw (uncanonicalized) copies can be persisted as portable recipes;
+// Canonicalize(caps) zeroes every field driven dynamically on this GPU to minimize pipeline permutations.
+struct FixedPipelineState {
+    static constexpr u8 kNegOne = 1u << 0;
+    static constexpr u8 kDepthClamp = 1u << 1;
+    static constexpr u8 kAlphaToCoverage = 1u << 2;
+    static constexpr u8 kHasPs = 1u << 3;
+    static constexpr u8 kHasGs = 1u << 4;
+
+    VkFormat color_formats[8]{};
+    VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    VkFormat stencil_format = VK_FORMAT_UNDEFINED;
+    u8 color_count = 0;
+    u8 samples = 1;            // 1..64
+    u8 topology_class = 2;     // 0=point, 1=line, 2=triangle
+    u8 flags = 0;              // kNegOne | kDepthClamp | kAlphaToCoverage | kHasPs | kHasGs
+    u8 square_color_mask = 0;  // bit k: scaled MIN/MAX squared color channel on attachment k
+    u8 square_alpha_mask = 0;  // bit k: scaled MIN/MAX squared alpha channel on attachment k
+    u8 pad[2]{};
+    FixedAttachmentBlend blend[8]{};
+
+    void Canonicalize(const DynamicCaps& caps);
+    bool NeedsSquarePipeline(const DynamicCaps& caps) const {
+        return (square_color_mask || square_alpha_mask) && (!caps.color_blend_enable || !caps.color_blend_equation);
+    }
+    bool operator==(const FixedPipelineState&) const = default;
+};
+static_assert(std::is_trivially_copyable_v<FixedPipelineState>);
+static_assert(sizeof(FixedPipelineState) == 112);
+
+struct GraphicsPipelineKey {
+    u64 vs_key = 0;
+    u64 ps_key = 0;
+    u64 gs_mask = 0;  // valid only when (state.flags & FixedPipelineState::kHasGs)
+    FixedPipelineState state{};
+    bool operator==(const GraphicsPipelineKey&) const = default;
+    u64 Hash() const;
+};
+
+struct CompiledPipeline {
+    VkPipeline main = VK_NULL_HANDLE;
+    VkPipeline square = VK_NULL_HANDLE;  // coupled second-pass pipeline for scaled MIN/MAX squared blend
+    bool is_lto = false;
 };
 // Key of a program: its code, the fetch shader it calls and the stage state its translation depends on besides the draw's.
 u64 ProgramKey(Gcn::Stage stage, u64 code_hash, u64 fetch_hash, u32 rsrc2, bool probe, bool boom);

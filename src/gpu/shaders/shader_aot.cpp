@@ -126,9 +126,11 @@ void Renderer::Impl::AotBuild() {
     const std::vector<Recipe> recipes = Recipes::Instance().All();
     const auto t0 = std::chrono::steady_clock::now();
     const auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
-    const auto pending_of = [&](u64 key) { return !cache.Contains(key) || !cache.ContainsBinary(BinaryKey(cache.ContentOf(key))); };
+    const auto pending_of = [&](u64 key) {
+        return !cache.Contains(key) || (caps.path == ShaderPath::Objects && !cache.ContainsBinary(BinaryKey(cache.ContentOf(key))));
+    };
     // The built-in clear VS handles SDK clears; other RectLists use the ordinary VS and an on-demand RectGs.
-    const auto rect_variant = [&](const Recipe& r) { return clear_rect_vs && r.h.stage == u32(Gcn::Stage::Vertex) && r.h.rect; };
+    const auto rect_variant = [&](const Recipe& r) { return HasClearRectVs() && r.h.stage == u32(Gcn::Stage::Vertex) && r.h.rect; };
 
     Parser::Index index;
     try {
@@ -165,6 +167,7 @@ void Renderer::Impl::AotBuild() {
     // What the player's runs used (with a binary), per file of its program, in the order they met it: made ready when the game
     // opens the file (or now, for a file already open).
     const auto give_hot = [&] {
+        if (caps.path != ShaderPath::Objects) return;
         std::vector<std::vector<ShaderCache::Hot>> hot(index.files.size());
         std::vector<u32> files;
         for (const Recipe& r : recipes) {
@@ -264,30 +267,34 @@ void Renderer::Impl::AotBuild() {
                 stored += !cache.ContainsContent(ShaderCache::ContentHash(spirv, out_mask)), spirv_bytes += spirv.size() * 4;
                 if (!(content = cache.Store(job.key, r.h.stage, out_mask, spirv))) return ++failed, fail("cache write failed"), cache.Completed(w);
             }
-            const u64 binary_key = BinaryKey(content);
-            bool has_binary = cache.ContainsBinary(binary_key);
-            if (!has_binary) {
-                {
-                    std::scoped_lock l(lock);
-                    has_binary = !building.insert(binary_key).second;  // another job is making it: listed for the WAD as if done
-                }
-                if (!has_binary) {  // the driver's code for this GPU, so the game loads it without compiling
-                    auto hit = cache.Find(job.key);
-                    // Same content from another job: it is linked as soon as reserved, its writer may still be compressing it.
-                    for (int wait = 0; !hit && wait < 2000; ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(1)), hit = cache.Find(job.key);
-                    const VkShaderStageFlags next_stage = stage == Gcn::Stage::Vertex ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT : 0;
-                    const auto t = std::chrono::steady_clock::now();
-                    if (!hit) {
-                        ++failed, fail("cached SPIR-V unreadable");
-                    } else if (const VkShaderEXT s = Create(hit->spirv, vk_stage[r.h.stage], next_stage)) {
-                        const auto data = Binary(s);
-                        has_binary = !data.empty() && cache.StoreBinary(binary_key, hit->out_mask, data);
-                        DestroyShader(dev, s, nullptr);
-                        binaries += has_binary, binary_bytes += data.size();
-                    } else {
-                        fail(std::format("stage {}: the driver rejected the SPIR-V", (int)stage));
+            bool has_binary = false;
+            u64 binary_key = 0;
+            if (caps.path == ShaderPath::Objects) {
+                binary_key = BinaryKey(content);
+                has_binary = cache.ContainsBinary(binary_key);
+                if (!has_binary) {
+                    {
+                        std::scoped_lock l(lock);
+                        has_binary = !building.insert(binary_key).second;  // another job is making it: listed for the WAD as if done
                     }
-                    driver_ns += since(t);
+                    if (!has_binary) {  // the driver's code for this GPU, so the game loads it without compiling
+                        auto hit = cache.Find(job.key);
+                        // Same content from another job: it is linked as soon as reserved, its writer may still be compressing it.
+                        for (int wait = 0; !hit && wait < 2000; ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(1)), hit = cache.Find(job.key);
+                        const VkShaderStageFlags next_stage = stage == Gcn::Stage::Vertex ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT : 0;
+                        const auto t = std::chrono::steady_clock::now();
+                        if (!hit) {
+                            ++failed, fail("cached SPIR-V unreadable");
+                        } else if (const VkShaderEXT s = Create(hit->spirv, vk_stage[r.h.stage], next_stage)) {
+                            const auto data = Binary(s);
+                            has_binary = !data.empty() && cache.StoreBinary(binary_key, hit->out_mask, data);
+                            DestroyShader(dev, s, nullptr);
+                            binaries += has_binary, binary_bytes += data.size();
+                        } else {
+                            fail(std::format("stage {}: the driver rejected the SPIR-V", (int)stage));
+                        }
+                        driver_ns += since(t);
+                    }
                 }
             }
             std::scoped_lock l(lock);

@@ -1859,6 +1859,7 @@ void Renderer::Impl::Reap() {
                 Common::AccurateSleep(std::chrono::milliseconds(1), nullptr, false);
             };
             for (auto v : g.views) each([&] { vkDestroyImageView(dev, v, nullptr); });
+            for (auto p : g.pipelines) each([&] { vkDestroyPipeline(dev, p, nullptr); });
             for (auto& t : g.own) each([&] { FreeImage(t); });
             // Only the last owner of a surface image destroys it: the other references just drop, unpaced (each evicted T#
             // of a surface holds one; Rage of Sparta's grab passes evict ~8 a frame, above the paced ~1000 a second).
@@ -1867,6 +1868,13 @@ void Renderer::Impl::Reap() {
                 else each([&] { s.reset(); });
         });
         dying = {};
+    }
+    {
+        std::scoped_lock lock(retired_pl_lock);
+        if (!retired_pipelines.empty()) {
+            graves.pipelines.insert(graves.pipelines.end(), retired_pipelines.begin(), retired_pipelines.end());
+            retired_pipelines.clear();
+        }
     }
     dying.Append(graves);
 }

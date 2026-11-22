@@ -297,10 +297,9 @@ bool Renderer::Impl::Setup(std::string& error) {
     const VkDescriptorSetLayout layouts[2]{set_layout, table_layout};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 2, layouts, 1, &pcr};
     if (const VkResult e = vkCreatePipelineLayout(dev, &plci, nullptr, &layout); e != VK_SUCCESS) Report(std::format("vkCreatePipelineLayout {}", (int)e));
+    if (caps.path != ShaderPath::Objects) CreatePipelineCache();
     if (!SetupClearRect(error)) return false;
     GOW3_DIAG TempDeviceReport(fp);
-    if (caps.path != ShaderPath::Objects)
-        return error = std::format("Vulkan shader path '{}' is not wired for drawing yet (Stage 2+)", ShaderPathName(caps.path)), false;
     ShaderCache::Instance().prepare = [this](u64 key, u64 binary, u32 stage) { return Prepare(key, binary, stage); };
     if (ShaderCache::Instance().Enabled() && ShaderCache::Instance().Kind() == CacheKind::Aot) AotBuild();  // the game waits for the build
     return true;
@@ -324,14 +323,30 @@ Renderer::~Renderer() {
     }
     for (auto& w : d->recorders)
         for (auto p : w.pool) vkDestroyCommandPool(d->dev, p, nullptr);
-    for (auto& [k, f] : d->compiling)
-        if (const VkShaderEXT s = f.get().s; s && d->DestroyShader) d->DestroyShader(d->dev, s, nullptr);
+    for (auto& [k, f] : d->compiling) {
+        const ShaderRef r = f.get().Ref(k);
+        auto it = d->shaders.find(k);
+        if (it == d->shaders.end() || it->second != r) d->DestroyShaderRef(r);
+    }
     d->StopCompilers();
-    for (auto& [k, s] : d->shaders)
-        if (s && d->DestroyShader) d->DestroyShader(d->dev, s, nullptr);
-    for (auto& [k, s] : d->rect_gs)
-        if (s && d->DestroyShader) d->DestroyShader(d->dev, s, nullptr);
-    if (d->clear_rect_vs && d->DestroyShader) d->DestroyShader(d->dev, d->clear_rect_vs, nullptr);
+    for (auto& [k, s] : d->shaders) d->DestroyShaderRef(s);
+    for (auto& [k, s] : d->rect_gs) d->DestroyShaderRef(s);
+    d->DestroyShaderRef(d->clear_rect_ref);
+    for (auto& [k, p] : d->pipelines) {
+        if (p.main) vkDestroyPipeline(d->dev, p.main, nullptr);
+        if (p.square) vkDestroyPipeline(d->dev, p.square, nullptr);
+    }
+    {
+        std::scoped_lock lock(d->retired_pl_lock);
+        for (auto p : d->retired_pipelines)
+            if (p) vkDestroyPipeline(d->dev, p, nullptr);
+        d->retired_pipelines.clear();
+    }
+    for (auto p : d->graves.pipelines)
+        if (p) vkDestroyPipeline(d->dev, p, nullptr);
+    for (auto p : d->dying.pipelines)
+        if (p) vkDestroyPipeline(d->dev, p, nullptr);
+    d->graves.pipelines.clear(), d->dying.pipelines.clear();
     if (d->q_stat) vkDestroyQueryPool(d->dev, d->q_stat, nullptr), vkDestroyQueryPool(d->dev, d->q_occ, nullptr);
     d->DestroyTextures();
     for (int k = 0; k < 2; ++k, d->SwapFrame()) {
@@ -344,7 +359,11 @@ Renderer::~Renderer() {
     if (d->copy_pool) vkDestroyCommandPool(d->dev, d->copy_pool, nullptr);
     for (auto* b : {&d->probe_buf, &d->vertex_probe, &d->index_probe}) d->FreeBuffer(*b);
     if (d->index_probe_vs && d->DestroyShader) d->DestroyShader(d->dev, d->index_probe_vs, nullptr);
+    if (d->index_probe_mod) vkDestroyShaderModule(d->dev, d->index_probe_mod, nullptr);
+    for (auto& [k, p] : d->index_probe_pls)
+        if (p) vkDestroyPipeline(d->dev, p, nullptr);
     d->DestroyMirror();
+    if (d->pipeline_cache) vkDestroyPipelineCache(d->dev, d->pipeline_cache, nullptr);
     vkDestroyPipelineLayout(d->dev, d->layout, nullptr);
     if (d->prof_pool) vkDestroyQueryPool(d->dev, d->prof_pool, nullptr);
     if (d->temp_qp) vkDestroyQueryPool(d->dev, d->temp_qp, nullptr);
@@ -489,7 +508,17 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     const Target* depth = nullptr;
     const Target* clear_apart = nullptr;  // depth cleared in its own pass: its sample count differs from the color's
     // DB_RENDER_CONTROL depth/stencil clear: the clear value lands under the draw; color is still written by the PS.
-    const bool db_clear = ctx[0x000] & 3, z_effect = (z_test && (depth_control >> 4 & 7) != 7) || z_write || stencil || z_bounds;  // test ALWAYS: no test
+    const bool db_clear = ctx[0x000] & 3;
+    const u32 st_ctl = ctx[0x10B], st_ref_f = ctx[0x10C], st_ref_b = (depth_control >> 7 & 1) ? ctx[0x10D] : st_ref_f;
+    const auto st_op_writes = [](u32 op_fail, u32 op_zpass, u32 op_zfail, u32 wmask) {
+        return (wmask & 0xFF) != 0 && (op_fail != 0 || op_zpass != 0 || op_zfail != 0);
+    };
+    const bool st_can_reject = stencil && s_fmt && ((depth_control >> 8 & 7) != 7 || ((depth_control >> 7 & 1) && (depth_control >> 20 & 7) != 7));
+    const bool st_can_write = stencil && s_fmt &&
+                              (st_op_writes(st_ctl & 0xF, st_ctl >> 4 & 0xF, st_ctl >> 8 & 0xF, st_ref_f >> 16) ||
+                               ((depth_control >> 7 & 1) && st_op_writes(st_ctl >> 12 & 0xF, st_ctl >> 16 & 0xF, st_ctl >> 20 & 0xF, st_ref_b >> 16)));
+    const bool stencil_eff = caps.path == ShaderPath::Objects ? stencil : (st_can_reject || st_can_write);
+    const bool z_effect = (z_test && (depth_control >> 4 & 7) != 7) || z_write || stencil_eff || z_bounds;  // test ALWAYS: no test
     for (const Target* t : color)
         if (t && (samples = samples ? samples : t->samples) != t->samples) return Count(stats.skipped), Note("color targets with mixed sample counts skipped");
     if (z_fmt && (z_effect || db_clear)) {
@@ -677,15 +706,15 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     u64 vs_mask = 0, unused = 0;
     waiting = false;
     read_prog = (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8;
-    VkShaderEXT vs = Shader(Gcn::Stage::Vertex, (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8, &sh[0x4C], cpu, sh[0x4A], sh[0x4B], vs_mask, rect_vs, vs_table);
+    const ShaderRef vs = Shader(Gcn::Stage::Vertex, (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8, &sh[0x4C], cpu, sh[0x4A], sh[0x4B], vs_mask, rect_vs, vs_table);
     const bool clear_vs = rect_vs && ClearVs(prep.in.code);
     const bool shadow_quad = vs && prim == 6 && op == 0x2D && b[0] == 4 && instances <= 1 && mask0 == VK_COLOR_COMPONENT_B_BIT &&
                              !stats.trace && !boom_on && ShadowQuad(prep.pkey, prep.in, vs_table);
     vs_rts = draw_rts.size();
     // Depth-only passes still run the PS when it exports Z or kills (DB_SHADER_CONTROL Z_EXPORT / KILL_ENABLE).
-    VkShaderEXT ps = ps_addr && (mode == 1 || ctx[0x203] & 0x41)
-                         ? Shader(Gcn::Stage::Pixel, ps_addr, &sh[0x0C], cpu, sh[0x0A], sh[0x0B], unused, rect, ps_table, blend_mode)
-                         : VK_NULL_HANDLE;
+    ShaderRef ps = ps_addr && (mode == 1 || ctx[0x203] & 0x41)
+                       ? Shader(Gcn::Stage::Pixel, ps_addr, &sh[0x0C], cpu, sh[0x0A], sh[0x0B], unused, rect, ps_table, blend_mode)
+                       : ShaderRef{};
     if (blend_mode && std::any_of(draw_rts.begin(), draw_rts.end(), [&](const auto& use) { return use.first == color[0]->t.img; })) {
         blend_mode = 0;
         draw_rts.resize(vs_rts);
@@ -696,7 +725,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         draw_rts.push_back({color[0]->t.img, true});
         color_view[0] = VK_NULL_HANDLE;  // written by the PS through its storage view, not as an attachment
     }
-    VkShaderEXT gs = rect && !rect_vs ? RectGs(vs_mask) : VK_NULL_HANDLE;
+    const ShaderRef gs = rect && !rect_vs ? RectGs(vs_mask) : ShaderRef{};
     // No PS program: the draw only touches depth/stencil (color writes masked below).
     if (!vs || (ps_addr && mode == 1 && !ps) || (rect && !rect_vs && !gs)) {
         stores.clear(), Count(stats.skipped);
@@ -718,9 +747,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         const auto swz = AmdGpu::MrtSwizzle(info0 >> 11 & 3, AmdGpu::DataFormat(info0 >> 2 & 0x1F));
         for (u32 k = 0; k < 4; ++k) clear_color.float32[k] = F(ps_table[swz.Map(k)]);
         color_clear_pending = true;
-    }
-    begin();
-    if (native_clear) {
+        begin();
         if (color_clear_pending) {
             const VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = clear_color}};
             const VkClearRect cr{sc, 0, 1};
@@ -730,6 +757,68 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         WriteBack(), Count(stats.draws);
         return;
     }
+    BlendState& bs = blend_memo;
+    if (color_count) {
+        u32 key[18]{bool(ps) | color_count << 9, target_mask};
+        for (u32 k = 0; k < color_count; ++k) key[0] |= u32(color[k] != nullptr) << (k + 1), key[2 + k] = ctx[0x1E0 + k], key[10 + k] = ctx[0x31C + k * 15];
+        if (std::memcmp(bs.key, key, sizeof(key))) {
+            std::memcpy(bs.key, key, sizeof(key)), bs.square = false, bs.square_color_mask = 0, bs.square_alpha_mask = 0, bs.unsupported = 0;
+            for (u32 k = 0; k < color_count; ++k) {
+                const u32 bc = ctx[0x1E0 + k], info = ctx[0x31C + k * 15], nt = info >> 8 & 7;  // CB_COLOR_INFO NUMBER_TYPE: 0 UNORM, 6 SRGB
+                const bool sep = bc >> 29 & 1;
+                u32 cs = bc & 0x1F, cf = bc >> 5 & 7, cd = bc >> 8 & 0x1F, as = sep ? bc >> 16 & 31 : cs, af = sep ? bc >> 21 & 7 : cf,
+                    ad = sep ? bc >> 24 & 31 : cd;
+                bs.blend[k] = color[k] && bc >> 30 & 1;
+                // CB_TARGET_MASK names exported components: the export swizzle (COMP_SWAP) moves them to image channels.
+                bs.mask[k] = color[k] && ps ? AmdGpu::MrtSwizzle(info >> 11 & 3, AmdGpu::DataFormat(info >> 2 & 0x1F)).ApplyMask(target_mask >> (4 * k) & 0xF) : 0;
+                const MinMax rc = RewriteMinMax(cs, cf, cd, nt == 0 || nt == 6, false), ra = RewriteMinMax(as, af, ad, nt == 0 || nt == 6, true);
+                const bool wc = bs.blend[k] && bs.mask[k] & 7, wa = bs.blend[k] && bs.mask[k] & 8;
+                bs.unsupported += (wc && rc == MinMax::Unsupported) || (wa && ra == MinMax::Unsupported);
+                const bool sc_c = wc && rc == MinMax::Squared, sc_a = wa && ra == MinMax::Squared;
+                bs.square |= sc_c || sc_a;
+                if (sc_c) bs.square_color_mask |= u8(1u << k);
+                if (sc_a) bs.square_alpha_mask |= u8(1u << k);
+                bs.eq[k] = {BlendFactor(cs), BlendFactor(cd), BlendOp(cf), BlendFactor(as), BlendFactor(ad), BlendOp(af)};
+                bs.square_blend[k] = bs.mask[k] != 0;  // second draw: dst * dst on squared channels, dst elsewhere
+                bs.square_eq[k] = {VK_BLEND_FACTOR_ZERO, sc_c ? VK_BLEND_FACTOR_DST_COLOR : VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
+                                   VK_BLEND_FACTOR_ZERO, sc_a ? VK_BLEND_FACTOR_DST_ALPHA : VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD};
+            }
+        }
+        for (u32 n = bs.unsupported; n; --n) Note("scaled MIN/MAX blend not representable");
+    }
+    FixedPipelineState raw_state{};
+    CompiledPipeline pl{};
+    if (caps.path != ShaderPath::Objects) {
+        raw_state.color_count = u8(color_count);
+        for (u32 k = 0; k < color_count; ++k) {
+            raw_state.color_formats[k] = color_view[k] ? ColorFormat(ctx[0x318 + k * 15 + 4]) : VK_FORMAT_UNDEFINED;
+            raw_state.blend[k] = {u8(bs.blend[k] ? 1 : 0), u8(bs.mask[k]),
+                                  u8(bs.eq[k].srcColorBlendFactor), u8(bs.eq[k].dstColorBlendFactor), u8(bs.eq[k].colorBlendOp),
+                                  u8(bs.eq[k].srcAlphaBlendFactor), u8(bs.eq[k].dstAlphaBlendFactor), u8(bs.eq[k].alphaBlendOp)};
+        }
+        raw_state.depth_format = depth ? depth->fmt : VK_FORMAT_UNDEFINED;
+        raw_state.stencil_format = (depth && depth->stencil) ? depth->fmt : VK_FORMAT_UNDEFINED;
+        raw_state.samples = u8(std::max(1u, samples));
+        raw_state.topology_class = (rect && !rect_vs) ? 2
+                                   : topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0
+                                   : (topo == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) ? 1
+                                   : 2;
+        raw_state.flags = (gl_clip ? FixedPipelineState::kNegOne : 0) |
+                          ((clip >> 26 & 3) ? FixedPipelineState::kDepthClamp : 0) |
+                          ((ctx[0x2DC] & 1) ? FixedPipelineState::kAlphaToCoverage : 0) |
+                          (ps ? FixedPipelineState::kHasPs : 0) |
+                          (gs ? FixedPipelineState::kHasGs : 0);
+        const bool want_square = color_count && !blend_mode && !(z_write || stencil);
+        raw_state.square_color_mask = want_square ? bs.square_color_mask : 0;
+        raw_state.square_alpha_mask = want_square ? bs.square_alpha_mask : 0;
+        pl = GetGraphicsPipeline(vs, ps, gs, raw_state);
+        if (!pl.main) {
+            stores.clear(), Count(stats.skipped);
+            if (!waiting) Note("draw without pipeline skipped");
+            return;
+        }
+    }
+    begin();
     auto put = [&](const std::vector<u32>& t) {
         const u64 n = t.size() * 4, at = TableAt(n, table_align);
         if (at != ~0ull) std::memcpy(tables_host.ptr + at, t.data(), n);
@@ -776,23 +865,29 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     decltype(dyn) prof_before;  // profile: state groups this draw changes
     if (prof >= 2) prof_before = dyn;
     if (first) {  // fixed for every draw
-        RenderProbe::Cmd(RenderProbe::Fixed, 4);
+        RenderProbe::Cmd(RenderProbe::Fixed, caps.path == ShaderPath::Objects ? 4 : 1);
         dyn.valid = true;
         vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
-        SetPolygonMode(cmd, VK_POLYGON_MODE_FILL);
-        SetLogicOpEnable(cmd, VK_FALSE);
-        SetVertexInput(cmd, 0, nullptr, 0, nullptr);
+        if (caps.path == ShaderPath::Objects) {
+            SetPolygonMode(cmd, VK_POLYGON_MODE_FILL);
+            SetLogicOpEnable(cmd, VK_FALSE);
+            SetVertexInput(cmd, 0, nullptr, 0, nullptr);
+        }
     }
-    const VkShaderStageFlagBits stages[]{VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT,
-                                         VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT};
-    const VkShaderEXT bound[]{vs, gs, ps, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    {  // only the span of stages that changed (tessellation stays unbound)
+    if (caps.path == ShaderPath::Objects) {
+        const VkShaderStageFlagBits stages[]{VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                             VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT};
+        const VkShaderEXT bound[]{vs.obj, gs.obj, ps.obj, VK_NULL_HANDLE, VK_NULL_HANDLE};
         u32 lo = 0, hi = first ? 5 : 3;
         while (!first && lo < hi && dyn.shaders[lo] == bound[lo]) ++lo;
         while (!first && hi > lo && dyn.shaders[hi - 1] == bound[hi - 1]) --hi;
         if (lo < hi) RenderProbe::Cmd(RenderProbe::Shaders), BindShaders(cmd, hi - lo, stages + lo, bound + lo), std::copy(bound + lo, bound + hi, dyn.shaders + lo);
+    } else {
+        if (dyn.pipeline != pl.main || first)
+            RenderProbe::Cmd(RenderProbe::Shaders), dyn.pipeline = pl.main, vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl.main);
     }
-    if (dyn.neg_one != gl_clip || first) RenderProbe::Cmd(RenderProbe::Clip), dyn.neg_one = gl_clip, SetNegativeOneToOne(cmd, gl_clip);
+    if (SetNegativeOneToOne && (dyn.neg_one != gl_clip || first))
+        RenderProbe::Cmd(RenderProbe::Clip), dyn.neg_one = gl_clip, SetNegativeOneToOne(cmd, gl_clip);
     if (changed(dyn.vp, vp) || first) RenderProbe::Cmd(RenderProbe::Viewport), vkCmdSetViewportWithCount(cmd, 1, &vp);
 
     // Raster, depth/stencil, blend: all dynamic.
@@ -806,13 +901,15 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     if (const u32 old_samples = dyn.raster[0]; changed(dyn.raster, raster) || first) {
         RenderProbe::Cmd(RenderProbe::Raster, 7);
         if (raster[0] != old_samples || first) {
-            RenderProbe::Cmd(RenderProbe::Raster, 2);
-            const VkSampleMask sample_mask = ~0u;
-            SetSamples(cmd, VkSampleCountFlagBits(samples));
-            SetSampleMask(cmd, VkSampleCountFlagBits(samples), &sample_mask);
+            if (SetSamples) RenderProbe::Cmd(RenderProbe::Raster), SetSamples(cmd, VkSampleCountFlagBits(samples));
+            if (SetSampleMask) {
+                RenderProbe::Cmd(RenderProbe::Raster);
+                const VkSampleMask sample_mask = ~0u;
+                SetSampleMask(cmd, VkSampleCountFlagBits(samples), &sample_mask);
+            }
         }
-        SetAlphaToCoverage(cmd, raster[1]);
-        SetDepthClamp(cmd, raster[2]);
+        if (SetAlphaToCoverage) SetAlphaToCoverage(cmd, raster[1]);
+        if (SetDepthClamp) SetDepthClamp(cmd, raster[2]);
         vkCmdSetCullMode(cmd, raster[3]);
         vkCmdSetFrontFace(cmd, VkFrontFace(raster[4]));
         vkCmdSetDepthBiasEnable(cmd, raster[5]);
@@ -822,7 +919,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     const float bias[3]{F(ctx[0x2E1]), F(ctx[0x2DF]), F(ctx[0x2E0]) / 16.0f};
     if (changed(dyn.bias, bias) || first) RenderProbe::Cmd(RenderProbe::Bias), vkCmdSetDepthBias(cmd, bias[0], bias[1], bias[2]);
     // A clearing draw leaves the clear value.
-    const u32 dz[5]{depth && z_test && !db_clear, depth && z_write && !db_clear, depth_control >> 4 & 7, depth && depth->stencil && stencil && !db_clear,
+    const u32 dz[5]{depth && z_test && !db_clear, depth && z_write && !db_clear, depth_control >> 4 & 7, depth && depth->stencil && stencil_eff && !db_clear,
                     depth && z_bounds && !db_clear};
     if (changed(dyn.depth, dz) || first) {
         RenderProbe::Cmd(RenderProbe::Depth, 5);
@@ -864,38 +961,16 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, st[13]);
     }
     const Target* probe_target = blend_mode ? color[0] : nullptr;
-    BlendState& bs = blend_memo;
     if (color_count) {
-        u32 key[18]{(ps != VK_NULL_HANDLE) | color_count << 9, target_mask};
-        for (u32 k = 0; k < color_count; ++k) key[0] |= u32(color[k] != nullptr) << (k + 1), key[2 + k] = ctx[0x1E0 + k], key[10 + k] = ctx[0x31C + k * 15];
-        if (std::memcmp(bs.key, key, sizeof(key))) {
-            std::memcpy(bs.key, key, sizeof(key)), bs.square = false, bs.unsupported = 0;
-            for (u32 k = 0; k < color_count; ++k) {
-                const u32 bc = ctx[0x1E0 + k], info = ctx[0x31C + k * 15], nt = info >> 8 & 7;  // CB_COLOR_INFO NUMBER_TYPE: 0 UNORM, 6 SRGB
-                const bool sep = bc >> 29 & 1;
-                u32 cs = bc & 0x1F, cf = bc >> 5 & 7, cd = bc >> 8 & 0x1F, as = sep ? bc >> 16 & 0x1F : cs, af = sep ? bc >> 21 & 7 : cf,
-                    ad = sep ? bc >> 24 & 0x1F : cd;
-                bs.blend[k] = color[k] && bc >> 30 & 1;
-                // CB_TARGET_MASK names exported components: the export swizzle (COMP_SWAP) moves them to image channels.
-                bs.mask[k] = color[k] && ps ? AmdGpu::MrtSwizzle(info >> 11 & 3, AmdGpu::DataFormat(info >> 2 & 0x1F)).ApplyMask(target_mask >> (4 * k) & 0xF) : 0;
-                const MinMax rc = RewriteMinMax(cs, cf, cd, nt == 0 || nt == 6, false), ra = RewriteMinMax(as, af, ad, nt == 0 || nt == 6, true);
-                const bool wc = bs.blend[k] && bs.mask[k] & 7, wa = bs.blend[k] && bs.mask[k] & 8;
-                bs.unsupported += (wc && rc == MinMax::Unsupported) || (wa && ra == MinMax::Unsupported);
-                const bool sc_c = wc && rc == MinMax::Squared, sc_a = wa && ra == MinMax::Squared;
-                bs.square |= sc_c || sc_a;
-                bs.eq[k] = {BlendFactor(cs), BlendFactor(cd), BlendOp(cf), BlendFactor(as), BlendFactor(ad), BlendOp(af)};
-                bs.square_blend[k] = bs.mask[k] != 0;  // second draw: dst * dst on squared channels, dst elsewhere
-                bs.square_eq[k] = {VK_BLEND_FACTOR_ZERO, sc_c ? VK_BLEND_FACTOR_DST_COLOR : VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
-                                   VK_BLEND_FACTOR_ZERO, sc_a ? VK_BLEND_FACTOR_DST_ALPHA : VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD};
-            }
-        }
-        for (u32 n = bs.unsupported; n; --n) Note("scaled MIN/MAX blend not representable");
         for (u32 k = 0; k < color_count && !probe_target; ++k) probe_target = bs.mask[k] ? color[k] : nullptr;
         const bool first_blend = dyn.blend_count == 0, more = color_count > dyn.blend_count;
         if (more) dyn.blend_count = color_count;
-        if (changed_n(dyn.blend, bs.blend, color_count) || more) RenderProbe::Cmd(RenderProbe::Blend), SetBlendEnable(cmd, 0, color_count, bs.blend);
-        if (changed_n(dyn.eq, bs.eq, color_count) || more) RenderProbe::Cmd(RenderProbe::Blend), SetBlendEquation(cmd, 0, color_count, bs.eq);
-        if (changed_n(dyn.mask, bs.mask, color_count) || more) RenderProbe::Cmd(RenderProbe::Blend), SetWriteMask(cmd, 0, color_count, bs.mask);
+        if ((changed_n(dyn.blend, bs.blend, color_count) || more) && SetBlendEnable)
+            RenderProbe::Cmd(RenderProbe::Blend), SetBlendEnable(cmd, 0, color_count, bs.blend);
+        if ((changed_n(dyn.eq, bs.eq, color_count) || more) && SetBlendEquation)
+            RenderProbe::Cmd(RenderProbe::Blend), SetBlendEquation(cmd, 0, color_count, bs.eq);
+        if ((changed_n(dyn.mask, bs.mask, color_count) || more) && SetWriteMask)
+            RenderProbe::Cmd(RenderProbe::Blend), SetWriteMask(cmd, 0, color_count, bs.mask);
         const float constants[4]{F(ctx[0x105]), F(ctx[0x106]), F(ctx[0x107]), F(ctx[0x108])};
         if (changed(dyn.constants, constants) || first_blend) RenderProbe::Cmd(RenderProbe::Blend), vkCmdSetBlendConstants(cmd, constants);
     }
@@ -933,23 +1008,47 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
             }
             stats.trace_lines.back() += std::format(" | I {:x} x{} first {} base {} cpu {}{}", addr, index_size, first_index, (int)base,
                                                     lo <= hi ? std::format("[{}, {}] head", lo, hi) : "unreadable", head);
-            if (index_probe_vs && index_probes.size() < kProbes) {
-                const u64 rec = index_probe.addr + index_probes.size() * kIndexProbe;
-                index_probes.push_back({stats.trace_lines.size() - 1, lo <= hi ? lo + base : 1u, lo <= hi ? hi + base : 0u});
-                const VkShaderEXT only[]{index_probe_vs, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
-                BindShaders(cmd, 5, stages, only);
-                vkCmdSetRasterizerDiscardEnable(cmd, VK_TRUE);
-                auto shadow = [&](u32 way, u32 first) {
-                    const u64 to = rec + way * 12;
-                    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, 8, &to);
-                    vkCmdDrawIndexed(cmd, n, 1, first, (int)base, 0);
-                };
-                vkCmdBindIndexBuffer(cmd, mirror, addr, type), shadow(1, 0);
-                vkCmdBindIndexBuffer(cmd, mirror, window, type), shadow(0, first_index);
-                if (BindIndex2) bind_index(), shadow(2, first_index);  // last, either way: the draw's own binding stays
-                vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
-                BindShaders(cmd, 5, stages, bound);
-                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, 8, &push);
+            if (index_probes.size() < kProbes) {
+                if (caps.path == ShaderPath::Objects) {
+                    if (index_probe_vs) {
+                        const VkShaderStageFlagBits stages[]{VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                             VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT};
+                        const VkShaderEXT bound[]{vs.obj, gs.obj, ps.obj, VK_NULL_HANDLE, VK_NULL_HANDLE};
+                        const u64 rec = index_probe.addr + index_probes.size() * kIndexProbe;
+                        index_probes.push_back({stats.trace_lines.size() - 1, lo <= hi ? lo + base : 1u, lo <= hi ? hi + base : 0u});
+                        const VkShaderEXT only[]{index_probe_vs, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+                        BindShaders(cmd, 5, stages, only);
+                        vkCmdSetRasterizerDiscardEnable(cmd, VK_TRUE);
+                        auto shadow = [&](u32 way, u32 first) {
+                            const u64 to = rec + way * 12;
+                            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, 8, &to);
+                            vkCmdDrawIndexed(cmd, n, 1, first, (int)base, 0);
+                        };
+                        vkCmdBindIndexBuffer(cmd, mirror, addr, type), shadow(1, 0);
+                        vkCmdBindIndexBuffer(cmd, mirror, window, type), shadow(0, first_index);
+                        if (BindIndex2) bind_index(), shadow(2, first_index);  // last, either way: the draw's own binding stays
+                        vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
+                        BindShaders(cmd, 5, stages, bound);
+                        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, 8, &push);
+                    }
+                } else if (const VkPipeline probe_pl = IndexProbePipeline(raw_state)) {
+                    const u64 rec = index_probe.addr + index_probes.size() * kIndexProbe;
+                    index_probes.push_back({stats.trace_lines.size() - 1, lo <= hi ? lo + base : 1u, lo <= hi ? hi + base : 0u});
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, probe_pl);
+                    vkCmdSetRasterizerDiscardEnable(cmd, VK_TRUE);
+                    auto shadow = [&](u32 way, u32 first) {
+                        const u64 to = rec + way * 12;
+                        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, 8, &to);
+                        vkCmdDrawIndexed(cmd, n, 1, first, (int)base, 0);
+                    };
+                    vkCmdBindIndexBuffer(cmd, mirror, addr, type), shadow(1, 0);
+                    vkCmdBindIndexBuffer(cmd, mirror, window, type), shadow(0, first_index);
+                    if (BindIndex2) bind_index(), shadow(2, first_index);
+                    vkCmdSetRasterizerDiscardEnable(cmd, VK_FALSE);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl.main);
+                    dyn.pipeline = pl.main;
+                    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, 8, &push);
+                }
             }
         }
     }
@@ -975,7 +1074,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     if (prof >= 2) {
         std::string ch;
 #define PROF_CH(f) if (std::memcmp(&prof_before.f, &dyn.f, sizeof(dyn.f))) ch += #f ",";
-        PROF_CH(shaders) PROF_CH(vp) PROF_CH(sc) PROF_CH(raster) PROF_CH(bias) PROF_CH(depth) PROF_CH(stencil) PROF_CH(blend) PROF_CH(eq) PROF_CH(mask)
+        PROF_CH(pipeline) PROF_CH(shaders) PROF_CH(vp) PROF_CH(sc) PROF_CH(raster) PROF_CH(bias) PROF_CH(depth) PROF_CH(stencil) PROF_CH(blend) PROF_CH(eq) PROF_CH(mask)
         PROF_CH(constants) PROF_CH(index)
 #undef PROF_CH
         prof_draw = ProfBegin(std::format("draw pass {} vs {:x} ps {:x} n {} inst {} s{} ch {}", prof_pass / 2, (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8, ps_addr,
@@ -987,12 +1086,24 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     if (blend_mode) Note("scaled MIN/MAX blend via fragment interlock");
     else if (color_count && bs.square && (z_write || stencil)) Note("scaled MIN/MAX blend not squared (depth/stencil write)");
     else if (color_count && bs.square) {
-        changed_n(dyn.blend, bs.square_blend, color_count), changed_n(dyn.eq, bs.square_eq, color_count);
-        RenderProbe::Cmd(RenderProbe::Blend, 2);
-        SetBlendEnable(cmd, 0, color_count, bs.square_blend);
-        SetBlendEquation(cmd, 0, color_count, bs.square_eq);
-        issue();
-        Note("scaled MIN/MAX blend squared by a second draw");
+        if (caps.path == ShaderPath::Objects || (SetBlendEnable && SetBlendEquation)) {
+            changed_n(dyn.blend, bs.square_blend, color_count), changed_n(dyn.eq, bs.square_eq, color_count);
+            RenderProbe::Cmd(RenderProbe::Blend, 2);
+            SetBlendEnable(cmd, 0, color_count, bs.square_blend);
+            SetBlendEquation(cmd, 0, color_count, bs.square_eq);
+            issue();
+            Note("scaled MIN/MAX blend squared by a second draw");
+        } else if (pl.square) {
+            RenderProbe::Cmd(RenderProbe::Blend);
+            dyn.pipeline = pl.square;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl.square);
+            if (SetBlendEnable && changed_n(dyn.blend, bs.square_blend, color_count)) SetBlendEnable(cmd, 0, color_count, bs.square_blend);
+            if (SetBlendEquation && changed_n(dyn.eq, bs.square_eq, color_count)) SetBlendEquation(cmd, 0, color_count, bs.square_eq);
+            issue();
+            Note("scaled MIN/MAX blend squared by a second draw");
+        } else {
+            Note("scaled MIN/MAX square pipeline missing");
+        }
     }
     if (pred_q != mesh.end()) EndConditional(cmd);
     // Viewport ∩ scissor: the texels this draw can write.
@@ -1021,7 +1132,7 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     std::vector<u32> table;
     u64 unused = 0;
     dispatching = true;
-    const VkShaderEXT cs = Shader(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], unused, false, table);
+    const ShaderRef cs = Shader(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], unused, false, table);
     dispatching = false;
     if (!cs) return stores.clear(), Count(stats.skipped), Note("dispatch without CS skipped");
     const u64 n = table.size() * 4, at = TableAt(n, table_align);
@@ -1051,8 +1162,12 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, sets, 2, offsets);
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
     dyn.push = push, dyn.pushed = true;  // shared with the graphics draws
-    const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    BindShaders(cmd, 1, &stage, &cs);
+    if (caps.path == ShaderPath::Objects) {
+        const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        BindShaders(cmd, 1, &stage, &cs.obj);
+    } else {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cs.pl);
+    }
     vkCmdDispatch(cmd, b[0], b[1], b[2]);
     if (stored) Barrier(cmd);
     pend_stores.insert(pend_stores.end(), stores.begin(), stores.end()), stores.clear();
@@ -1759,8 +1874,13 @@ void main() {
     gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
 }
 )", shaderc_vertex_shader, err);
-        index_probe_vs = spirv.empty() ? VK_NULL_HANDLE : Create(spirv, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
-        if (!index_probe_vs) Report("Index probe: no vertex shader " + err.substr(0, 300));
+        if (caps.path == ShaderPath::Objects) {
+            index_probe_vs = spirv.empty() ? VK_NULL_HANDLE : Create(spirv, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+            if (!index_probe_vs) Report("Index probe: no vertex shader " + err.substr(0, 300));
+        } else {
+            index_probe_mod = spirv.empty() ? VK_NULL_HANDLE : CreateShaderModule(spirv);
+            if (!index_probe_mod) Report("Index probe: no vertex shader module " + err.substr(0, 300));
+        }
     }
     for (u32* p = (u32*)index_probe.ptr, *end = p + kProbes * kIndexProbe / 4; p < end; p += 3) p[0] = 0, p[1] = ~0u, p[2] = 0;
     index_probes.clear(), traced_tex.clear();

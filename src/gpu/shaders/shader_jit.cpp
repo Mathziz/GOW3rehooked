@@ -14,26 +14,33 @@ Compiled Renderer::Impl::Compile(Gcn::Stage stage, u64 prog, u64 key, Gcn::Input
     const VkShaderStageFlags next = stage == Gcn::Stage::Vertex ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT : 0;
     ShaderCache& cache = ShaderCache::Instance();
     Compiled c;
+    auto make_stage = [&](std::span<const u32> words) {
+        if (caps.path == ShaderPath::Objects) c.s = Create({words.begin(), words.end()}, vk_stage[(int)stage], next);
+        else if (stage == Gcn::Stage::Compute) c.pl = CreateComputePipeline(words);
+        else c.mod = CreateShaderModule(words);
+    };
     // Debug flags: the probe variant (traced frames only) neither reads nor writes the cache; the exploded-vertex one is cached
     // under its own key (ProgramKey's boom bit), every debug run has it. One they only observe (TEMP_STATS) translates again.
     static const bool temp_stats = DebugDeep("GOW3_TEMP_STATS");  // driver statistics of each program
     const bool altered = in.probe;
     if (!(altered || temp_stats)) {  // translated by an earlier run (or by the AOT build)
-        const u64 content = cache.ContentOf(key);
-        if (const auto bin = content ? cache.FindBinary(BinaryKey(content)) : nullptr) {  // the driver's own code for this GPU: no compile at all
-            c.s = CreateFrom(VK_SHADER_CODE_TYPE_BINARY_EXT, bin->data.data(), bin->data.size(), vk_stage[(int)stage], next), c.out_mask = bin->out_mask;
-            if (c.s) return c;
+        if (caps.path == ShaderPath::Objects) {
+            const u64 content = cache.ContentOf(key);
+            if (const auto bin = content ? cache.FindBinary(BinaryKey(content)) : nullptr) {  // the driver's own code for this GPU: no compile at all
+                c.s = CreateFrom(VK_SHADER_CODE_TYPE_BINARY_EXT, bin->data.data(), bin->data.size(), vk_stage[(int)stage], next), c.out_mask = bin->out_mask;
+                if (c.s) return c;
+            }
         }
         if (const auto hit = cache.Find(key)) {
-            c.s = Create(hit->spirv, vk_stage[(int)stage], next), c.out_mask = hit->out_mask;
-            if (c.s) return c;
+            make_stage(hit->spirv), c.out_mask = hit->out_mask;
+            if (c.Ready(caps.path, stage)) return c;
         }
     }
     in.code = code, in.fetch = fetch;
     std::vector<u32> spirv;
     u64 mask = 0;
     if (Gcn::EmitSpirv(Gcn::Analyze(in), in, spec, spirv, mask, c.err)) {
-        c.s = Create(spirv, vk_stage[(int)stage], next), c.out_mask = mask;  // exported parameters, for the rect list geometry shader
+        make_stage(spirv), c.out_mask = mask;  // exported parameters, for the rect list geometry shader
         if (temp_stats && !spirv.empty() && stage != Gcn::Stage::Compute) {
             std::string e2;
             static const std::vector<u32> vs0 = compiler.Spirv("#version 460\nvoid main() { gl_Position = vec4(0.0); }\n", shaderc_vertex_shader, e2);
@@ -92,11 +99,12 @@ Compiled Renderer::Impl::Compile(Gcn::Stage stage, u64 prog, u64 key, Gcn::Input
             std::fprintf(stderr, "%s\n", line.c_str());
         }
     }
-    if (c.s && !altered) cache.Record(key, (u32)stage, c.out_mask, spirv);
+    if (c.Ready(caps.path, stage) && !altered) cache.Record(key, (u32)stage, c.out_mask, spirv);
     return c;
 }
 
 u32 Renderer::Impl::Prepare(u64 key, u64 binary, u32 stage) {
+    if (caps.path != ShaderPath::Objects) return 0;
     static constexpr VkShaderStageFlagBits vk_stage[]{VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
     if (stage >= std::size(vk_stage)) return 2;
     {
@@ -112,14 +120,14 @@ u32 Renderer::Impl::Prepare(u64 key, u64 binary, u32 stage) {
     std::unique_lock lock(prog_lock);
     if (shaders.contains(key)) return lock.unlock(), DestroyShader(dev, s, nullptr), 0;  // a draw made it meanwhile
     if (vertex) vs_outputs[key] = bin->out_mask;
-    shaders[key] = s;
+    shaders[key] = {key, s, VK_NULL_HANDLE, VK_NULL_HANDLE};
     return 1;
 }
 
 void Renderer::Impl::Enqueue(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, bool urgent) {
     Prepared p;
     if (!prog || !Identify(stage, prog, user, cpu, rsrc1, rsrc2, rect, p)) return;
-    if (clear_rect_vs && p.in.rect && ClearVs(p.in.code)) return;
+    if (HasClearRectVs() && p.in.rect && ClearVs(p.in.code)) return;
     Specify(stage, p);
     ShaderCache& cache = ShaderCache::Instance();
     {
@@ -127,7 +135,7 @@ void Renderer::Impl::Enqueue(Gcn::Stage stage, u64 prog, const u32* user, const 
         if (shaders.contains(p.key) || compiling.contains(p.key)) return;
     }
     const u64 content = cache.ContentOf(p.key);
-    const bool built = content && cache.ContainsBinary(BinaryKey(content));  // a short load, which a draw waits for
+    const bool built = caps.path == ShaderPath::Objects ? (content && cache.ContainsBinary(BinaryKey(content))) : (content != 0);  // a short load, which a draw waits for
     if (urgent && !built) return;
     std::unique_lock lock(prog_lock);
     if (!shaders.contains(p.key) && !compiling.contains(p.key)) compiling.emplace(p.key, Async(stage, prog, p, urgent, built));

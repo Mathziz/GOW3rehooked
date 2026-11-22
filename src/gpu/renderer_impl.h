@@ -555,12 +555,21 @@ struct Renderer::Impl {
         std::vector<VkImageView> views;
         std::vector<Tex> own;
         std::vector<std::shared_ptr<Tex>> shared;  // the last owner's deleter destroys the surface's image
-        bool empty() const { return views.empty() && own.empty() && shared.empty(); }
+        std::vector<VkPipeline> pipelines;
+        bool empty() const { return views.empty() && own.empty() && shared.empty() && pipelines.empty(); }
         void Append(Graves& o) {
             views.insert(views.end(), o.views.begin(), o.views.end()), own.insert(own.end(), o.own.begin(), o.own.end());
-            shared.insert(shared.end(), std::make_move_iterator(o.shared.begin()), std::make_move_iterator(o.shared.end())), o = {};
+            shared.insert(shared.end(), std::make_move_iterator(o.shared.begin()), std::make_move_iterator(o.shared.end()));
+            pipelines.insert(pipelines.end(), o.pipelines.begin(), o.pipelines.end()), o = {};
         }
     } graves, dying;
+    std::mutex retired_pl_lock;
+    std::vector<VkPipeline> retired_pipelines;  // safe cross-thread retirement (drained by Reap)
+    void RetirePipeline(VkPipeline p) {
+        if (!p) return;
+        std::scoped_lock lock(retired_pl_lock);
+        retired_pipelines.push_back(p);
+    }
     std::future<void> reaping;
     std::atomic<u32> reaped{0};        // objects destroyed (frame recorder)
     std::atomic<u64> reap_max_ns{0};   // the longest of them
@@ -659,7 +668,7 @@ struct Renderer::Impl {
     struct Recent {
         std::vector<u32> in;  // Shader's `inputs` (its first n)
         u64 out_mask = 0;
-        VkShaderEXT s = VK_NULL_HANDLE;
+        ShaderRef s{};
         std::vector<MemoTex> slots;  // per slot: Texture's `tex_used`, a sampler's element
     };
     struct ProgUse {
@@ -679,18 +688,23 @@ struct Renderer::Impl {
     struct Memo {
         const Impl* owner = nullptr;
         u64 epoch = ~0ull;
+        u64 pipeline_epoch = ~0ull;
         Flat<MemoTarget> targets;
         Flat<u32> samplers;
-        Flat<MemoTex> tex;                           // T# hash + binding
-        Flat<std::pair<VkShaderEXT, u64>> shaders;  // translation key -> shader, VS output mask
-        Flat<ProgUse> progs;                         // program key -> its slots and last inputs
+        Flat<MemoTex> tex;                       // T# hash + binding
+        Flat<std::pair<ShaderRef, u64>> shaders; // translation key -> shader, VS output mask
+        Flat<CompiledPipeline> pipelines;        // GraphicsPipelineKey::Hash() -> main/square VkPipeline
+        Flat<ProgUse> progs;                     // program key -> its slots and last inputs
     };
     static thread_local Memo memo;
     u64 epoch = 0;
+    u64 pipeline_epoch = 0;
     Memo& Memos() {
         if (memo.owner != this) memo = {}, memo.owner = this;
         if (const u64 e = std::atomic_ref(epoch).load(std::memory_order_acquire); memo.epoch != e)
             memo.tex.clear(), memo.targets.clear(), memo.epoch = e;
+        if (const u64 pe = std::atomic_ref(pipeline_epoch).load(std::memory_order_acquire); memo.pipeline_epoch != pe)
+            memo.pipelines.clear(), memo.pipeline_epoch = pe;
         return memo;
     }
     static inline thread_local bool table_ps = false;  // the table being built is a pixel shader's
@@ -704,8 +718,8 @@ struct Renderer::Impl {
 
     // ---- Shaders: translation, compilation, caches and discovery (shaders/) ----
     Gcn::Compiler compiler;
-    std::unordered_map<u64, VkShaderEXT> shaders;  // translation key -> shader (null: failed)
-    std::unordered_map<u64, ProgSlots> slots;      // program key -> slots
+    std::unordered_map<u64, ShaderRef> shaders;  // translation key -> shader/module/compute pipeline (empty: failed)
+    std::unordered_map<u64, ProgSlots> slots;    // program key -> slots
     // Live: the content hashes of the 4 KB pieces under [a, a + n), tracked first so that a CPU write there reaches them
     // by the next frame; 0 when unknown (offline, or a piece not mirrored whole).
     u64 Version(u64 a, u64 n) {
@@ -719,11 +733,15 @@ struct Renderer::Impl {
     }
     static inline thread_local Flat<ProgMemo> prog_memo;   // program address | stage -> this frame's code, hash, fetch SGPR
     static inline thread_local Flat<ProgMemo> fetch_memo;  // fetch shader address -> this frame's code and hash
-    std::unordered_map<u64, VkShaderEXT> rect_gs;          // VS output mask -> rect list geometry shader
-    VkShaderEXT clear_rect_vs = VK_NULL_HANDLE;           // the SDK clear's four strip vertices
+    std::unordered_map<u64, ShaderRef> rect_gs;            // VS output mask -> rect list geometry shader
+    ShaderRef clear_rect_ref{};                            // the SDK clear's four strip vertices
+    bool HasClearRectVs() const { return bool(clear_rect_ref); }
     std::vector<u32> clear_rect_spirv;
     std::unordered_map<u64, u64> vs_outputs;               // VS translation key -> output mask
     std::unordered_map<u64, Variant> variants;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    std::atomic<u32> pipeline_cache_dirty{0};
+    std::unordered_map<u64, CompiledPipeline> pipelines;   // GraphicsPipelineKey::Hash() -> main/square VkPipeline (under prog_lock)
     // A program's translation input and key under the current registers (no GPU work).
     struct Prepared {
         Gcn::Input in;
@@ -746,14 +764,14 @@ struct Renderer::Impl {
     static constexpr u32 kInputs = 512;
     static inline thread_local u32 inputs[kInputs];                  // Shader's: what makes its variant and slot elements
     static inline thread_local std::vector<MemoTex> slot_used;       // Shader's: each slot's, for Recent
-    VkShaderEXT Shader(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, u64& out_mask,
-                       bool rect, std::vector<u32>& table, u32 blend = 0);
+    ShaderRef Shader(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, u64& out_mask,
+                     bool rect, std::vector<u32>& table, u32 blend = 0);
     // Prepare in two halves: the program's code, key and slots with their descriptors (Identify), then the input's
     // registers, the slots' specs and the translation key (Specify), which a repeated input skips.
     bool Identify(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, Prepared& p);
     void Specify(Gcn::Stage stage, Prepared& p);
     void SpecifySlots(Prepared& p);
-    VkShaderEXT Translated(Gcn::Stage stage, u64 prog, const CpuRead& cpu, Prepared& p, u64& out_mask);  // compiled, or compiled now
+    ShaderRef Translated(Gcn::Stage stage, u64 prog, const CpuRead& cpu, Prepared& p, u64& out_mask);  // compiled, or compiled now
     // Translation and compilation, on any thread: `code` and `fetch` are copies the input's spans point at.
     Compiled Compile(Gcn::Stage stage, u64 prog, u64 key, Gcn::Input in, std::vector<u32> code, std::vector<u32> fetch, std::vector<Gcn::SlotSpec> spec);
     // A shader the player's runs used, made from its driver binary when the game opens its WAD (ShaderCache::prepare).
@@ -783,7 +801,7 @@ struct Renderer::Impl {
     // (a short load), ahead of the prefetches.
     void Discover(const CpuRead& cpu, Pos to, bool urgent);
     void Enqueue(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, bool urgent);
-    VkShaderEXT RectGs(u64 mask);
+    ShaderRef RectGs(u64 mask);
     static bool ClearVs(std::span<const u32> code);
     bool SetupClearRect(std::string& error);
     bool RectVs(u32 op, const u32* b, const CpuRead& cpu) const;
@@ -791,6 +809,19 @@ struct Renderer::Impl {
     VkShaderEXT CreateFrom(VkShaderCodeTypeEXT type, const void* code, size_t bytes, VkShaderStageFlagBits stage, VkShaderStageFlags next);
     u64 BinaryKey(u64 key) const { return ::Gpu::PieceHash::DriverBinaryKey(&key, sizeof(key), binary_seed); }
     std::vector<u8> Binary(VkShaderEXT s);  // the driver's binary of a shader object (empty: not available)
+    bool ValidateNativePipelineCacheData(std::span<const u8> data) const;
+    void CreatePipelineCache(std::span<const u8> initial_data = {});
+    void DestroyShaderRef(const ShaderRef& r);
+    VkShaderModule CreateShaderModule(std::span<const u32> spirv);
+    VkPipeline CreateComputePipeline(std::span<const u32> spirv);
+    std::vector<VkDynamicState> BuildDynamicStates() const;
+    VkPipeline CreateGraphicsPipelineRaw(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
+                                         const FixedPipelineState& state, bool fail_on_compile, bool square_pass);
+    CompiledPipeline CreateMonolithicPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
+                                              const FixedPipelineState& state, bool fail_on_compile);
+    CompiledPipeline GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
+                                         const FixedPipelineState& raw_state);
+    VkPipeline IndexProbePipeline(const FixedPipelineState& state);
 
     // ---- Barriers (hazards.cpp) ----
     static thread_local Hazards hz;
@@ -961,13 +992,14 @@ struct Renderer::Impl {
         bool valid = false, neg_one = false;
         bool pushed = false;  // `push` holds the push constants (another layout's push clears it)
         Push push{};
+        VkPipeline pipeline = VK_NULL_HANDLE;
         VkShaderEXT shaders[5]{};
         VkViewport vp{};
         VkRect2D sc{};
         u32 raster[8]{};  // samples, alpha to coverage, depth clamp, cull, front face, bias enable, topology, restart
         float bias[3]{};
         u32 depth[5]{};  // test, write, compare op, stencil test, bounds test
-        float bounds[2]{};
+        float bounds[2]{-1.f, -1.f};
         u32 stencil[14]{};
         u32 blend_count = 0;
         VkBool32 blend[8]{};
@@ -986,6 +1018,7 @@ struct Renderer::Impl {
         VkColorBlendEquationEXT eq[8], square_eq[8];
         VkColorComponentFlags mask[8];
         bool square;
+        u8 square_color_mask, square_alpha_mask;
         u32 unsupported;  // targets whose scaled MIN/MAX blend is not representable
     };
     static inline thread_local BlendState blend_memo{{~0u}};  // key[0] above any real one: none yet
@@ -1132,6 +1165,8 @@ struct Renderer::Impl {
     static constexpr u32 kIndexProbe = 3 * 12;
     Buffer index_probe;
     VkShaderEXT index_probe_vs = VK_NULL_HANDLE;
+    VkShaderModule index_probe_mod = VK_NULL_HANDLE;
+    std::unordered_map<u64, VkPipeline> index_probe_pls;
     struct IndexProbe {
         size_t line;
         u32 lo, hi;  // what the CPU reads, base vertex added (lo > hi: unreadable)

@@ -28,15 +28,18 @@ void main() {
 )", shaderc_vertex_shader, error);
     if (clear_rect_spirv.empty()) return false;
     if (caps.path == ShaderPath::Objects) {
-        clear_rect_vs = Create(clear_rect_spirv, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT);
-        if (!clear_rect_vs) return error = "SDK clear vertex shader creation failed", false;
+        clear_rect_ref = {kClearRectVsKey, Create(clear_rect_spirv, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT),
+                          VK_NULL_HANDLE, VK_NULL_HANDLE};
+    } else {
+        clear_rect_ref = {kClearRectVsKey, VK_NULL_HANDLE, CreateShaderModule(clear_rect_spirv), VK_NULL_HANDLE};
     }
+    if (!clear_rect_ref) return error = "SDK clear vertex shader creation failed", false;
     return true;
 }
 
 bool Renderer::Impl::RectVs(u32 op, const u32* b, const CpuRead& cpu) const {
     if (uc[0x242] != 0x11 || op != 0x2D || b[0] != 3) return false;
-    if (!clear_rect_vs) return true;
+    if (!HasClearRectVs()) return true;
     const u64 addr = (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8;
     const auto* code = static_cast<const u32*>(cpu(addr, sizeof(kClearVs)));
     return code && ClearVs({code, std::size(kClearVs)});
@@ -108,11 +111,11 @@ static std::span<const u32> FetchProgram(u64 addr, const CpuRead& cpu) {
 }
 
 // Translated program for a draw stage; fills `table` with user data and the slots' bindless indices.
-VkShaderEXT Renderer::Impl::Shader(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, u64& out_mask,
-                                   bool rect, std::vector<u32>& table, u32 blend) {
+ShaderRef Renderer::Impl::Shader(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, u64& out_mask,
+                                 bool rect, std::vector<u32>& table, u32 blend) {
     RenderProbe::Scope shader_time(RenderProbe::Shader);
     Prepared& p = prep;
-    if (!Identify(stage, prog, user, cpu, rsrc1, rsrc2, rect, p)) return VK_NULL_HANDLE;
+    if (!Identify(stage, prog, user, cpu, rsrc1, rsrc2, rect, p)) return {};
     p.in.blend_interlock = blend;
     if (track)  // live: the memory of every V# the program loads through, and of the pointers leading to it
         for (const Gcn::Path& bp : *p.paths) {
@@ -231,7 +234,7 @@ VkShaderEXT Renderer::Impl::Shader(Gcn::Stage stage, u64 prog, const u32* user, 
     }
     if (p.motion_blur) table.push_back(std::bit_cast<u32>(motion_blur_rate));
     if (subs) p.key = TranslationKey(p.pkey, p.in, p.spec);
-    const VkShaderEXT s = Translated(stage, prog, cpu, p, out_mask);
+    const ShaderRef s = Translated(stage, prog, cpu, p, out_mask);
     if (ProgUse* u = keep && s ? Memos().progs.Find(p.pkey) : nullptr) {  // not a shader still compiling  // found again: compiling may have added program keys
         Recent& r = u->recent[u->order[3]];  // the least recent gives way
         std::rotate(u->order, u->order + 3, u->order + 4);
@@ -240,9 +243,9 @@ VkShaderEXT Renderer::Impl::Shader(Gcn::Stage stage, u64 prog, const u32* user, 
     return s;
 }
 
-VkShaderEXT Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& cpu, Prepared& p, u64& out_mask) {
+ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& cpu, Prepared& p, u64& out_mask) {
     const u64 key = p.key;
-    const bool clear_rect = clear_rect_vs && p.in.rect && ClearVs(p.in.code);
+    const bool clear_rect = HasClearRectVs() && p.in.rect && ClearVs(p.in.code);
     auto found = [&] {
         auto it = shaders.find(key);
         if (it == shaders.end()) return false;
@@ -260,7 +263,7 @@ VkShaderEXT Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead
             stats.trace_spirv.push_back({name, std::string((const char*)words.data(), words.size() * 4)});
         }
     }
-    if (clear_rect) return out_mask = 1, clear_rect_vs;
+    if (clear_rect) return out_mask = 1, clear_rect_ref;
     auto& memo = Memos().shaders;  // compiled shaders stay
     if (const auto* m = memo.Find(key)) return out_mask = m->second, m->first;
     {
@@ -284,7 +287,9 @@ VkShaderEXT Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead
         const bool compute = stage == Gcn::Stage::Compute;
         // Built by an earlier run or the AOT: the driver's binary only loads (no compile), here, so the draw is never skipped.
         const u64 content = mode == Jit::Mode::Async ? ShaderCache::Instance().ContentOf(key) : 0;
-        const bool built = content && ShaderCache::Instance().ContainsBinary(BinaryKey(content));
+        const bool built = caps.path == ShaderPath::Objects
+                               ? (content && ShaderCache::Instance().ContainsBinary(BinaryKey(content)))
+                               : (content != 0);
         std::promise<Compiled> here;
         std::shared_future<Compiled> f;
         bool own = false;
@@ -297,22 +302,24 @@ VkShaderEXT Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead
         }
         if (own) here.set_value(Compile(stage, prog, key, p.in, std::vector<u32>(p.in.code.begin(), p.in.code.end()),
                                         std::vector<u32>(p.in.fetch.begin(), p.in.fetch.end()), p.spec));
-        if (mode == Jit::Mode::Async && !compute && !built && f.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return waiting = true, VK_NULL_HANDLE;
+        if (mode == Jit::Mode::Async && !compute && !built && f.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return waiting = true, ShaderRef{};
         Stalled(stall_waits, stall_wait_ns, [&] { c = f.get(); });
     }
     std::unique_lock lock(prog_lock);
     if (found()) {  // another block or the WAD's warm-up (Prepare) finished it first: the first to end this compile drops its copy
         if (const auto it = compiling.find(key); it != compiling.end()) {
             compiling.erase(it);
-            if (c.s && c.s != shaders.find(key)->second) DestroyShader(dev, c.s, nullptr);
+            const ShaderRef cr = c.Ref(key);
+            if (cr && cr != shaders.find(key)->second) DestroyShaderRef(cr);
         }
         return shaders.find(key)->second;
     }
     compiling.erase(key);
     if (stage == Gcn::Stage::Vertex) vs_outputs[key] = out_mask = c.out_mask;
     Count(stats.shaders);
-    if (!c.s) Count(stats.shader_fail), Note(std::format("shader {:x} stage {}: {}", prog, (int)stage, c.err.substr(0, 300)));
-    return shaders[key] = c.s;
+    const ShaderRef ref = c.Ref(key);
+    if (!c.Ready(caps.path, stage)) Count(stats.shader_fail), Note(std::format("shader {:x} stage {}: {}", prog, (int)stage, c.err.substr(0, 300)));
+    return shaders[key] = ref;
 }
 
 bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, Prepared& p) {
@@ -452,7 +459,7 @@ u64 TranslationKey(u64 program_key, const Gcn::Input& in, std::span<const Gcn::S
 }
 
 // Rect list: three corners of an axis-aligned rectangle; the corner with the right angle is opposite the missing one.
-VkShaderEXT Renderer::Impl::RectGs(u64 mask) {
+ShaderRef Renderer::Impl::RectGs(u64 mask) {
     std::unique_lock lock(prog_lock);
     if (auto it = rect_gs.find(mask); it != rect_gs.end()) return it->second;
     std::string s = "#version 460\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 4) out;\n";
@@ -481,8 +488,276 @@ void main() {
 )";
     std::string err;
     auto spirv = compiler.Spirv(s, shaderc_geometry_shader, err);
-    VkShaderEXT gs = spirv.empty() ? VK_NULL_HANDLE : Create(spirv, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+    ShaderRef gs{};
+    if (!spirv.empty()) {
+        if (caps.path == ShaderPath::Objects)
+            gs = {mask, Create(spirv, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT), VK_NULL_HANDLE, VK_NULL_HANDLE};
+        else
+            gs = {mask, VK_NULL_HANDLE, CreateShaderModule(spirv), VK_NULL_HANDLE};
+    }
     if (!gs) Note("rect list geometry shader: " + err.substr(0, 300));
     return rect_gs[mask] = gs;
+}
+
+void FixedPipelineState::Canonicalize(const DynamicCaps& c) {
+    if (c.depth_clip_negative_one_to_one) flags &= ~kNegOne;
+    if (c.depth_clamp_enable) flags &= ~kDepthClamp;
+    if (c.alpha_to_coverage_enable) flags &= ~kAlphaToCoverage;
+    if (c.rasterization_samples) samples = 1;
+    if (c.unrestricted_topology && !(flags & kHasGs)) topology_class = 2;
+    if (c.color_blend_enable && c.color_blend_equation) square_color_mask = square_alpha_mask = 0;
+    for (u32 k = color_count; k < 8; ++k) color_formats[k] = VK_FORMAT_UNDEFINED, blend[k] = {};
+    for (u32 k = 0; k < color_count; ++k) {
+        if (c.color_blend_enable) blend[k].blend_enable = 0;
+        if (c.color_blend_equation || (!c.color_blend_enable && !blend[k].blend_enable))
+            blend[k].src_color = blend[k].dst_color = blend[k].color_op =
+                blend[k].src_alpha = blend[k].dst_alpha = blend[k].alpha_op = 0;
+        if (c.color_write_mask) blend[k].write_mask = 0xF;
+    }
+    pad[0] = pad[1] = 0;
+}
+
+u64 GraphicsPipelineKey::Hash() const {
+    const u64 head[3]{vs_key, ps_key, (state.flags & FixedPipelineState::kHasGs) ? gs_mask : 0ull};
+    return ::Gpu::PieceHash::Stable64Seeded(&state, sizeof(state), ::Gpu::PieceHash::Stable64(head, sizeof(head)));
+}
+
+bool Renderer::Impl::ValidateNativePipelineCacheData(std::span<const u8> data) const {
+    struct VulkanPipelineCacheHeader {
+        u32 header_size, header_version, vendor_id, device_id;
+        u8 uuid[VK_UUID_SIZE];
+    };
+    static_assert(sizeof(VulkanPipelineCacheHeader) == 32);
+    if (data.size() < sizeof(VulkanPipelineCacheHeader)) return false;
+    VulkanPipelineCacheHeader h{};
+    std::memcpy(&h, data.data(), sizeof(h));
+    if (h.header_size != sizeof(VulkanPipelineCacheHeader) || h.header_version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE) return false;
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(pd, &props);
+    return h.vendor_id == props.vendorID && h.device_id == props.deviceID && std::memcmp(h.uuid, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+}
+
+void Renderer::Impl::CreatePipelineCache(std::span<const u8> initial_data) {
+    if (pipeline_cache) vkDestroyPipelineCache(dev, pipeline_cache, nullptr), pipeline_cache = VK_NULL_HANDLE;
+    const bool valid = !initial_data.empty() && ValidateNativePipelineCacheData(initial_data);
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, valid ? initial_data.size() : 0,
+                                 valid ? initial_data.data() : nullptr};
+    VkResult e = vkCreatePipelineCache(dev, &ci, nullptr, &pipeline_cache);
+    if (e != VK_SUCCESS && valid) {
+        ci.initialDataSize = 0, ci.pInitialData = nullptr;
+        e = vkCreatePipelineCache(dev, &ci, nullptr, &pipeline_cache);
+    }
+    if (e != VK_SUCCESS) Report(std::format("vkCreatePipelineCache {}", (int)e)), pipeline_cache = VK_NULL_HANDLE;
+}
+
+void Renderer::Impl::DestroyShaderRef(const ShaderRef& r) {
+    if (r.obj && DestroyShader) DestroyShader(dev, r.obj, nullptr);
+    if (r.mod) vkDestroyShaderModule(dev, r.mod, nullptr);
+    if (r.pl) vkDestroyPipeline(dev, r.pl, nullptr);
+}
+
+VkShaderModule Renderer::Impl::CreateShaderModule(std::span<const u32> spirv) {
+    if (spirv.empty()) return VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, spirv.size_bytes(), spirv.data()};
+    VkShaderModule mod = VK_NULL_HANDLE;
+    if (const VkResult e = vkCreateShaderModule(dev, &ci, nullptr, &mod); e != VK_SUCCESS) {
+        Report(std::format("vkCreateShaderModule {}: {} bytes", (int)e, spirv.size_bytes()));
+        mod = VK_NULL_HANDLE;
+    }
+    return mod;
+}
+
+VkPipeline Renderer::Impl::CreateComputePipeline(std::span<const u32> spirv) {
+    if (spirv.empty()) return VK_NULL_HANDLE;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo mod_ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, spirv.size_bytes(), spirv.data()};
+    VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, caps.maintenance5 ? &mod_ci : nullptr, 0,
+                                          VK_SHADER_STAGE_COMPUTE_BIT, VK_NULL_HANDLE, "main"};
+    if (!caps.maintenance5) {
+        mod = CreateShaderModule(spirv);
+        if (!mod) return VK_NULL_HANDLE;
+        stage.module = mod;
+    }
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stage, layout};
+    VkPipeline pl = VK_NULL_HANDLE;
+    const VkResult e = vkCreateComputePipelines(dev, pipeline_cache, 1, &ci, nullptr, &pl);
+    if (mod) vkDestroyShaderModule(dev, mod, nullptr);
+    if (e != VK_SUCCESS) {
+        Report(std::format("vkCreateComputePipelines {}: {} bytes", (int)e, spirv.size_bytes()));
+        return VK_NULL_HANDLE;
+    }
+    pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+    return pl;
+}
+
+std::vector<VkDynamicState> Renderer::Impl::BuildDynamicStates() const {
+    std::vector<VkDynamicState> list{
+        VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
+        VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
+        VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
+        VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE,
+        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+        VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,
+        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+        VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_BOUNDS,
+        VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+        VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+    };
+    if (caps.depth_clip_negative_one_to_one) list.push_back(VK_DYNAMIC_STATE_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT);
+    if (caps.depth_clamp_enable) list.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
+    if (caps.rasterization_samples) list.push_back(VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
+    if (caps.alpha_to_coverage_enable) list.push_back(VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT);
+    if (caps.color_blend_enable) list.push_back(VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT);
+    if (caps.color_blend_equation) list.push_back(VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT);
+    if (caps.color_write_mask) list.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
+    return list;
+}
+
+VkPipeline Renderer::Impl::CreateGraphicsPipelineRaw(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
+                                                     const FixedPipelineState& state, bool fail_on_compile, bool square_pass) {
+    if (fail_on_compile && !caps.cache_control) return VK_NULL_HANDLE;
+    if (!vs.mod) return VK_NULL_HANDLE;
+    const bool has_gs = (state.flags & FixedPipelineState::kHasGs) != 0;
+    const bool has_ps = (state.flags & FixedPipelineState::kHasPs) != 0;
+    if (has_gs && !gs.mod) return VK_NULL_HANDLE;
+    if (has_ps && !ps.mod) return VK_NULL_HANDLE;
+
+    VkPipelineShaderStageCreateInfo stages[3]{};
+    u32 stage_count = 0;
+    stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs.mod, "main"};
+    if (has_gs) stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT, gs.mod, "main"};
+    if (has_ps) stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ps.mod, "main"};
+
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    static constexpr VkPrimitiveTopology kTopos[]{VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, nullptr, 0,
+                                              kTopos[std::min<u8>(state.topology_class, 2)], VK_FALSE};
+    VkPipelineViewportDepthClipControlCreateInfoEXT dcc{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, nullptr,
+                                                       (state.flags & FixedPipelineState::kNegOne) ? VK_TRUE : VK_FALSE};
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                          caps.depth_clip_negative_one_to_one ? nullptr : &dcc};
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.depthClampEnable = (!caps.depth_clamp_enable && (state.flags & FixedPipelineState::kDepthClamp)) ? VK_TRUE : VK_FALSE;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VkSampleCountFlagBits(std::max<u32>(1, state.samples));
+    ms.alphaToCoverageEnable = (!caps.alpha_to_coverage_enable && (state.flags & FixedPipelineState::kAlphaToCoverage)) ? VK_TRUE : VK_FALSE;
+
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+
+    VkPipelineColorBlendAttachmentState cba[8]{};
+    const u32 count = std::min<u32>(state.color_count, 8);
+    for (u32 k = 0; k < count; ++k) {
+        auto& a = cba[k];
+        if (square_pass) {
+            const bool active = state.color_formats[k] != VK_FORMAT_UNDEFINED && state.blend[k].write_mask != 0;
+            const bool sq_c = (state.square_color_mask >> k & 1) != 0;
+            const bool sq_a = (state.square_alpha_mask >> k & 1) != 0;
+            a.blendEnable = (!caps.color_blend_enable && active) ? VK_TRUE : VK_FALSE;
+            a.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+            a.dstColorBlendFactor = sq_c ? VK_BLEND_FACTOR_DST_COLOR : VK_BLEND_FACTOR_ONE;
+            a.colorBlendOp = VK_BLEND_OP_ADD;
+            a.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            a.dstAlphaBlendFactor = sq_a ? VK_BLEND_FACTOR_DST_ALPHA : VK_BLEND_FACTOR_ONE;
+            a.alphaBlendOp = VK_BLEND_OP_ADD;
+        } else {
+            const auto& b = state.blend[k];
+            a.blendEnable = (!caps.color_blend_enable && b.blend_enable) ? VK_TRUE : VK_FALSE;
+            a.srcColorBlendFactor = VkBlendFactor(b.src_color);
+            a.dstColorBlendFactor = VkBlendFactor(b.dst_color);
+            a.colorBlendOp = VkBlendOp(b.color_op);
+            a.srcAlphaBlendFactor = VkBlendFactor(b.src_alpha);
+            a.dstAlphaBlendFactor = VkBlendFactor(b.dst_alpha);
+            a.alphaBlendOp = VkBlendOp(b.alpha_op);
+        }
+        a.colorWriteMask = caps.color_write_mask ? VkColorComponentFlags(0xF) : VkColorComponentFlags(state.blend[k].write_mask);
+    }
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, nullptr, 0, VK_FALSE, VK_LOGIC_OP_COPY,
+                                           count, count ? cba : nullptr};
+
+    const auto dyns = BuildDynamicStates();
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, u32(dyns.size()), dyns.data()};
+    VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, nullptr, 0, count,
+                                      count ? state.color_formats : nullptr, state.depth_format, state.stencil_format};
+    const VkPipelineCreateFlags flags = fail_on_compile ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0;
+    VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, flags, stage_count, stages, &vi, &ia,
+                                    nullptr, &vps, &rs, &ms, &ds, &cb, &dsi, layout};
+    VkPipeline pl = VK_NULL_HANDLE;
+    const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl);
+    if (e == VK_SUCCESS) {
+        if (!fail_on_compile) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+        return pl;
+    }
+    if (e < 0) Report(std::format("vkCreateGraphicsPipelines {}: vs {:x} ps {:x}", (int)e, vs.key, ps.key));
+    return VK_NULL_HANDLE;
+}
+
+CompiledPipeline Renderer::Impl::CreateMonolithicPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
+                                                          const FixedPipelineState& state, bool fail_on_compile) {
+    CompiledPipeline pl{};
+    pl.main = CreateGraphicsPipelineRaw(vs, ps, gs, state, fail_on_compile, false);
+    if (!pl.main) return {};
+    if (state.NeedsSquarePipeline(caps)) {
+        pl.square = CreateGraphicsPipelineRaw(vs, ps, gs, state, fail_on_compile, true);
+        if (!pl.square) {
+            vkDestroyPipeline(dev, pl.main, nullptr);
+            return {};
+        }
+    }
+    pl.is_lto = true;
+    return pl;
+}
+
+CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
+                                                     const FixedPipelineState& raw_state) {
+    GraphicsPipelineKey gkey{vs.key, ps ? ps.key : 0ull, (raw_state.flags & FixedPipelineState::kHasGs) ? gs.key : 0ull, raw_state};
+    gkey.state.Canonicalize(caps);
+    const u64 h = gkey.Hash();
+    auto& pm = Memos().pipelines;
+    if (const auto* m = pm.Find(h)) return *m;
+    {
+        std::shared_lock lock(prog_lock);
+        if (auto it = pipelines.find(h); it != pipelines.end()) return pm[h] = it->second;
+    }
+    const CompiledPipeline created = CreateMonolithicPipeline(vs, ps, gs, gkey.state, false);
+    if (!created.main) return {};
+    std::unique_lock lock(prog_lock);
+    auto [it, inserted] = pipelines.try_emplace(h, created);
+    if (!inserted) {
+        vkDestroyPipeline(dev, created.main, nullptr);
+        if (created.square) vkDestroyPipeline(dev, created.square, nullptr);
+    }
+    return pm[h] = it->second;
+}
+
+VkPipeline Renderer::Impl::IndexProbePipeline(const FixedPipelineState& raw_state) {
+    if (!index_probe_mod) return VK_NULL_HANDLE;
+    FixedPipelineState s = raw_state;
+    s.flags &= ~(FixedPipelineState::kHasPs | FixedPipelineState::kHasGs);
+    s.square_color_mask = s.square_alpha_mask = 0;
+    s.Canonicalize(caps);
+    const u64 h = GraphicsPipelineKey{0, 0, 0, s}.Hash();
+    {
+        std::shared_lock lock(prog_lock);
+        if (auto it = index_probe_pls.find(h); it != index_probe_pls.end()) return it->second;
+    }
+    const VkPipeline pl = CreateGraphicsPipelineRaw({0, VK_NULL_HANDLE, index_probe_mod, VK_NULL_HANDLE}, {}, {}, s, false, false);
+    if (!pl) return VK_NULL_HANDLE;
+    std::unique_lock lock(prog_lock);
+    auto [it, inserted] = index_probe_pls.try_emplace(h, pl);
+    if (!inserted) vkDestroyPipeline(dev, pl, nullptr);
+    return it->second;
 }
 } // namespace Gpu
