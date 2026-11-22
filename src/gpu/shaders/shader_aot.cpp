@@ -602,19 +602,19 @@ void Renderer::Impl::AotBuild() {
         };
 
         auto aot_gpl_frag = [&](u64 ps_content, VkShaderModule ps_mod, const FixedPipelineState& st) -> VkPipeline {
-            const bool has_ps = (st.flags & FixedPipelineState::kHasPs) != 0;
+            if (!(st.flags & FixedPipelineState::kHasPs) || !ps_mod) return VK_NULL_HANDLE;
             const u32 samples = caps.rasterization_samples ? 1u : std::max<u32>(1, st.samples);
-            if (!has_ps && samples == 1 && gpl_empty_fs) return gpl_empty_fs;
+            const bool a2c = !caps.alpha_to_coverage_enable && (st.flags & FixedPipelineState::kAlphaToCoverage) != 0;
             struct FragKey {
                 u64 ps;
-                u32 samples, has_ps;
-            } fk{has_ps ? ps_content : 0ull, samples, has_ps ? 1u : 0u};
+                u32 samples, a2c;
+            } fk{ps_content, samples, a2c ? 1u : 0u};
             const u64 h = PieceHash::Stable64(&fk, sizeof(fk));
             {
                 std::scoped_lock l(aot_lock);
                 if (auto it = temp.frag.find(h); it != temp.frag.end()) return it->second;
             }
-            const VkPipeline created = CreateGplFragShader(has_ps ? ps_mod : VK_NULL_HANDLE, samples);
+            const VkPipeline created = CreateGplFragShader(ps_mod, samples, a2c);
             if (!created) return VK_NULL_HANDLE;
             std::scoped_lock l(aot_lock);
             auto [it, inserted] = temp.frag.try_emplace(h, created);
@@ -684,7 +684,7 @@ void Renderer::Impl::AotBuild() {
                 cache.PipelineCompleted();
                 return;
             }
-            if (caps.path == ShaderPath::Gpl) {
+            if (caps.path == ShaderPath::Gpl && has_ps) {
                 const VkPipeline vi = gpl_vi[std::min<u8>(gk.state.topology_class, 2)];
                 const VkPipeline prerast = aot_gpl_prerast(vs_content, vs_mod, gs_ref.mod, gk.gs_mask, gk.state);
                 const VkPipeline fs = aot_gpl_frag(ps_content, ps_mod, gk.state);

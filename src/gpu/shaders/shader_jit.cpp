@@ -125,7 +125,8 @@ u32 Renderer::Impl::Prepare(u64 key, u64 binary, u32 stage) {
         if (!hit || hit->spirv.empty()) return 2;
         ShaderRef ref{key};
         if (stage == u32(Gcn::Stage::Compute)) {
-            ref.pl = CreateComputePipeline(hit->spirv);
+            ref.pl = CreateComputePipeline(hit->spirv, true);
+            if (!ref.pl) ref.pl = CreateComputePipeline(hit->spirv, false);
         } else {
             ref.mod = CreateShaderModule(hit->spirv);
             if (caps.path == ShaderPath::Gpl && ref.mod)
@@ -456,7 +457,7 @@ bool Renderer::Impl::ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool 
 }
 
 void Renderer::Impl::EnqueuePipeline(u64 vs_key, u64 ps_key, bool has_gs, const FixedPipelineState& raw_state) {
-    if (caps.path != ShaderPath::Monolithic || !vs_key) return;
+    if (!vs_key || (caps.path != ShaderPath::Monolithic && !(caps.path == ShaderPath::Gpl && !ps_key))) return;
     ShaderRef vs{}, ps{}, gs{};
     u64 gs_mask = 0;
     {
@@ -519,7 +520,7 @@ void Renderer::Impl::Discover(const CpuRead& cpu, Pos to, bool urgent) {
             const u64 vs_key = Enqueue(Gcn::Stage::Vertex, vs_addr, &sh[0x4C], cpu, sh[0x4A], sh[0x4B], rect_vs, urgent);
             const bool want_ps = ps_addr && (mode == 1 || (ctx[0x203] & 0x41));
             const u64 ps_key = want_ps ? Enqueue(Gcn::Stage::Pixel, ps_addr, &sh[0x0C], cpu, sh[0x0A], sh[0x0B], rect, urgent) : 0;
-            if (caps.path == ShaderPath::Monolithic && vs_key && !(want_ps && mode == 1 && !ps_key)) {
+            if ((caps.path == ShaderPath::Monolithic || (caps.path == ShaderPath::Gpl && !ps_key)) && vs_key && !(want_ps && mode == 1 && !ps_key)) {
                 FixedPipelineState raw_state{};
                 if (ExtractDiscoverPipelineState(rect, rect_vs, ps_key != 0, raw_state))
                     EnqueuePipeline(vs_key, ps_key, rect && !rect_vs, raw_state);

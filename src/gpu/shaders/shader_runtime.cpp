@@ -829,8 +829,6 @@ void Renderer::Impl::SetupGplGlobals() {
         if (const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &gpl_vi[k]); e != VK_SUCCESS)
             Report(std::format("vkCreateGraphicsPipelines GPL VI[{}] {}", k, (int)e)), gpl_vi[k] = VK_NULL_HANDLE;
     }
-    // Default samples=1 depth-only FS library; MSAA depth-only variants go into gpl_frag_msaa on demand.
-    gpl_empty_fs = CreateGplFragShader(VK_NULL_HANDLE, 1);
 }
 
 VkPipeline Renderer::Impl::CreateGplPreRaster(VkShaderModule vs_mod, VkShaderModule gs_mod, bool neg_one, bool depth_clamp) {
@@ -860,7 +858,8 @@ VkPipeline Renderer::Impl::CreateGplPreRaster(VkShaderModule vs_mod, VkShaderMod
     if (caps.depth_clip_negative_one_to_one) dyns.push_back(VK_DYNAMIC_STATE_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT);
     if (caps.depth_clamp_enable) dyns.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
     VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, u32(dyns.size()), dyns.data()};
-    VkGraphicsPipelineLibraryCreateInfoEXT lib_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, nullptr,
+    VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkGraphicsPipelineLibraryCreateInfoEXT lib_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &rci,
                                                   VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT};
     VkGraphicsPipelineCreateInfo gi{
         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib_ci,
@@ -875,11 +874,13 @@ VkPipeline Renderer::Impl::CreateGplPreRaster(VkShaderModule vs_mod, VkShaderMod
     return pl;
 }
 
-VkPipeline Renderer::Impl::CreateGplFragShader(VkShaderModule ps_mod, u32 samples) {
+VkPipeline Renderer::Impl::CreateGplFragShader(VkShaderModule ps_mod, u32 samples, bool alpha_to_coverage) {
+    if (!ps_mod) return VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, "main"};
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VkSampleCountFlagBits(std::max<u32>(1, samples));
+    ms.alphaToCoverageEnable = (!caps.alpha_to_coverage_enable && alpha_to_coverage) ? VK_TRUE : VK_FALSE;
 
     std::vector<VkDynamicState> dyns{
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
@@ -895,12 +896,13 @@ VkPipeline Renderer::Impl::CreateGplFragShader(VkShaderModule ps_mod, u32 sample
     };
     if (caps.rasterization_samples) dyns.push_back(VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
     VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, u32(dyns.size()), dyns.data()};
-    VkGraphicsPipelineLibraryCreateInfoEXT lib_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, nullptr,
+    VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkGraphicsPipelineLibraryCreateInfoEXT lib_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &rci,
                                                   VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT};
     VkGraphicsPipelineCreateInfo gi{
         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib_ci,
         VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT,
-        ps_mod ? 1u : 0u, ps_mod ? &st : nullptr};
+        1u, &st};
     gi.pMultisampleState = &ms, gi.pDepthStencilState = &ds, gi.pDynamicState = &dsi, gi.layout = layout;
     VkPipeline pl = VK_NULL_HANDLE;
     if (const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl); e != VK_SUCCESS) {
@@ -992,21 +994,20 @@ VkPipeline Renderer::Impl::GetGplPreRaster(const ShaderRef& vs, const ShaderRef&
 }
 
 VkPipeline Renderer::Impl::GetGplFragShader(const ShaderRef& ps, const FixedPipelineState& state) {
-    const bool has_ps = (state.flags & FixedPipelineState::kHasPs) != 0;
+    if (!(state.flags & FixedPipelineState::kHasPs) || !ps.mod) return VK_NULL_HANDLE;
     const u32 samples = caps.rasterization_samples ? 1u : std::max<u32>(1, state.samples);
-    if (!has_ps && samples == 1 && gpl_empty_fs) return gpl_empty_fs;
-    if (has_ps && samples == 1 && ps.pl) return ps.pl;
-    if (has_ps && !ps.mod) return VK_NULL_HANDLE;
+    const bool a2c = !caps.alpha_to_coverage_enable && (state.flags & FixedPipelineState::kAlphaToCoverage) != 0;
+    if (samples == 1 && !a2c && ps.pl) return ps.pl;
     struct FragKey {
         u64 ps;
-        u32 samples, has_ps;
-    } fk{has_ps ? ps.key : 0ull, samples, has_ps ? 1u : 0u};
+        u32 samples, a2c;
+    } fk{ps.key, samples, a2c ? 1u : 0u};
     const u64 h = ::Gpu::PieceHash::Stable64(&fk, sizeof(fk));
     {
         std::shared_lock lock(prog_lock);
         if (auto it = gpl_frag_msaa.find(h); it != gpl_frag_msaa.end()) return it->second;
     }
-    const VkPipeline created = CreateGplFragShader(has_ps ? ps.mod : VK_NULL_HANDLE, samples);
+    const VkPipeline created = CreateGplFragShader(ps.mod, samples, a2c);
     if (!created) return VK_NULL_HANDLE;
     std::unique_lock lock(prog_lock);
     auto [it, inserted] = gpl_frag_msaa.try_emplace(h, created);
@@ -1100,7 +1101,7 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
     if (!stats.trace && !boom_on)
         PipelineRecipes::Instance().Note(vs.key, ps ? ps.key : 0ull,
                                          (raw_state.flags & FixedPipelineState::kHasGs) ? gs.key : 0ull, raw_state);
-    if (caps.path == ShaderPath::Gpl) {
+    if (caps.path == ShaderPath::Gpl && (gkey.state.flags & FixedPipelineState::kHasPs)) {
         const VkPipeline vi = gpl_vi[std::min<u8>(gkey.state.topology_class, 2)];
         const VkPipeline prerast = GetGplPreRaster(vs, gs, gkey.state);
         const VkPipeline fs = GetGplFragShader(ps, gkey.state);
@@ -1223,7 +1224,7 @@ void Renderer::Impl::WarmPipelines() {
             }
         }
         CompiledPipeline pl{};
-        if (caps.path == ShaderPath::Gpl) {
+        if (caps.path == ShaderPath::Gpl && (gk.state.flags & FixedPipelineState::kHasPs)) {
             const VkPipeline vi = gpl_vi[std::min<u8>(gk.state.topology_class, 2)];
             const VkPipeline prerast = GetGplPreRaster(vs, gs, gk.state);
             const VkPipeline fs = GetGplFragShader(ps, gk.state);

@@ -330,7 +330,6 @@ Renderer::~Renderer() {
     }
     for (auto p : d->gpl_vi)
         if (p) vkDestroyPipeline(d->dev, p, nullptr);
-    if (d->gpl_empty_fs) vkDestroyPipeline(d->dev, d->gpl_empty_fs, nullptr);
     for (auto& [k, p] : d->gpl_prerast)
         if (p) vkDestroyPipeline(d->dev, p, nullptr);
     for (auto& [k, p] : d->gpl_frag_msaa)
@@ -960,11 +959,11 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         for (u32 k = 0; k < color_count && !probe_target; ++k) probe_target = bs.mask[k] ? color[k] : nullptr;
         const bool first_blend = dyn.blend_count == 0, more = color_count > dyn.blend_count;
         if (more) dyn.blend_count = color_count;
-        if ((changed_n(dyn.blend, bs.blend, color_count) || more) && SetBlendEnable)
+        if (SetBlendEnable && (changed_n(dyn.blend, bs.blend, color_count) || more))
             RenderProbe::Cmd(RenderProbe::Blend), SetBlendEnable(cmd, 0, color_count, bs.blend);
-        if ((changed_n(dyn.eq, bs.eq, color_count) || more) && SetBlendEquation)
+        if (SetBlendEquation && (changed_n(dyn.eq, bs.eq, color_count) || more))
             RenderProbe::Cmd(RenderProbe::Blend), SetBlendEquation(cmd, 0, color_count, bs.eq);
-        if ((changed_n(dyn.mask, bs.mask, color_count) || more) && SetWriteMask)
+        if (SetWriteMask && (changed_n(dyn.mask, bs.mask, color_count) || more))
             RenderProbe::Cmd(RenderProbe::Blend), SetWriteMask(cmd, 0, color_count, bs.mask);
         const float constants[4]{F(ctx[0x105]), F(ctx[0x106]), F(ctx[0x107]), F(ctx[0x108])};
         if (changed(dyn.constants, constants) || first_blend) RenderProbe::Cmd(RenderProbe::Blend), vkCmdSetBlendConstants(cmd, constants);
