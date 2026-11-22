@@ -381,17 +381,18 @@ bool Renderer::Impl::ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool 
         color_count = k + 1;
     }
 
-    const bool z_test = depth_control >> 1 & 1, z_write = depth_control >> 2 & 1, stencil = depth_control & 1, z_bounds = depth_control >> 3 & 1;
+    const bool z_test = depth_control >> 1 & 1, z_write = depth_control >> 2 & 1, stencil = depth_control & 1, z_bounds = caps.depth_bounds && (depth_control >> 3 & 1);
     const u32 z_fmt = ctx[0x010] & 3, s_fmt = ctx[0x011] & 1;
     const bool db_clear = (ctx[0x000] & 3) != 0;
     const u32 st_ctl = ctx[0x10B], st_ref_f = ctx[0x10C], st_ref_b = (depth_control >> 7 & 1) ? ctx[0x10D] : st_ref_f;
-    const auto st_op_writes = [](u32 op_fail, u32 op_zpass, u32 op_zfail, u32 wmask) {
-        return (wmask & 0xFF) != 0 && (op_fail != 0 || op_zpass != 0 || op_zfail != 0);
+    const u32 st_fn_f = depth_control >> 8 & 7, st_fn_b = (depth_control >> 7 & 1) ? (depth_control >> 20 & 7) : st_fn_f;
+    const auto st_op_writes = [](u32 fn, u32 op_fail, u32 op_zpass, u32 op_zfail, u32 wmask) {
+        return (wmask & 0xFF) != 0 && ((fn != 7 && op_fail != 0) || (fn != 0 && (op_zpass != 0 || op_zfail != 0)));
     };
-    const bool st_can_reject = stencil && s_fmt && ((depth_control >> 8 & 7) != 7 || ((depth_control >> 7 & 1) && (depth_control >> 20 & 7) != 7));
+    const bool st_can_reject = stencil && s_fmt && (st_fn_f != 7 || ((depth_control >> 7 & 1) && st_fn_b != 7));
     const bool st_can_write = stencil && s_fmt &&
-                              (st_op_writes(st_ctl & 0xF, st_ctl >> 4 & 0xF, st_ctl >> 8 & 0xF, st_ref_f >> 16) ||
-                               ((depth_control >> 7 & 1) && st_op_writes(st_ctl >> 12 & 0xF, st_ctl >> 16 & 0xF, st_ctl >> 20 & 0xF, st_ref_b >> 16)));
+                              (st_op_writes(st_fn_f, st_ctl & 0xF, st_ctl >> 4 & 0xF, st_ctl >> 8 & 0xF, st_ref_f >> 16) ||
+                               ((depth_control >> 7 & 1) && st_op_writes(st_fn_b, st_ctl >> 12 & 0xF, st_ctl >> 16 & 0xF, st_ctl >> 20 & 0xF, st_ref_b >> 16)));
     const bool stencil_eff = st_can_reject || st_can_write;
     const bool z_effect = (z_test && (depth_control >> 4 & 7) != 7) || z_write || stencil_eff || z_bounds;
     VkFormat depth_fmt = VK_FORMAT_UNDEFINED, stencil_fmt = VK_FORMAT_UNDEFINED;
@@ -422,7 +423,7 @@ bool Renderer::Impl::ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool 
 
     out = {};
     out.color_count = u8(color_count);
-    const bool want_square = color_count && !(z_write || stencil);
+    const bool want_square = color_count && !(z_write || stencil_eff);
     for (u32 k = 0; k < color_count; ++k) {
         out.color_formats[k] = color_fmt[k];
         const u32 bc = ctx[0x1E0 + k], info = ctx[0x31C + k * 15], nt = info >> 8 & 7;

@@ -322,12 +322,6 @@ Renderer::~Renderer() {
         if (p.main) vkDestroyPipeline(d->dev, p.main, nullptr);
         if (p.square) vkDestroyPipeline(d->dev, p.square, nullptr);
     }
-    {
-        std::scoped_lock lock(d->retired_pl_lock);
-        for (auto p : d->retired_pipelines)
-            if (p) vkDestroyPipeline(d->dev, p, nullptr);
-        d->retired_pipelines.clear();
-    }
     for (auto p : d->gpl_vi)
         if (p) vkDestroyPipeline(d->dev, p, nullptr);
     for (auto& [k, p] : d->gpl_prerast)
@@ -336,11 +330,6 @@ Renderer::~Renderer() {
         if (p) vkDestroyPipeline(d->dev, p, nullptr);
     for (auto& [k, p] : d->gpl_foi)
         if (p) vkDestroyPipeline(d->dev, p, nullptr);
-    for (auto p : d->graves.pipelines)
-        if (p) vkDestroyPipeline(d->dev, p, nullptr);
-    for (auto p : d->dying.pipelines)
-        if (p) vkDestroyPipeline(d->dev, p, nullptr);
-    d->graves.pipelines.clear(), d->dying.pipelines.clear();
     if (d->q_stat) vkDestroyQueryPool(d->dev, d->q_stat, nullptr), vkDestroyQueryPool(d->dev, d->q_occ, nullptr);
     d->DestroyTextures();
     for (int k = 0; k < 2; ++k, d->SwapFrame()) {
@@ -497,20 +486,21 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     }
     u32 samples = 0;
     // DB_DEPTH_CONTROL: STENCIL_ENABLE 0, Z_ENABLE 1, Z_WRITE_ENABLE 2, DEPTH_BOUNDS_ENABLE 3, ZFUNC 4-6.
-    const bool z_test = depth_control >> 1 & 1, z_write = depth_control >> 2 & 1, stencil = depth_control & 1, z_bounds = depth_control >> 3 & 1;
+    const bool z_test = depth_control >> 1 & 1, z_write = depth_control >> 2 & 1, stencil = depth_control & 1, z_bounds = caps.depth_bounds && (depth_control >> 3 & 1);
     const u32 z_fmt = ctx[0x010] & 3, s_fmt = ctx[0x011] & 1;
     const Target* depth = nullptr;
     const Target* clear_apart = nullptr;  // depth cleared in its own pass: its sample count differs from the color's
     // DB_RENDER_CONTROL depth/stencil clear: the clear value lands under the draw; color is still written by the PS.
     const bool db_clear = ctx[0x000] & 3;
     const u32 st_ctl = ctx[0x10B], st_ref_f = ctx[0x10C], st_ref_b = (depth_control >> 7 & 1) ? ctx[0x10D] : st_ref_f;
-    const auto st_op_writes = [](u32 op_fail, u32 op_zpass, u32 op_zfail, u32 wmask) {
-        return (wmask & 0xFF) != 0 && (op_fail != 0 || op_zpass != 0 || op_zfail != 0);
+    const u32 st_fn_f = depth_control >> 8 & 7, st_fn_b = (depth_control >> 7 & 1) ? (depth_control >> 20 & 7) : st_fn_f;
+    const auto st_op_writes = [](u32 fn, u32 op_fail, u32 op_zpass, u32 op_zfail, u32 wmask) {
+        return (wmask & 0xFF) != 0 && ((fn != 7 && op_fail != 0) || (fn != 0 && (op_zpass != 0 || op_zfail != 0)));
     };
-    const bool st_can_reject = stencil && s_fmt && ((depth_control >> 8 & 7) != 7 || ((depth_control >> 7 & 1) && (depth_control >> 20 & 7) != 7));
+    const bool st_can_reject = stencil && s_fmt && (st_fn_f != 7 || ((depth_control >> 7 & 1) && st_fn_b != 7));
     const bool st_can_write = stencil && s_fmt &&
-                              (st_op_writes(st_ctl & 0xF, st_ctl >> 4 & 0xF, st_ctl >> 8 & 0xF, st_ref_f >> 16) ||
-                               ((depth_control >> 7 & 1) && st_op_writes(st_ctl >> 12 & 0xF, st_ctl >> 16 & 0xF, st_ctl >> 20 & 0xF, st_ref_b >> 16)));
+                              (st_op_writes(st_fn_f, st_ctl & 0xF, st_ctl >> 4 & 0xF, st_ctl >> 8 & 0xF, st_ref_f >> 16) ||
+                               ((depth_control >> 7 & 1) && st_op_writes(st_fn_b, st_ctl >> 12 & 0xF, st_ctl >> 16 & 0xF, st_ctl >> 20 & 0xF, st_ref_b >> 16)));
     const bool stencil_eff = caps.path == ShaderPath::Objects ? stencil : (st_can_reject || st_can_write);
     const bool z_effect = (z_test && (depth_control >> 4 & 7) != 7) || z_write || stencil_eff || z_bounds;  // test ALWAYS: no test
     for (const Target* t : color)
@@ -802,7 +792,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
                           ((ctx[0x2DC] & 1) ? FixedPipelineState::kAlphaToCoverage : 0) |
                           (ps ? FixedPipelineState::kHasPs : 0) |
                           (gs ? FixedPipelineState::kHasGs : 0);
-        const bool want_square = color_count && !blend_mode && !(z_write || stencil);
+        const bool want_square = color_count && !blend_mode && !(z_write || stencil_eff);
         raw_state.square_color_mask = want_square ? bs.square_color_mask : 0;
         raw_state.square_alpha_mask = want_square ? bs.square_alpha_mask : 0;
         pl = GetGraphicsPipeline(vs, ps, gs, raw_state, cpu);
@@ -921,7 +911,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         vkCmdSetDepthWriteEnable(cmd, dz[1]);
         vkCmdSetDepthCompareOp(cmd, (VkCompareOp)dz[2]);
         vkCmdSetStencilTestEnable(cmd, dz[3]);
-        vkCmdSetDepthBoundsTestEnable(cmd, dz[4]);
+        if (caps.path == ShaderPath::Objects || caps.depth_bounds) vkCmdSetDepthBoundsTestEnable(cmd, dz[4]);
     }
     if (dz[4]) {
         const float bmin = std::clamp(F(ctx[0x008]), 0.0f, 1.0f), bmax = std::clamp(F(ctx[0x009]), bmin, 1.0f);
@@ -1078,7 +1068,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     if (prof >= 2) ProfEnd(prof_draw);
     // The squaring draw repeats every side effect of the first one: only when depth and stencil stay unwritten.
     if (blend_mode) Note("scaled MIN/MAX blend via fragment interlock");
-    else if (color_count && bs.square && (z_write || stencil)) Note("scaled MIN/MAX blend not squared (depth/stencil write)");
+    else if (color_count && bs.square && (z_write || stencil_eff)) Note("scaled MIN/MAX blend not squared (depth/stencil write)");
     else if (color_count && bs.square) {
         if (caps.path == ShaderPath::Objects || (SetBlendEnable && SetBlendEquation)) {
             changed_n(dyn.blend, bs.square_blend, color_count), changed_n(dyn.eq, bs.square_eq, color_count);

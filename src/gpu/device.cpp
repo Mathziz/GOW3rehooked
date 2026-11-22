@@ -187,9 +187,10 @@ void Initialize(SDL_Window* window) {
     Log(std::format("Vulkan device: {} ({} {}); extensions:{}", properties.properties.deviceName, driver.driverName, driver.driverInfo, requested));
     Check(created, "Create Vulkan device");
     Log(std::format(
-        "Vulkan shader path: {}{} (cache_control {} m5 {} fast_link {} unrestricted_topo {} | eds3: neg_one {} clamp {} samples {} a2c {} blend_en {} blend_eq {} mask {})",
+        "Vulkan shader path: {}{} (cache_control {} m5 {} fast_link {} unrestricted_topo {} depth_bounds {} storage_read_nofmt {} | eds3: neg_one {} clamp {} samples {} a2c {} blend_en {} blend_eq {} mask {})",
         Gpu::ShaderPathName(caps.path), caps.forced ? " [GOW3_SHADER_PATH]" : " [auto]", caps.cache_control, caps.maintenance5,
-        caps.gpl_fast_link, caps.unrestricted_topology, caps.depth_clip_negative_one_to_one, caps.depth_clamp_enable,
+        caps.gpl_fast_link, caps.unrestricted_topology, caps.depth_bounds, caps.storage_image_read_without_format,
+        caps.depth_clip_negative_one_to_one, caps.depth_clamp_enable,
         caps.rasterization_samples, caps.alpha_to_coverage_enable, caps.color_blend_enable, caps.color_blend_equation, caps.color_write_mask));
     Log(std::format("Vulkan Unified Image Layouts: {}", unified_layouts ? "supported and enabled" : "not supported (disabled)"));
     vkGetDeviceQueue(context.device, context.family, 0, &context.queue);
@@ -264,6 +265,8 @@ DynamicCaps QueryDynamicCaps(VkPhysicalDevice pd, std::span<const VkExtensionPro
     VkPhysicalDeviceFeatures2 f2_q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13_q};
     vkGetPhysicalDeviceFeatures2(pd, &f2_q);
     c.cache_control = f13_q.pipelineCreationCacheControl != VK_FALSE;
+    c.depth_bounds = f2_q.features.depthBounds != VK_FALSE;
+    c.storage_image_read_without_format = f2_q.features.shaderStorageImageReadWithoutFormat != VK_FALSE;
     c.maintenance5 = SupportsMaintenance5(pd, available);
 
     const bool has_objects = SupportsShaderObject(pd, available);
@@ -453,8 +456,10 @@ VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* con
     auto& f = f2.features;
     f.shaderInt16 = VK_TRUE;
     f.geometryShader = f.sparseBinding = f.sparseResidencyBuffer = f.shaderInt64 = f.independentBlend = f.dualSrcBlend = VK_TRUE;
-    f.samplerAnisotropy = f.imageCubeArray = f.fragmentStoresAndAtomics = f.vertexPipelineStoresAndAtomics = f.depthClamp = f.depthBounds = VK_TRUE;
-    f.shaderStorageImageReadWithoutFormat = f.shaderStorageImageWriteWithoutFormat = f.shaderStorageImageExtendedFormats = f.depthBiasClamp = f.logicOp = VK_TRUE;
+    f.samplerAnisotropy = f.imageCubeArray = f.fragmentStoresAndAtomics = f.vertexPipelineStoresAndAtomics = f.depthClamp = VK_TRUE;
+    f.depthBounds = dc.depth_bounds ? VK_TRUE : VK_FALSE;
+    f.shaderStorageImageReadWithoutFormat = dc.storage_image_read_without_format ? VK_TRUE : VK_FALSE;
+    f.shaderStorageImageWriteWithoutFormat = f.shaderStorageImageExtendedFormats = f.depthBiasClamp = f.logicOp = VK_TRUE;
     f.pipelineStatisticsQuery = f.occlusionQueryPrecise = VK_TRUE;
     const float prio[2]{1.0f, 1.0f};
     const auto fp = QueueFamilies(pd);
@@ -692,8 +697,9 @@ void Renderer::Impl::TempDeviceReport(std::span<const VkQueueFamilyProperties> f
     for (const auto& x : ext) s += std::format(" {}", x.extensionName + (std::strncmp(x.extensionName, "VK_", 3) ? 0 : 3));
     Report(std::format("Extensions ({}), fragment interlock used {}, sized index binding {}:{}", ext.size(), blend_interlock, BindIndex2 != nullptr, s));
     Report(std::format(
-        "ShaderPath: {} (forced {}), cache_control {}, gpl_fast_link {}, unrestricted_topology {}, eds3[neg1to1 {} clamp {} samples {} a2c {} blend_en {} blend_eq {} mask {}]",
+        "ShaderPath: {} (forced {}), cache_control {}, gpl_fast_link {}, unrestricted_topology {}, depth_bounds {}, storage_read_nofmt {}, eds3[neg1to1 {} clamp {} samples {} a2c {} blend_en {} blend_eq {} mask {}]",
         ShaderPathName(caps.path), caps.forced, caps.cache_control, caps.gpl_fast_link, caps.unrestricted_topology,
+        caps.depth_bounds, caps.storage_image_read_without_format,
         caps.depth_clip_negative_one_to_one, caps.depth_clamp_enable, caps.rasterization_samples,
         caps.alpha_to_coverage_enable, caps.color_blend_enable, caps.color_blend_equation, caps.color_write_mask));
 }

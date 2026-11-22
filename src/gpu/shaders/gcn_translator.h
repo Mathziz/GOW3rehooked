@@ -73,6 +73,7 @@ struct Input {
     std::uint32_t probe_pc = ~0u;  // registers stored after this instruction instead of at the position export
     bool boom = false;  // VS counts exploded positions (first index, its loads, gl_Position) at res[slots..+1] (live)
     bool rect = false;  // VS expands a 3-vertex DI_PT_RECTLIST into a 4-vertex triangle strip: each vertex runs the program for the three corners
+    bool no_storage_read_nofmt = false;  // GPU lacks shaderStorageImageReadWithoutFormat: keep image_load on Texture (OpImageFetch) instead of merging into Storage
 };
 
 // Per slot, from the descriptor at draw time (part of the translation key).

@@ -33,6 +33,8 @@ struct DynamicCaps {
     bool color_blend_enable = false;
     bool color_blend_equation = false;
     bool color_write_mask = false;
+    bool depth_bounds = false;                       // VkPhysicalDeviceFeatures::depthBounds
+    bool storage_image_read_without_format = false;  // VkPhysicalDeviceFeatures::shaderStorageImageReadWithoutFormat
 };
 
 // Always-active runtime override from GOW3_SHADER_PATH (independent of GOW3_DEBUG).

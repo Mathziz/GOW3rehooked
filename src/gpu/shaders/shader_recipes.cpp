@@ -21,7 +21,8 @@ static_assert(sizeof(RecipeHead) == 200);
 Gcn::Input Recipe::Input() const {
     Gcn::Input in;
     in.stage = Gcn::Stage(h.stage), in.rsrc1 = h.rsrc1, in.rsrc2 = h.rsrc2, in.rect = h.rect;
-    in.blend_interlock = h.reserved;
+    in.blend_interlock = h.reserved & 0xFFFFu;
+    in.no_storage_read_nofmt = (h.reserved >> 16 & 1) != 0;
     in.ps_input_ena = h.ps_input_ena, in.ps_input_addr = h.ps_input_addr, in.col_format = h.col_format;
     std::memcpy(in.ps_input_cntl, h.cntl, sizeof(h.cntl)), std::memcpy(in.threads, h.threads, sizeof(h.threads));
     std::memcpy(in.mrt_class, h.mrt_class, 8), std::memcpy(in.mrt_map, h.mrt_map, 8);
@@ -49,7 +50,7 @@ Recipe Recipe::From(const Gcn::Input& in, std::uint64_t code_hash, std::uint64_t
     std::memcpy(h.cntl, in.ps_input_cntl, sizeof(h.cntl)), std::memcpy(h.threads, in.threads, sizeof(h.threads));
     std::memcpy(h.mrt_class, in.mrt_class, 8), std::memcpy(h.mrt_map, in.mrt_map, 8);
     h.nspec = std::uint16_t(spec.size()), h.stage = std::uint8_t(in.stage), h.rect = in.rect;
-    h.reserved = in.blend_interlock;
+    h.reserved = (in.blend_interlock & 0xFFFFu) | (in.no_storage_read_nofmt ? (1u << 16) : 0u);
     for (const Gcn::SlotSpec& s : spec) r.spec.push_back(Gcn::Pack(s));
     return r;
 }

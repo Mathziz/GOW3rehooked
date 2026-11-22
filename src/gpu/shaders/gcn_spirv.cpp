@@ -73,6 +73,7 @@ struct Gen : Ops {
     std::map<u32, Id> image_sizes;
     const Id pInU = Ptr(spv::StorageClassInput, tU32);
     Id gTex[6][3]{}, gImg[3][3]{};
+    bool storage_read[3][3]{};
     std::map<u32, Id> gOut, gParam, gAttr;
     std::map<u32, u32> attrs;  // PS attribute -> interpolation qualifier (1 sample, 2 centroid, 4 noperspective, 8 flat), decorated at the end
     bool samplers = false, depth_out = false;
@@ -443,7 +444,7 @@ struct Gen : Ops {
             g = b.Global(Ptr(spv::StorageClassUniformConstant, arr), spv::StorageClassUniformConstant);
             b.Decorate(g, spv::DecorationDescriptorSet, {0}), b.Decorate(g, spv::DecorationBinding, {u32(storage ? kStorageBinding + kind * 3 + cls : kind * 3 + cls)});
             b.Capability(spv::CapabilityRuntimeDescriptorArray);
-            if (storage) b.Capability(spv::CapabilityStorageImageReadWithoutFormat), b.Capability(spv::CapabilityStorageImageWriteWithoutFormat);
+            if (storage) b.Capability(spv::CapabilityStorageImageWriteWithoutFormat);
         }
         return g;
     }
@@ -1267,7 +1268,11 @@ void Gen::Mimg(const Inst& i) {
         if (t.dim == Dim::Cube) return Fail("image_load on a cube");
         const Id c = icoords();
         Id e;
-        if (storage) e = R(spv::OpImageRead, vec4t, img, c);
+        if (storage) {
+            storage_read[kind][cls] = true;
+            b.Capability(spv::CapabilityStorageImageReadWithoutFormat);
+            e = R(spv::OpImageRead, vec4t, img, c);
+        }
         else if (t.dim == Dim::D2Ms || t.dim == Dim::D2MsArray) {
             e = R(spv::OpImageFetch, vec4t, img, c, 0x40u, ia());
             if (i.pc == depth_resolve.load_pc) {
@@ -1942,6 +1947,9 @@ bool Gen::Run(std::vector<u32>& words, u64& out_mask) {
     if (b.Open()) b.Return();
 
     // Module: capabilities and modes of the stage, interpolation qualifiers of the inputs.
+    for (int k = 0; k < 3; ++k)
+        for (int c = 0; c < 3; ++c)
+            if (gImg[k][c].v && !storage_read[k][c]) b.Decorate(gImg[k][c], spv::DecorationNonReadable);
     b.Capability(spv::CapabilitySignedZeroInfNanPreserve);  // GCN floats keep inf, NaN and -0 (GOW3 multiplies by +inf literals)
     b.Mode(spv::ExecutionModeSignedZeroInfNanPreserve, {32});
     spv::ExecutionModel model = spv::ExecutionModelVertex;

@@ -49,11 +49,12 @@ constexpr u32 kKeptMagic = 0x43433347, kKeptFormat = 1;  // "G3CC"; kKeptFormat:
 struct KeptHead { u32 magic, format; u64 stamp; u32 count, reserved; };
 struct KeptFixed { RecipeHead h; u64 key, code_start, fetch_start; u32 file, paths, code_size, fetch_size, fetch_words, reserved; };
 
-u64 KeptStamp(u64 files_stamp) {
+u64 KeptStamp(u64 files_stamp, bool no_storage_read_nofmt) {
     std::error_code ec;
     const auto module = Gow3::ExecutableDirectory() / Gow3::ExecutableName;  // a new build derives the contract differently
     const u64 parts[]{files_stamp, Aot::sample_log2, std::filesystem::file_size(module, ec), u64(std::filesystem::last_write_time(module, ec).time_since_epoch().count()), kKeptFormat};
-    return PieceHash::Stable64(parts, sizeof(parts));
+    const u64 h = PieceHash::Stable64(parts, sizeof(parts));
+    return no_storage_read_nofmt ? (h ^ 0x53544F524E4F5244ull) : h;
 }
 
 bool LoadKept(const std::filesystem::path& path, u64 stamp, std::vector<Kept>& out) {
@@ -167,6 +168,7 @@ void Renderer::Impl::AotBuild() {
     const std::vector<Recipe> recipes = Recipes::Instance().All();
     const auto t0 = std::chrono::steady_clock::now();
     const auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    const bool no_srnf = !caps.storage_image_read_without_format;
     const auto pending_of = [&](u64 key) {
         return !cache.Contains(key) || (caps.path == ShaderPath::Objects && !cache.ContainsBinary(BinaryKey(cache.ContentOf(key))));
     };
@@ -211,7 +213,7 @@ void Renderer::Impl::AotBuild() {
         std::vector<std::vector<ShaderCache::Hot>> hot(index.files.size());
         std::vector<u32> files;
         for (const Recipe& r : recipes) {
-            if (rect_variant(r)) continue;
+            if (rect_variant(r) || ((r.h.reserved >> 16 & 1) != 0) != no_srnf) continue;
             const u64 key = r.Key();
             files.clear();
             if (caps.path == ShaderPath::Objects) {
@@ -363,9 +365,10 @@ void Renderer::Impl::AotBuild() {
     std::vector<Job> jobs;
     std::vector<u64> compute_keys;
     for (const Recipe& r : recipes) {
+        if (((r.h.reserved >> 16 & 1) != 0) != no_srnf) continue;
         const u64 key = r.Key();
         if (r.h.stage == u8(Gcn::Stage::Compute)) compute_keys.push_back(key);
-        if (!rect_variant(r) && (!r.h.reserved || blend_interlock) && pending_of(key)) jobs.push_back({r, key, cache.Contains(key), nullptr, {}});
+        if (!rect_variant(r) && (!(r.h.reserved & 0xFFFFu) || blend_interlock) && pending_of(key)) jobs.push_back({r, key, cache.Contains(key), nullptr, {}});
     }
     for (Job& job : jobs) place(job);
     // Grouped by WAD (each by its first file, in the order the runs met them): the file keeps what a WAD's runs used together.
@@ -390,7 +393,7 @@ void Renderer::Impl::AotBuild() {
     const bool need_pl = caps.path != ShaderPath::Objects;
     const auto kept_path = cache.Directory() / (PieceHash::UsesAes() ? "contract-hash2-aes.cache" : "contract-hash2-xxh.cache");
     const auto kept_pl_path = cache.Directory() / (PieceHash::UsesAes() ? "pipeline-contract-hash2-aes.cache" : "pipeline-contract-hash2-xxh.cache");
-    const u64 kept_stamp = KeptStamp(index.stamp);
+    const u64 kept_stamp = KeptStamp(index.stamp, no_srnf);
     std::vector<Kept> kept;
     std::vector<ContractedPipeline> kept_pipelines;
     std::deque<Parser::Program> kept_code;  // where the code of the variants read from the file lies, for their jobs

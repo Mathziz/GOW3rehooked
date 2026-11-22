@@ -324,7 +324,8 @@ Analysis Analyze(const Input& in) {
     auto slot = [&](SlotKind kind, const Path& path) {
         for (size_t k = 0; k < a.slots.size(); ++k) {
             auto& s = a.slots[k];
-            if (!(s.path == path) || (s.kind == SlotKind::Sampler) != (kind == SlotKind::Sampler)) continue;
+            if (!(s.path == path)) continue;
+            if (in.no_storage_read_nofmt ? s.kind != kind : (s.kind == SlotKind::Sampler) != (kind == SlotKind::Sampler)) continue;
             if (kind == SlotKind::Storage) s.kind = kind;
             return s16(k);
         }

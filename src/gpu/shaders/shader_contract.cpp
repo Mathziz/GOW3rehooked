@@ -461,6 +461,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                             cur.fetch_hash = cur.fetch.empty() ? 0 : ::Gpu::PieceHash::ShaderCode(cur.fetch.data(), cur.fetch.size() * 4);
                             Gcn::Input a;
                             a.stage = stage, a.code = cur.code, a.fetch = cur.fetch, a.rsrc1 = rsrc1, a.rsrc2 = rsrc2;
+                            a.no_storage_read_nofmt = !caps.storage_image_read_without_format;
                             cur.an = Gcn::Analyze(a);
                             if (!cur.an.error.empty()) throw std::runtime_error("Analysis: " + cur.an.error);
                         } catch (const std::exception& error) {
@@ -470,6 +471,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                         Prepared p;
                         Gcn::Input& in = p.in;
                         in.stage = stage, in.code = cur.code, in.fetch = cur.fetch, in.rsrc1 = rsrc1, in.rsrc2 = rsrc2;
+                        in.no_storage_read_nofmt = !caps.storage_image_read_without_format;
                         if (stage == Gcn::Stage::Vertex) {
                             in.rect = job.rect;
                         } else if (stage == Gcn::Stage::Pixel) {

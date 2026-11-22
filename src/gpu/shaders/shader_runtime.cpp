@@ -363,6 +363,7 @@ bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const
     in.stage = stage, in.code = code, in.fetch = fetch, in.rsrc1 = rsrc1, in.rsrc2 = rsrc2, in.probe = stats.trace && stage == Gcn::Stage::Vertex;
     in.boom = boom_on && !in.probe && stage == Gcn::Stage::Vertex;
     in.rect = rect && stage == Gcn::Stage::Vertex;
+    in.no_storage_read_nofmt = !caps.storage_image_read_without_format;
     static const char* probe_pc = DebugOption("GOW3_PROBE_PC");  // e.g. 100017: after the fetch
     if (in.probe && probe_pc) in.probe_pc = (u32)std::strtoul(probe_pc, nullptr, 16);
     p.pkey = ProgramKey(stage, pm.hash, fetch_hash, rsrc2, in.probe, in.boom);
@@ -463,6 +464,7 @@ u64 TranslationKey(u64 program_key, const Gcn::Input& in, std::span<const Gcn::S
         key = ::Gpu::PieceHash::ShaderKey(in.ps_input_cntl, sizeof(in.ps_input_cntl),
                                    ::Gpu::PieceHash::ShaderKey(&in.mrt_class, 16, key ^ in.ps_input_ena ^ (u64)in.ps_input_addr << 32 ^ in.col_format));
     if (in.blend_interlock) key = ::Gpu::PieceHash::ShaderKey(&in.blend_interlock, sizeof(in.blend_interlock), key);
+    if (in.no_storage_read_nofmt) key ^= 0x53544F524E4F5244ull;
     return key;
 }
 
@@ -695,8 +697,6 @@ std::vector<VkDynamicState> Renderer::Impl::BuildDynamicStates() const {
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
-        VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
-        VK_DYNAMIC_STATE_DEPTH_BOUNDS,
         VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
         VK_DYNAMIC_STATE_STENCIL_OP,
         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
@@ -704,6 +704,10 @@ std::vector<VkDynamicState> Renderer::Impl::BuildDynamicStates() const {
         VK_DYNAMIC_STATE_STENCIL_REFERENCE,
         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
     };
+    if (caps.depth_bounds) {
+        list.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE);
+        list.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
+    }
     if (caps.depth_clip_negative_one_to_one) list.push_back(VK_DYNAMIC_STATE_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT);
     if (caps.depth_clamp_enable) list.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
     if (caps.rasterization_samples) list.push_back(VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
@@ -807,7 +811,6 @@ CompiledPipeline Renderer::Impl::CreateMonolithicPipeline(const ShaderRef& vs, c
             return {};
         }
     }
-    pl.is_lto = true;
     return pl;
 }
 
@@ -886,14 +889,16 @@ VkPipeline Renderer::Impl::CreateGplFragShader(VkShaderModule ps_mod, u32 sample
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
-        VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
-        VK_DYNAMIC_STATE_DEPTH_BOUNDS,
         VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
         VK_DYNAMIC_STATE_STENCIL_OP,
         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
         VK_DYNAMIC_STATE_STENCIL_REFERENCE,
     };
+    if (caps.depth_bounds) {
+        dyns.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE);
+        dyns.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
+    }
     if (caps.rasterization_samples) dyns.push_back(VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
     VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, u32(dyns.size()), dyns.data()};
     VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -1083,7 +1088,6 @@ CompiledPipeline Renderer::Impl::LinkGplPair(const VkPipeline (&main_libs)[4], V
             return {};
         }
     }
-    pl.is_lto = lto;
     return pl;
 }
 
@@ -1113,44 +1117,13 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
             CompiledPipeline pl = LinkGplPair(libs, foi_sq, true, true);
             if (!pl.main) pl = LinkGplPair(libs, foi_sq, false, false);
             if (pl.main) {
-                bool queue_lto = false;
-                CompiledPipeline ret{};
-                {
-                    std::unique_lock lock(prog_lock);
-                    auto [it, inserted] = pipelines.try_emplace(h, pl);
-                    if (!inserted) {
-                        vkDestroyPipeline(dev, pl.main, nullptr);
-                        if (pl.square) vkDestroyPipeline(dev, pl.square, nullptr);
-                    }
-                    ret = it->second;
-                    if (!ret.is_lto && !stats.trace) queue_lto = gpl_lto_queued.insert(h).second;
+                std::unique_lock lock(prog_lock);
+                auto [it, inserted] = pipelines.try_emplace(h, pl);
+                if (!inserted) {
+                    vkDestroyPipeline(dev, pl.main, nullptr);
+                    if (pl.square) vkDestroyPipeline(dev, pl.square, nullptr);
                 }
-                if (queue_lto) {
-                    Queue([this, h, vi, prerast, fs, foi, foi_sq] {
-                        const VkPipeline lto_libs[4]{vi, prerast, fs, foi};
-                        const CompiledPipeline lto = LinkGplPair(lto_libs, foi_sq, true, false);
-                        if (!lto.main) return;
-                        CompiledPipeline old{};
-                        bool used = false;
-                        {
-                            std::unique_lock lock(prog_lock);
-                            if (auto it = pipelines.find(h); it != pipelines.end() && !it->second.is_lto) {
-                                old = it->second;
-                                it->second = lto;
-                                std::atomic_ref(pipeline_epoch).fetch_add(1, std::memory_order_release);
-                                used = true;
-                            }
-                        }
-                        if (used) {
-                            RetirePipeline(old.main);
-                            RetirePipeline(old.square);
-                        } else {
-                            vkDestroyPipeline(dev, lto.main, nullptr);
-                            if (lto.square) vkDestroyPipeline(dev, lto.square, nullptr);
-                        }
-                    }, 1);
-                }
-                return pm[h] = ret;
+                return pm[h] = it->second;
             }
         }
     }

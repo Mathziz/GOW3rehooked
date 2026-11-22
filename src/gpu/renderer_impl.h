@@ -555,21 +555,13 @@ struct Renderer::Impl {
         std::vector<VkImageView> views;
         std::vector<Tex> own;
         std::vector<std::shared_ptr<Tex>> shared;  // the last owner's deleter destroys the surface's image
-        std::vector<VkPipeline> pipelines;
-        bool empty() const { return views.empty() && own.empty() && shared.empty() && pipelines.empty(); }
+        bool empty() const { return views.empty() && own.empty() && shared.empty(); }
         void Append(Graves& o) {
             views.insert(views.end(), o.views.begin(), o.views.end()), own.insert(own.end(), o.own.begin(), o.own.end());
             shared.insert(shared.end(), std::make_move_iterator(o.shared.begin()), std::make_move_iterator(o.shared.end()));
-            pipelines.insert(pipelines.end(), o.pipelines.begin(), o.pipelines.end()), o = {};
+            o = {};
         }
     } graves, dying;
-    std::mutex retired_pl_lock;
-    std::vector<VkPipeline> retired_pipelines;  // safe cross-thread retirement (drained by Reap)
-    void RetirePipeline(VkPipeline p) {
-        if (!p) return;
-        std::scoped_lock lock(retired_pl_lock);
-        retired_pipelines.push_back(p);
-    }
     std::future<void> reaping;
     std::atomic<u32> reaped{0};        // objects destroyed (frame recorder)
     std::atomic<u64> reap_max_ns{0};   // the longest of them
@@ -688,7 +680,6 @@ struct Renderer::Impl {
     struct Memo {
         const Impl* owner = nullptr;
         u64 epoch = ~0ull;
-        u64 pipeline_epoch = ~0ull;
         Flat<MemoTarget> targets;
         Flat<u32> samplers;
         Flat<MemoTex> tex;                       // T# hash + binding
@@ -698,13 +689,10 @@ struct Renderer::Impl {
     };
     static thread_local Memo memo;
     u64 epoch = 0;
-    u64 pipeline_epoch = 0;
     Memo& Memos() {
         if (memo.owner != this) memo = {}, memo.owner = this;
         if (const u64 e = std::atomic_ref(epoch).load(std::memory_order_acquire); memo.epoch != e)
             memo.tex.clear(), memo.targets.clear(), memo.epoch = e;
-        if (const u64 pe = std::atomic_ref(pipeline_epoch).load(std::memory_order_acquire); memo.pipeline_epoch != pe)
-            memo.pipelines.clear(), memo.pipeline_epoch = pe;
         return memo;
     }
     static inline thread_local bool table_ps = false;  // the table being built is a pixel shader's
@@ -743,12 +731,11 @@ struct Renderer::Impl {
     std::atomic<u32> pipeline_cache_dirty{0};
     std::mutex pipeline_cache_save_lock;
     std::unordered_map<u64, CompiledPipeline> pipelines;   // GraphicsPipelineKey::Hash() -> main/square VkPipeline (under prog_lock)
-    // Tier 2 (Gpl): 4-part Graphics Pipeline Library caches + LTO upgrade dedup set (under prog_lock).
+    // Tier 2 (Gpl): 4-part Graphics Pipeline Library caches (under prog_lock).
     VkPipeline gpl_vi[3]{};                              // Vertex Input Interface: POINT_LIST, LINE_LIST, TRIANGLE_LIST
     std::unordered_map<u64, VkPipeline> gpl_prerast;     // Pre-Rasterization library cache (VS+GS or non-default static flags)
     std::unordered_map<u64, VkPipeline> gpl_frag_msaa;   // Fragment Shader library cache when samples > 1 or static alphaToCoverageEnable is active
     std::unordered_map<u64, VkPipeline> gpl_foi;         // Fragment Output Interface library cache
-    std::unordered_set<u64> gpl_lto_queued;              // GraphicsPipelineKey hashes already queued for background LTO
     // A program's translation input and key under the current registers (no GPU work).
     struct Prepared {
         Gcn::Input in;

@@ -145,7 +145,6 @@ struct GraphicsPipelineKey {
 struct CompiledPipeline {
     VkPipeline main = VK_NULL_HANDLE;
     VkPipeline square = VK_NULL_HANDLE;  // coupled second-pass pipeline for scaled MIN/MAX squared blend
-    bool is_lto = false;
 };
 // Key of a program: its code, the fetch shader it calls and the stage state its translation depends on besides the draw's.
 u64 ProgramKey(Gcn::Stage stage, u64 code_hash, u64 fetch_hash, u32 rsrc2, bool probe, bool boom);
