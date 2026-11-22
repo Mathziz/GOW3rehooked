@@ -13,16 +13,21 @@ namespace Gpu {
 
 // ---- Buffers and sparse guest mirror ----
 
-// Device-local, unless the GPU is integrated and that heap's budget is spent: then the largest heap with room, the same RAM
-// (no PCIe in between). Write-combined over host-cached, which the GPU snoops.
+// Device-local while its budget permits; on a low-VRAM discrete GPU, move compatible allocations
+// into a host-visible heap when necessary (slower over PCIe, but avoids immediate VRAM exhaustion).
 u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size) {
     const u32 local = Type(bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!uma_budget || local == ~0u) return local;
+    if (!memory_budget || local == ~0u) return local;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
     vkGetPhysicalDeviceMemoryProperties2(pd, &query);
-    // An eighth of the heap stays free for the driver and the presenter.
-    const auto room = [&](u32 h) { return budget.heapUsage[h] + size + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]; };
+    // Leave headroom for the driver, render targets and presentation, without overflowing arithmetic.
+    const auto room = [&](u32 h) {
+        const VkDeviceSize reserve = std::min<VkDeviceSize>(mem.memoryHeaps[h].size / 8, 256ull << 20);
+        return budget.heapUsage[h] <= budget.heapBudget[h] &&
+               size <= budget.heapBudget[h] - budget.heapUsage[h] &&
+               reserve <= budget.heapBudget[h] - budget.heapUsage[h] - size;
+    };
     const u32 heap = mem.memoryTypes[local].heapIndex;
     if (room(heap)) return local;
     constexpr VkMemoryPropertyFlags kAvoid = VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT |
@@ -30,7 +35,8 @@ u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size) {
     u32 best = ~0u;
     for (u32 i = 0; i < mem.memoryTypeCount; ++i) {
         const auto& t = mem.memoryTypes[i];
-        if (bits >> i & 1 && t.heapIndex != heap && !(t.propertyFlags & kAvoid) && room(t.heapIndex) &&
+        if (bits >> i & 1 && t.heapIndex != heap && (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            !(t.propertyFlags & kAvoid) && room(t.heapIndex) &&
             (best == ~0u || mem.memoryHeaps[t.heapIndex].size > mem.memoryHeaps[mem.memoryTypes[best].heapIndex].size))
             best = i;
     }
@@ -107,6 +113,12 @@ bool Renderer::Impl::SetupMirror(std::string& error) {
     VkMemoryRequirements mr;
     vkGetBufferMemoryRequirements(dev, mirror, &mr);
     page = mr.alignment, mirror_bits = mr.memoryTypeBits;
+    if (const u32 local = Type(mirror_bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); local != ~0u &&
+        mem.memoryHeaps[mem.memoryTypes[local].heapIndex].size <= (3ull << 30)) {
+        chunk_capacity = std::max<u64>(page, 64ull << 20);
+        chunk_used = chunk_capacity;
+        Gow3::Log(std::format("Renderer: low-VRAM GPU; using {} MiB guest mirror chunks", chunk_capacity >> 20));
+    }
     bound.assign(mirror_size / page / 64 + 1, 0);
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, mirror};
     mirror_addr = vkGetBufferDeviceAddress(dev, &bai);
@@ -159,18 +171,37 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
         const u64 bit = 1ull << (p / page % 64);
         if (word & bit) continue;
         word |= bit;
-        if (chunk_used + page > kChunk) {
+        if (chunk_used + page > chunk_capacity) {
             VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, kChunk, DeviceType(mirror_bits, kChunk)};
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, chunk_capacity, DeviceType(mirror_bits, chunk_capacity)};
             VkDeviceMemory m = VK_NULL_HANDLE;
-            if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS) {
-                word &= ~bit;  // the rest stays without memory (reads zero); the next write there tries again
+            VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m);
+            // Memory budget data may lag behind the driver's actual allocations. On VRAM exhaustion,
+            // retry a compatible host-visible memory type on a different heap.
+            if (e == VK_ERROR_OUT_OF_DEVICE_MEMORY || e == VK_ERROR_OUT_OF_HOST_MEMORY) {
+                const u32 previous_type = ai.memoryTypeIndex;
+                const u32 previous_heap = previous_type < mem.memoryTypeCount ? mem.memoryTypes[previous_type].heapIndex : ~0u;
+                for (u32 type = 0; type < mem.memoryTypeCount; ++type) {
+                    if (!(mirror_bits >> type & 1) || type == previous_type ||
+                        mem.memoryTypes[type].heapIndex == previous_heap ||
+                        !(mem.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+                    ai.memoryTypeIndex = type;
+                    e = vkAllocateMemory(dev, &ai, nullptr, &m);
+                    if (e == VK_SUCCESS) {
+                        if (!spilled.exchange(true))
+                            Gow3::Log(std::format("Renderer: guest mirror allocation moved to system memory type {} after VRAM allocation failure", type));
+                        break;
+                    }
+                }
+            }
+            if (e != VK_SUCCESS) {
+                word &= ~bit;  // report below; page remains unbound
                 if (!chunk_failed)
-                    chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror (type {}, {} MB held)", (int)e,
+                    chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror (last type {}, {} MB held)", (int)e,
                                                                (int)ai.memoryTypeIndex, mirror_chunks.load() >> 20));
                 break;
             }
-            chunks.push_back(m), chunk_used = 0, mirror_chunks += kChunk;
+            chunks.push_back(m), chunk_used = 0, mirror_chunks += chunk_capacity;
         }
         if (!pending_binds.empty() && pending_binds.back().resourceOffset + pending_binds.back().size == p &&
             pending_binds.back().memory == chunks.back() &&

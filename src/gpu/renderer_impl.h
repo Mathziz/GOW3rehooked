@@ -138,9 +138,9 @@ struct Renderer::Impl {
     std::mutex* queue_lock = &own_queue_lock;  // every queue operation, shared with the presenter when live
 
     VkPhysicalDeviceMemoryProperties mem{};
-    // Integrated GPU with VK_EXT_memory_budget: its device-local heap is a carve-out of the same RAM (1 GiB by default on the
-    // Steam Deck), so DeviceType takes the largest heap once that budget is spent.
-    bool uma_budget = false;
+    // VK_EXT_memory_budget is useful on both integrated and discrete GPUs. When the local heap is at its
+    // budget, guest mirror chunks may live in a compatible host-visible heap instead of exhausting VRAM.
+    bool memory_budget = false;
     std::atomic<bool> spilled{false};
     // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp
     // buffer. Mesa 26.0 RADV read zeros from it in buffer-to-image copies past 4 GB (issue #24: green video, black frame);
@@ -309,7 +309,7 @@ struct Renderer::Impl {
     u64 page = 0;
     u32 mirror_bits = 0;  // memory types its chunks may have (DeviceType picks one per chunk)
     std::vector<VkDeviceMemory> chunks;
-    u64 chunk_used = kChunk;
+    u64 chunk_capacity = kChunk, chunk_used = kChunk;  // smaller allocations on low-VRAM GPUs
     bool chunk_failed = false;  // a chunk allocation failed (logged once)
     std::vector<u64> bound;  // bitmap of mirror pages with memory
     std::vector<VkSparseMemoryBind> pending_binds;
