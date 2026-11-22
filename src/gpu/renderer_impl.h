@@ -34,6 +34,7 @@
 #include <windows.h>
 #endif
 #include "orbis/common/thread.h"
+#include "gpu/device.h"
 #include "gpu/hazards.h"
 #include "gpu/vk_gpu.h"
 #include "gpu/shaders/gcn_translator.h"
@@ -130,6 +131,7 @@ struct Renderer::Impl {
     float anisotropy = 0;
     float motion_blur_rate = 1;
     bool blend_interlock = false;
+    DynamicCaps caps{};
     VkDevice dev = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     u32 family = 0;

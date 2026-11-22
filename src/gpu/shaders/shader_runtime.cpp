@@ -27,8 +27,10 @@ void main() {
 }
 )", shaderc_vertex_shader, error);
     if (clear_rect_spirv.empty()) return false;
-    clear_rect_vs = Create(clear_rect_spirv, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT);
-    if (!clear_rect_vs) return error = "SDK clear vertex shader creation failed", false;
+    if (caps.path == ShaderPath::Objects) {
+        clear_rect_vs = Create(clear_rect_spirv, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT);
+        if (!clear_rect_vs) return error = "SDK clear vertex shader creation failed", false;
+    }
     return true;
 }
 

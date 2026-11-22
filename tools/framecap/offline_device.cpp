@@ -59,6 +59,7 @@ bool Renderer::Impl::Init(bool validation, std::string& error) {
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, qf.data());
     for (family = 0; family < n && !QueueFamilySuitable(qf[family].queueFlags); ++family) {}
     if (family == n) return error = "no graphics queue with sparse binding", false;
+    if (const auto m = MissingExtensions(pd); !m.empty()) return error = "missing Vulkan extensions:" + m, false;
     if (CreateDevice(pd, family, {}, &dev) != VK_SUCCESS) return error = "vkCreateDevice failed (features)", false;
     vkGetDeviceQueue(dev, family, 0, &queue);
     return Setup(error);

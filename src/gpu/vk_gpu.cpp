@@ -205,13 +205,21 @@ thread_local Renderer::Impl::Memo Renderer::Impl::memo;
 bool Renderer::Impl::Setup(std::string& error) {
     LoadDeviceFunctions();
 
-    {  // a driver binary only loads on the GPU and driver that made it, with the bindless layout it was made against
+    if (caps.path == ShaderPath::Objects) {  // a driver binary only loads on the GPU and driver that made it, with the bindless layout it was made against
         VkPhysicalDeviceShaderObjectPropertiesEXT so{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &so};
         vkGetPhysicalDeviceProperties2(pd, &p2);
         struct { u8 uuid[VK_UUID_SIZE]; u32 version, vendor, device, driver, layout[3]; } id{};
         std::memcpy(id.uuid, so.shaderBinaryUUID, VK_UUID_SIZE);
         id.version = so.shaderBinaryVersion, id.vendor = p2.properties.vendorID, id.device = p2.properties.deviceID, id.driver = p2.properties.driverVersion;
+        id.layout[0] = kTextures, id.layout[1] = kSamplers, id.layout[2] = kStorage;
+        binary_seed = ::Gpu::PieceHash::DriverKey(&id, sizeof(id));
+    } else {
+        VkPhysicalDeviceProperties p{};
+        vkGetPhysicalDeviceProperties(pd, &p);
+        struct { u8 uuid[VK_UUID_SIZE]; u32 path, vendor, device, driver, layout[3]; } id{};
+        std::memcpy(id.uuid, p.pipelineCacheUUID, VK_UUID_SIZE);
+        id.path = u32(caps.path), id.vendor = p.vendorID, id.device = p.deviceID, id.driver = p.driverVersion;
         id.layout[0] = kTextures, id.layout[1] = kSamplers, id.layout[2] = kStorage;
         binary_seed = ::Gpu::PieceHash::DriverKey(&id, sizeof(id));
     }
@@ -291,6 +299,8 @@ bool Renderer::Impl::Setup(std::string& error) {
     if (const VkResult e = vkCreatePipelineLayout(dev, &plci, nullptr, &layout); e != VK_SUCCESS) Report(std::format("vkCreatePipelineLayout {}", (int)e));
     if (!SetupClearRect(error)) return false;
     GOW3_DIAG TempDeviceReport(fp);
+    if (caps.path != ShaderPath::Objects)
+        return error = std::format("Vulkan shader path '{}' is not wired for drawing yet (Stage 2+)", ShaderPathName(caps.path)), false;
     ShaderCache::Instance().prepare = [this](u64 key, u64 binary, u32 stage) { return Prepare(key, binary, stage); };
     if (ShaderCache::Instance().Enabled() && ShaderCache::Instance().Kind() == CacheKind::Aot) AotBuild();  // the game waits for the build
     return true;
@@ -315,13 +325,13 @@ Renderer::~Renderer() {
     for (auto& w : d->recorders)
         for (auto p : w.pool) vkDestroyCommandPool(d->dev, p, nullptr);
     for (auto& [k, f] : d->compiling)
-        if (const VkShaderEXT s = f.get().s) d->DestroyShader(d->dev, s, nullptr);
+        if (const VkShaderEXT s = f.get().s; s && d->DestroyShader) d->DestroyShader(d->dev, s, nullptr);
     d->StopCompilers();
     for (auto& [k, s] : d->shaders)
-        if (s) d->DestroyShader(d->dev, s, nullptr);
+        if (s && d->DestroyShader) d->DestroyShader(d->dev, s, nullptr);
     for (auto& [k, s] : d->rect_gs)
-        if (s) d->DestroyShader(d->dev, s, nullptr);
-    if (d->clear_rect_vs) d->DestroyShader(d->dev, d->clear_rect_vs, nullptr);
+        if (s && d->DestroyShader) d->DestroyShader(d->dev, s, nullptr);
+    if (d->clear_rect_vs && d->DestroyShader) d->DestroyShader(d->dev, d->clear_rect_vs, nullptr);
     if (d->q_stat) vkDestroyQueryPool(d->dev, d->q_stat, nullptr), vkDestroyQueryPool(d->dev, d->q_occ, nullptr);
     d->DestroyTextures();
     for (int k = 0; k < 2; ++k, d->SwapFrame()) {
@@ -333,7 +343,7 @@ Renderer::~Renderer() {
     }
     if (d->copy_pool) vkDestroyCommandPool(d->dev, d->copy_pool, nullptr);
     for (auto* b : {&d->probe_buf, &d->vertex_probe, &d->index_probe}) d->FreeBuffer(*b);
-    if (d->index_probe_vs) d->DestroyShader(d->dev, d->index_probe_vs, nullptr);
+    if (d->index_probe_vs && d->DestroyShader) d->DestroyShader(d->dev, d->index_probe_vs, nullptr);
     d->DestroyMirror();
     vkDestroyPipelineLayout(d->dev, d->layout, nullptr);
     if (d->prof_pool) vkDestroyQueryPool(d->dev, d->prof_pool, nullptr);

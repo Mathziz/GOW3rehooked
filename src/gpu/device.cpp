@@ -2,6 +2,8 @@
 // The Vulkan instance, window surface and device shared by the renderer and the presenter, and the renderer's own device.
 #include "gpu/device.h"
 #include "gpu/renderer_impl.h"
+#include <cctype>
+#include <cstdlib>
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -55,6 +57,10 @@ void Initialize(SDL_Window* window) {
     }
     if (validate || temp_fault || DebugAuto("GOW3_TEMP_LABELS")) instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);  // labels
     u32 count = 0;
+    std::string invalid_shader_path;
+    const auto requested_shader_path = Gpu::RequestedShaderPath(&invalid_shader_path);
+    if (!invalid_shader_path.empty())
+        Log(std::format("Ignoring unrecognized GOW3_SHADER_PATH='{}' (expected auto, objects, gpl, or monolithic)", invalid_shader_path));
 #ifdef _WIN32
     auto has = [](std::span<const VkExtensionProperties> list, const char* name) {
         return std::ranges::any_of(list, [&](const auto& e) { return !std::strcmp(e.extensionName, name); });
@@ -150,8 +156,12 @@ void Initialize(SDL_Window* window) {
             break;
         }
     }
-    if (best < 0 && !lacking.empty())
+    if (best < 0 && !lacking.empty()) {
+        if (requested_shader_path.has_value())
+            throw std::runtime_error(std::format("{} (required because GOW3_SHADER_PATH={} is set). Update the GPU's Vulkan driver or unset GOW3_SHADER_PATH.",
+                                                 lacking, Gpu::ShaderPathName(*requested_shader_path)));
         throw std::runtime_error(lacking + ". Update the GPU's Vulkan driver (on Linux, Mesa 24.1 or newer).");
+    }
 #ifdef __linux__
     if (best < 0 && missing_radeon_maintenance5)
         throw std::runtime_error("Radeon requires VK_KHR_maintenance5. Install or update the Mesa Vulkan driver (RADV).");
@@ -171,10 +181,16 @@ void Initialize(SDL_Window* window) {
     VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
     vkGetPhysicalDeviceProperties2(context.physical, &properties);
     std::string requested;
+    Gpu::DynamicCaps caps{};
     const VkResult created = Gpu::CreateDevice(context.physical, context.family, device_extensions, &context.device, &context.present_wait,
-                                               &context.reflex, &unified_layouts, &requested);
+                                               &context.reflex, &unified_layouts, &requested, &caps);
     Log(std::format("Vulkan device: {} ({} {}); extensions:{}", properties.properties.deviceName, driver.driverName, driver.driverInfo, requested));
     Check(created, "Create Vulkan device");
+    Log(std::format(
+        "Vulkan shader path: {}{} (cache_control {} m5 {} fast_link {} unrestricted_topo {} | eds3: neg_one {} clamp {} samples {} a2c {} blend_en {} blend_eq {} mask {})",
+        Gpu::ShaderPathName(caps.path), caps.forced ? " [GOW3_SHADER_PATH]" : " [auto]", caps.cache_control, caps.maintenance5,
+        caps.gpl_fast_link, caps.unrestricted_topology, caps.depth_clip_negative_one_to_one, caps.depth_clamp_enable,
+        caps.rasterization_samples, caps.alpha_to_coverage_enable, caps.color_blend_enable, caps.color_blend_equation, caps.color_write_mask));
     Log(std::format("Vulkan Unified Image Layouts: {}", unified_layouts ? "supported and enabled" : "not supported (disabled)"));
     vkGetDeviceQueue(context.device, context.family, 0, &context.queue);
 }
@@ -213,14 +229,119 @@ bool SupportsMaintenance5(VkPhysicalDevice pd, std::span<const VkExtensionProper
     return m5.maintenance5;
 }
 
-constexpr const char* kRequiredExtensions[]{VK_EXT_SHADER_OBJECT_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-                                            VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
+constexpr const char* kRequiredExtensions[]{VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+                                            VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
+
+bool SupportsShaderObject(VkPhysicalDevice pd, std::span<const VkExtensionProperties> available) {
+    if (!HasExtension(available, VK_EXT_SHADER_OBJECT_EXTENSION_NAME)) return false;
+    VkPhysicalDeviceShaderObjectFeaturesEXT so{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &so};
+    vkGetPhysicalDeviceFeatures2(pd, &query);
+    return so.shaderObject != VK_FALSE;
+}
+
+bool SupportsGraphicsPipelineLibrary(VkPhysicalDevice pd, std::span<const VkExtensionProperties> available, bool* fast_link = nullptr) {
+    if (fast_link) *fast_link = false;
+    if (!HasExtension(available, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) ||
+        !HasExtension(available, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME))
+        return false;
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &gpl};
+    vkGetPhysicalDeviceFeatures2(pd, &query);
+    if (!gpl.graphicsPipelineLibrary) return false;
+    if (fast_link) {
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props};
+        vkGetPhysicalDeviceProperties2(pd, &p2);
+        *fast_link = props.graphicsPipelineLibraryFastLinking != VK_FALSE;
+    }
+    return true;
+}
+
+DynamicCaps QueryDynamicCaps(VkPhysicalDevice pd, std::span<const VkExtensionProperties> available) {
+    DynamicCaps c{};
+    VkPhysicalDeviceVulkan13Features f13_q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 f2_q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13_q};
+    vkGetPhysicalDeviceFeatures2(pd, &f2_q);
+    c.cache_control = f13_q.pipelineCreationCacheControl != VK_FALSE;
+    c.maintenance5 = SupportsMaintenance5(pd, available);
+
+    const bool has_objects = SupportsShaderObject(pd, available);
+    bool fast_link = false;
+    const bool has_gpl = SupportsGraphicsPipelineLibrary(pd, available, &fast_link);
+
+    if (const auto req = RequestedShaderPath(); req.has_value()) {
+        c.path = *req;
+        c.forced = true;
+    } else {
+        c.forced = false;
+        c.path = has_objects ? ShaderPath::Objects : has_gpl ? ShaderPath::Gpl : ShaderPath::Monolithic;
+    }
+
+    if (c.path == ShaderPath::Objects) {
+        c.gpl_fast_link = false;
+        c.unrestricted_topology = true;
+        c.depth_clip_negative_one_to_one = true;
+        c.depth_clamp_enable = true;
+        c.rasterization_samples = true;
+        c.alpha_to_coverage_enable = true;
+        c.color_blend_enable = true;
+        c.color_blend_equation = true;
+        c.color_write_mask = true;
+    } else {
+        c.gpl_fast_link = (c.path == ShaderPath::Gpl) && fast_link;
+        if (HasExtension(available, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME)) {
+            VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3_q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &eds3_q};
+            vkGetPhysicalDeviceFeatures2(pd, &q2);
+
+            VkPhysicalDeviceExtendedDynamicState3PropertiesEXT eds3_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &eds3_p};
+            vkGetPhysicalDeviceProperties2(pd, &p2);
+
+            c.unrestricted_topology = eds3_p.dynamicPrimitiveTopologyUnrestricted != VK_FALSE;
+            c.depth_clip_negative_one_to_one = eds3_q.extendedDynamicState3DepthClipNegativeOneToOne != VK_FALSE;
+            c.depth_clamp_enable = eds3_q.extendedDynamicState3DepthClampEnable != VK_FALSE;
+            c.rasterization_samples = eds3_q.extendedDynamicState3RasterizationSamples != VK_FALSE;
+            c.alpha_to_coverage_enable = eds3_q.extendedDynamicState3AlphaToCoverageEnable != VK_FALSE;
+            c.color_blend_enable = eds3_q.extendedDynamicState3ColorBlendEnable != VK_FALSE;
+            c.color_blend_equation = eds3_q.extendedDynamicState3ColorBlendEquation != VK_FALSE;
+            c.color_write_mask = eds3_q.extendedDynamicState3ColorWriteMask != VK_FALSE;
+        }
+    }
+    return c;
+}
 
 const auto temp_bind_t0 = std::chrono::steady_clock::now();
 double TempBindMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - temp_bind_t0).count(); }
 } // namespace
 
 // ---- Physical device queries and device creation ----
+
+const char* ShaderPathName(ShaderPath path) {
+    switch (path) {
+    case ShaderPath::Objects: return "objects";
+    case ShaderPath::Gpl: return "gpl";
+    case ShaderPath::Monolithic: return "monolithic";
+    }
+    return "unknown";
+}
+
+std::optional<ShaderPath> RequestedShaderPath(std::string* invalid) {
+    const char* env = std::getenv("GOW3_SHADER_PATH");
+    if (!env || !*env) return std::nullopt;
+    std::string v;
+    for (const char* p = env; *p; ++p)
+        if (!std::isspace(static_cast<unsigned char>(*p))) v.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+    if (v.empty() || v == "auto") return std::nullopt;
+    if (v == "objects" || v == "object" || v == "shader_object") return ShaderPath::Objects;
+    if (v == "gpl" || v == "library") return ShaderPath::Gpl;
+    if (v == "monolithic" || v == "pipeline" || v == "mono") return ShaderPath::Monolithic;
+    if (invalid) *invalid = env;
+    return std::nullopt;
+}
+
+DynamicCaps QueryDynamicCaps(VkPhysicalDevice pd) { return QueryDynamicCaps(pd, DeviceExtensions(pd)); }
 
 bool QueueFamilySuitable(VkQueueFlags flags) {
     const VkQueueFlags want = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_SPARSE_BINDING_BIT;
@@ -251,20 +372,75 @@ std::string MissingExtensions(VkPhysicalDevice pd) {
     std::string missing;
     for (const char* name : kRequiredExtensions)
         if (!HasExtension(available, name)) missing += std::format(" {}", name);
+    if (const auto req = RequestedShaderPath(); req.has_value()) {
+        if (*req == ShaderPath::Objects) {
+            if (!SupportsShaderObject(pd, available)) missing += std::format(" {}", VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+        } else if (*req == ShaderPath::Gpl) {
+            if (!HasExtension(available, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME))
+                missing += std::format(" {}", VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+            if (!HasExtension(available, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+                missing += std::format(" {}", VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+            } else if (HasExtension(available, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && !SupportsGraphicsPipelineLibrary(pd, available)) {
+                missing += std::format(" {}", VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+            }
+        }
+    }
     return missing;
 }
 
 VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* const> extensions, VkDevice* device, bool* present_wait, bool* reflex, bool* unified_layouts,
-                      std::string* requested) {
+                      std::string* requested, DynamicCaps* caps) {
+    const auto available = DeviceExtensions(pd);
+    const DynamicCaps dc = QueryDynamicCaps(pd, available);
+    if (caps) *caps = dc;
+
     VkPhysicalDeviceDepthClipControlFeaturesEXT dcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, nullptr, VK_TRUE};
     VkPhysicalDeviceConditionalRenderingFeaturesEXT cr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT, &dcc, VK_TRUE};  // predication
     const bool temp_stats = DebugDeep("GOW3_TEMP_STATS");  // driver statistics of each program (Compile)
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR temp_pep{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, &cr, VK_TRUE};
-    VkPhysicalDeviceShaderObjectFeaturesEXT so{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT, temp_stats ? (void*)&temp_pep : &cr, VK_TRUE};
-    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &so};
+    void* f13_next = temp_stats ? (void*)&temp_pep : &cr;
+
+    std::vector<const char*> ext(std::begin(kRequiredExtensions), std::end(kRequiredExtensions));
+    VkPhysicalDeviceShaderObjectFeaturesEXT so{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT, nullptr, VK_TRUE};
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, nullptr, VK_TRUE};
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.dynamicRendering = f13.synchronization2 = f13.maintenance4 = f13.shaderDemoteToHelperInvocation = VK_TRUE;
     // A slot that falls back to the 1x1 dummy: its out-of-bounds writes are dropped, not stray.
     f13.robustImageAccess = VK_TRUE;
+
+    if (dc.path == ShaderPath::Objects) {
+        ext.push_back(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+        so.pNext = f13_next;
+        f13_next = &so;
+    } else {
+        if (dc.cache_control) f13.pipelineCreationCacheControl = VK_TRUE;
+        if (dc.path == ShaderPath::Gpl) {
+            ext.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+            ext.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+            gpl.pNext = f13_next;
+            f13_next = &gpl;
+        }
+        const bool any_eds3 = dc.depth_clip_negative_one_to_one || dc.depth_clamp_enable || dc.rasterization_samples ||
+                                dc.alpha_to_coverage_enable || dc.color_blend_enable || dc.color_blend_equation || dc.color_write_mask;
+        if (HasExtension(available, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && (any_eds3 || dc.unrestricted_topology)) {
+            ext.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+            if (any_eds3) {
+                if (dc.depth_clip_negative_one_to_one) eds3.extendedDynamicState3DepthClipNegativeOneToOne = VK_TRUE;
+                if (dc.depth_clamp_enable) eds3.extendedDynamicState3DepthClampEnable = VK_TRUE;
+                if (dc.rasterization_samples) eds3.extendedDynamicState3RasterizationSamples = VK_TRUE;
+                if (dc.alpha_to_coverage_enable) eds3.extendedDynamicState3AlphaToCoverageEnable = VK_TRUE;
+                if (dc.color_blend_enable) eds3.extendedDynamicState3ColorBlendEnable = VK_TRUE;
+                if (dc.color_blend_equation) eds3.extendedDynamicState3ColorBlendEquation = VK_TRUE;
+                if (dc.color_write_mask) eds3.extendedDynamicState3ColorWriteMask = VK_TRUE;
+                eds3.pNext = f13_next;
+                f13_next = &eds3;
+            }
+        }
+    }
+    f13.pNext = f13_next;
+
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
     f12.bufferDeviceAddress = f12.descriptorIndexing = f12.runtimeDescriptorArray = f12.descriptorBindingPartiallyBound = VK_TRUE;
     f12.descriptorBindingSampledImageUpdateAfterBind = f12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
@@ -287,8 +463,6 @@ VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* con
     VkDeviceQueueCreateInfo qci[2]{{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, family, std::min(2u, fp[family].queueCount), prio}};
     u32 queue_infos = 1;
     if (const u32 cf = CopyFamily(fp); cf != ~0u) qci[queue_infos++] = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, cf, std::min(2u, fp[cf].queueCount), prio};
-    std::vector<const char*> ext(std::begin(kRequiredExtensions), std::end(kRequiredExtensions));
-    const auto available = DeviceExtensions(pd);
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
     if (HasExtension(available, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &unified};
@@ -370,6 +544,7 @@ VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* con
 
 void Renderer::Impl::LoadDeviceFunctions() {
     const auto available = DeviceExtensions(pd);
+    caps = QueryDynamicCaps(pd, available);
     blend_interlock = SupportsBlendInterlock(pd, available);
     vkGetPhysicalDeviceMemoryProperties(pd, &mem);
     VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
@@ -378,24 +553,26 @@ void Renderer::Impl::LoadDeviceFunctions() {
     uma_budget = props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && HasExtension(available, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     image_copy_via_temp = p13.maxBufferSize < kMirrorMax;  // before SetupMirror: against the largest mirror
 #define LOAD(var, name) var = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
-    LOAD(CreateShaders, vkCreateShadersEXT);
-    LOAD(GetShaderBinary, vkGetShaderBinaryDataEXT);
-    LOAD(BindShaders, vkCmdBindShadersEXT);
-    LOAD(SetVertexInput, vkCmdSetVertexInputEXT);
-    LOAD(SetPolygonMode, vkCmdSetPolygonModeEXT);
-    LOAD(SetSamples, vkCmdSetRasterizationSamplesEXT);
-    LOAD(SetSampleMask, vkCmdSetSampleMaskEXT);
-    LOAD(SetAlphaToCoverage, vkCmdSetAlphaToCoverageEnableEXT);
-    LOAD(SetBlendEnable, vkCmdSetColorBlendEnableEXT);
-    LOAD(SetBlendEquation, vkCmdSetColorBlendEquationEXT);
-    LOAD(SetWriteMask, vkCmdSetColorWriteMaskEXT);
-    LOAD(SetDepthClamp, vkCmdSetDepthClampEnableEXT);
-    LOAD(SetLogicOpEnable, vkCmdSetLogicOpEnableEXT);
-    LOAD(SetNegativeOneToOne, vkCmdSetDepthClipNegativeOneToOneEXT);
-    LOAD(DestroyShader, vkDestroyShaderEXT);
+    if (caps.path == ShaderPath::Objects) {
+        LOAD(CreateShaders, vkCreateShadersEXT);
+        LOAD(GetShaderBinary, vkGetShaderBinaryDataEXT);
+        LOAD(BindShaders, vkCmdBindShadersEXT);
+        LOAD(DestroyShader, vkDestroyShaderEXT);
+        LOAD(SetVertexInput, vkCmdSetVertexInputEXT);
+        LOAD(SetPolygonMode, vkCmdSetPolygonModeEXT);
+        LOAD(SetSampleMask, vkCmdSetSampleMaskEXT);
+        LOAD(SetLogicOpEnable, vkCmdSetLogicOpEnableEXT);
+    }
+    if (caps.rasterization_samples) LOAD(SetSamples, vkCmdSetRasterizationSamplesEXT);
+    if (caps.alpha_to_coverage_enable) LOAD(SetAlphaToCoverage, vkCmdSetAlphaToCoverageEnableEXT);
+    if (caps.color_blend_enable) LOAD(SetBlendEnable, vkCmdSetColorBlendEnableEXT);
+    if (caps.color_blend_equation) LOAD(SetBlendEquation, vkCmdSetColorBlendEquationEXT);
+    if (caps.color_write_mask) LOAD(SetWriteMask, vkCmdSetColorWriteMaskEXT);
+    if (caps.depth_clamp_enable) LOAD(SetDepthClamp, vkCmdSetDepthClampEnableEXT);
+    if (caps.depth_clip_negative_one_to_one) LOAD(SetNegativeOneToOne, vkCmdSetDepthClipNegativeOneToOneEXT);
     LOAD(PushDescriptors, vkCmdPushDescriptorSetKHR);
     LOAD(BeginConditional, vkCmdBeginConditionalRenderingEXT), LOAD(EndConditional, vkCmdEndConditionalRenderingEXT);
-    if (SupportsMaintenance5(pd, available)) LOAD(BindIndex2, vkCmdBindIndexBuffer2KHR);
+    if (caps.maintenance5) LOAD(BindIndex2, vkCmdBindIndexBuffer2KHR);
     if (DebugAuto("GOW3_TEMP_LABELS")) LOAD(temp_label_begin, vkCmdBeginDebugUtilsLabelEXT), LOAD(temp_label_end, vkCmdEndDebugUtilsLabelEXT);
     if (DebugAuto("GOW3_TEMP_FAULT"))
         LOAD(temp_get_fault, vkGetDeviceFaultInfoEXT), LOAD(temp_set_check, vkCmdSetCheckpointNV), LOAD(temp_get_checks, vkGetQueueCheckpointDataNV);
@@ -514,6 +691,11 @@ void Renderer::Impl::TempDeviceReport(std::span<const VkQueueFamilyProperties> f
     s.clear();
     for (const auto& x : ext) s += std::format(" {}", x.extensionName + (std::strncmp(x.extensionName, "VK_", 3) ? 0 : 3));
     Report(std::format("Extensions ({}), fragment interlock used {}, sized index binding {}:{}", ext.size(), blend_interlock, BindIndex2 != nullptr, s));
+    Report(std::format(
+        "ShaderPath: {} (forced {}), cache_control {}, gpl_fast_link {}, unrestricted_topology {}, eds3[neg1to1 {} clamp {} samples {} a2c {} blend_en {} blend_eq {} mask {}]",
+        ShaderPathName(caps.path), caps.forced, caps.cache_control, caps.gpl_fast_link, caps.unrestricted_topology,
+        caps.depth_clip_negative_one_to_one, caps.depth_clamp_enable, caps.rasterization_samples,
+        caps.alpha_to_coverage_enable, caps.color_blend_enable, caps.color_blend_equation, caps.color_write_mask));
 }
 
 void Renderer::Impl::TempLost(const char* where, VkResult r) {  // TEMP fault
