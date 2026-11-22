@@ -1002,7 +1002,7 @@ CompiledPipeline Renderer::Impl::LinkGplPair(const VkPipeline (&main_libs)[4], V
 }
 
 CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
-                                                     const FixedPipelineState& raw_state) {
+                                                     const FixedPipelineState& raw_state, const CpuRead& cpu) {
     GraphicsPipelineKey gkey{vs.key, ps ? ps.key : 0ull, (raw_state.flags & FixedPipelineState::kHasGs) ? gs.key : 0ull, raw_state};
     gkey.state.Canonicalize(caps);
     const u64 h = gkey.Hash();
@@ -1065,15 +1065,44 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
             }
         }
     }
-    const CompiledPipeline created = CreateMonolithicPipeline(vs, ps, gs, gkey.state, false);
-    if (!created.main) return {};
-    std::unique_lock lock(prog_lock);
-    auto [it, inserted] = pipelines.try_emplace(h, created);
-    if (!inserted) {
-        vkDestroyPipeline(dev, created.main, nullptr);
-        if (created.square) vkDestroyPipeline(dev, created.square, nullptr);
+    if (!stats.trace && caps.cache_control) {
+        if (const CompiledPipeline hit = CreateMonolithicPipeline(vs, ps, gs, gkey.state, true); hit.main) {
+            std::unique_lock lock(prog_lock);
+            auto [it, inserted] = pipelines.try_emplace(h, hit);
+            if (!inserted) {
+                vkDestroyPipeline(dev, hit.main, nullptr);
+                if (hit.square) vkDestroyPipeline(dev, hit.square, nullptr);
+            }
+            return pm[h] = it->second;
+        }
     }
-    return pm[h] = it->second;
+    if (stats.trace) {
+        const CompiledPipeline created = CreateMonolithicPipeline(vs, ps, gs, gkey.state, false);
+        if (!created.main) return {};
+        std::unique_lock lock(prog_lock);
+        auto [it, inserted] = pipelines.try_emplace(h, created);
+        if (!inserted) {
+            vkDestroyPipeline(dev, created.main, nullptr);
+            if (created.square) vkDestroyPipeline(dev, created.square, nullptr);
+        }
+        return pm[h] = it->second;
+    }
+    if (!in_worker && !discovered) discovered = true, Discover(cpu, {walk_chain.size(), 0}, false);
+    else if (in_worker && block_now && !block_discovered) block_discovered = true, Discover(cpu, block_now->to, true);
+    std::shared_future<CompiledPipeline> f;
+    {
+        std::unique_lock lock(prog_lock);
+        if (auto it = pipelines.find(h); it != pipelines.end()) return pm[h] = it->second;
+        auto [it, fresh] = compiling_pipelines.try_emplace(h);
+        if (fresh) it->second = AsyncPipeline(h, vs, ps, gs, gkey.state, true);
+        f = it->second;
+    }
+    if (Jit::mode == Jit::Mode::Async && f.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return waiting = true, CompiledPipeline{};
+    CompiledPipeline pl{};
+    Stalled(stall_waits, stall_wait_ns, [&] { pl = f.get(); });
+    if (!pl.main) return {};
+    return pm[h] = pl;
 }
 
 VkPipeline Renderer::Impl::IndexProbePipeline(const FixedPipelineState& raw_state) {

@@ -5,6 +5,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <iterator>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -60,6 +61,34 @@ struct Compiled {
     }
     ShaderRef Ref(u64 key) const { return {key, s, mod, pl}; }
 };
+
+inline VkBlendFactor BlendFactor(u32 f) {
+    static constexpr VkBlendFactor t[]{VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_SRC_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,
+                                       VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_DST_ALPHA,
+                                       VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,
+                                       VK_BLEND_FACTOR_SRC_ALPHA_SATURATE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_CONSTANT_COLOR,
+                                       VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR, VK_BLEND_FACTOR_SRC1_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR,
+                                       VK_BLEND_FACTOR_SRC1_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_FACTOR_CONSTANT_ALPHA,
+                                       VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA};
+    return f < std::size(t) ? t[f] : VK_BLEND_FACTOR_ONE;
+}
+inline VkBlendOp BlendOp(u32 f) {
+    static constexpr VkBlendOp t[]{VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX, VK_BLEND_OP_REVERSE_SUBTRACT};
+    return f < std::size(t) ? t[f] : VK_BLEND_OP_ADD;
+}
+// GCN applies the blend factors before MIN/MAX, Vulkan ignores them (shadPS4 RewriteScaledMinMaxBlend). With one zero
+// operand the equation is an exact ADD on a UNORM target; with both operands scaled by themselves MIN/MAX(s*s, d*d) =
+// MIN/MAX(s, d)^2, kept native and squared by a second draw.
+enum class MinMax { Native, Exact, Squared, Unsupported };
+inline MinMax RewriteMinMax(u32& src, u32& fn, u32& dst, bool unorm, bool alpha) {
+    if ((fn != 2 && fn != 3) || (src == 1 && dst == 1)) return MinMax::Native;  // MIN, MAX; factors ONE
+    if (!unorm) return MinMax::Unsupported;
+    if ((src == 2 || (alpha && src == 4)) && (dst == 8 || (alpha && dst == 6))) return MinMax::Squared;  // SRC_COLOR/ALPHA, DST_COLOR/ALPHA
+    if (src && dst) return MinMax::Unsupported;
+    if (fn == 2) src = dst = 0;
+    fn = 0;
+    return MinMax::Exact;
+}
 
 struct FixedAttachmentBlend {
     u8 blend_enable = 0;

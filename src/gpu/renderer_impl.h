@@ -786,9 +786,14 @@ struct Renderer::Impl {
     // Parallel compilation: the first shader a frame lacks walks the rest of the frame (on a copy of the registers) and
     // compiles every program it will need on worker threads; each draw then waits only for its own.
     std::unordered_map<u64, std::shared_future<Compiled>> compiling;
+    std::unordered_map<u64, std::shared_future<CompiledPipeline>> compiling_pipelines;
     // Compile on the workers; `miss`: a draw needs it now (else Discover's, queued behind).
     // `waited`: a draw waits for it (a driver binary's load), so it runs at normal priority even in Async mode.
     std::shared_future<Compiled> Async(Gcn::Stage stage, u64 prog, const Prepared& p, bool miss, bool waited = false);
+    ShaderRef ResolveCachedModule(Gcn::Stage stage, u64 key);
+    std::shared_future<CompiledPipeline> AsyncPipeline(u64 h, ShaderRef vs, ShaderRef ps, ShaderRef gs, FixedPipelineState state, bool miss);
+    bool ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool has_ps, FixedPipelineState& out) const;
+    void EnqueuePipeline(u64 vs_key, u64 ps_key, bool has_gs, const FixedPipelineState& raw_state);
     // The compile workers: tasks by priority (0: a draw needs it now, 1: found ahead by Discover).
     std::mutex task_lock;
     std::condition_variable task_cv;
@@ -807,7 +812,7 @@ struct Renderer::Impl {
     // The programs from the current packet up to `to` go to the compile threads; `urgent`: only those with a driver binary
     // (a short load), ahead of the prefetches.
     void Discover(const CpuRead& cpu, Pos to, bool urgent);
-    void Enqueue(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, bool urgent);
+    u64 Enqueue(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, bool urgent);
     ShaderRef RectGs(u64 mask);
     static bool ClearVs(std::span<const u32> code);
     bool SetupClearRect(std::string& error);
@@ -836,7 +841,7 @@ struct Renderer::Impl {
     VkPipeline LinkGplPipeline(const VkPipeline (&libs)[4], bool lto, bool fail_on_compile);
     CompiledPipeline LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, bool lto, bool fail_on_compile);
     CompiledPipeline GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
-                                         const FixedPipelineState& raw_state);
+                                         const FixedPipelineState& raw_state, const CpuRead& cpu);
     VkPipeline IndexProbePipeline(const FixedPipelineState& state);
 
     // ---- Barriers (hazards.cpp) ----

@@ -123,34 +123,6 @@ VkRect2D ShadowScissor(VkRect2D sc, const VkViewport& vp, std::span<const u32> t
     return {{x, y}, {w, h}};
 }
 
-VkBlendFactor BlendFactor(u32 f) {
-    static constexpr VkBlendFactor t[]{VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_SRC_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,
-                                       VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_DST_ALPHA,
-                                       VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,
-                                       VK_BLEND_FACTOR_SRC_ALPHA_SATURATE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_CONSTANT_COLOR,
-                                       VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR, VK_BLEND_FACTOR_SRC1_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR,
-                                       VK_BLEND_FACTOR_SRC1_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_FACTOR_CONSTANT_ALPHA,
-                                       VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA};
-    return f < std::size(t) ? t[f] : VK_BLEND_FACTOR_ONE;
-}
-VkBlendOp BlendOp(u32 f) {
-    static constexpr VkBlendOp t[]{VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX, VK_BLEND_OP_REVERSE_SUBTRACT};
-    return f < std::size(t) ? t[f] : VK_BLEND_OP_ADD;
-}
-// GCN applies the blend factors before MIN/MAX, Vulkan ignores them (shadPS4 RewriteScaledMinMaxBlend). With one zero
-// operand the equation is an exact ADD on a UNORM target; with both operands scaled by themselves MIN/MAX(s*s, d*d) =
-// MIN/MAX(s, d)^2, kept native and squared by a second draw.
-enum class MinMax { Native, Exact, Squared, Unsupported };
-MinMax RewriteMinMax(u32& src, u32& fn, u32& dst, bool unorm, bool alpha) {
-    if ((fn != 2 && fn != 3) || (src == 1 && dst == 1)) return MinMax::Native;  // MIN, MAX; factors ONE
-    if (!unorm) return MinMax::Unsupported;
-    if ((src == 2 || (alpha && src == 4)) && (dst == 8 || (alpha && dst == 6))) return MinMax::Squared;  // SRC_COLOR/ALPHA, DST_COLOR/ALPHA
-    if (src && dst) return MinMax::Unsupported;
-    if (fn == 2) src = dst = 0;
-    fn = 0;
-    return MinMax::Exact;
-}
-
 // Early tests must not suppress guest side effects or change discarded/depth-exporting fragments.
 bool BlendShaderSafe(std::span<const u32> code, u32 rsrc2, u32 layout) {
     const u64 hash = ::Gpu::PieceHash::ShaderCode(code.data(), code.size_bytes());
@@ -324,12 +296,14 @@ Renderer::~Renderer() {
     }
     for (auto& w : d->recorders)
         for (auto p : w.pool) vkDestroyCommandPool(d->dev, p, nullptr);
+    d->StopCompilers();
+    for (auto& [k, f] : d->compiling_pipelines) (void)f.get();
+    d->compiling_pipelines.clear();
     for (auto& [k, f] : d->compiling) {
         const ShaderRef r = f.get().Ref(k);
         auto it = d->shaders.find(k);
         if (it == d->shaders.end() || it->second != r) d->DestroyShaderRef(r);
     }
-    d->StopCompilers();
     for (auto& [k, s] : d->shaders) d->DestroyShaderRef(s);
     for (auto& [k, s] : d->rect_gs) d->DestroyShaderRef(s);
     d->DestroyShaderRef(d->clear_rect_ref);
@@ -821,7 +795,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         const bool want_square = color_count && !blend_mode && !(z_write || stencil);
         raw_state.square_color_mask = want_square ? bs.square_color_mask : 0;
         raw_state.square_alpha_mask = want_square ? bs.square_alpha_mask : 0;
-        pl = GetGraphicsPipeline(vs, ps, gs, raw_state);
+        pl = GetGraphicsPipeline(vs, ps, gs, raw_state, cpu);
         if (!pl.main) {
             stores.clear(), Count(stats.skipped);
             if (!waiting) Note("draw without pipeline skipped");
