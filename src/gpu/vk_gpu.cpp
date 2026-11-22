@@ -387,7 +387,9 @@ void Renderer::Impl::Query(u64 a) {
     FlushStores();
     EndRendering(false);
     if (!(a & 8) && !query_open && query_blocks.size() < kRays)
-        vkCmdBeginQuery(cmd, query_pool, slot * kQueries + (u32)query_blocks.size(), VK_QUERY_CONTROL_PRECISE_BIT), query_blocks.push_back(a), query_open = true;
+        vkCmdBeginQuery(cmd, query_pool, slot * kQueries + (u32)query_blocks.size(),
+                        VkQueryControlFlags(::Gpu::Features().occlusion_query_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0)),  // not exact without the feature
+            query_blocks.push_back(a), query_open = true;
     else if (a & 8 && query_open)
         vkCmdEndQuery(cmd, query_pool, slot * kQueries + (u32)query_blocks.size() - 1), query_open = false;
 }
@@ -813,7 +815,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     if (changed(dyn.bias, bias) || first) RenderProbe::Cmd(RenderProbe::Bias), vkCmdSetDepthBias(cmd, bias[0], bias[1], bias[2]);
     // A clearing draw leaves the clear value.
     const u32 dz[5]{depth && z_test && !db_clear, depth && z_write && !db_clear, depth_control >> 4 & 7, depth && depth->stencil && stencil && !db_clear,
-                    depth && z_bounds && !db_clear};
+                    depth && z_bounds && !db_clear && ::Gpu::Features().depth_bounds};  // a GPU without depth bounds keeps the test off
     if (changed(dyn.depth, dz) || first) {
         RenderProbe::Cmd(RenderProbe::Depth, 5);
         vkCmdSetDepthTestEnable(cmd, dz[0]);
@@ -960,7 +962,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     // occlusion queries: one at a time, begun and ended in one pass.
     const bool probe = stats.trace && probes.size() < kProbes, probe_px = probe && !query_open && query_on == ~0u;
     if (probe) vkCmdBeginQuery(cmd, q_stat, (u32)probes.size(), 0);
-    if (probe_px) vkCmdBeginQuery(cmd, q_occ, (u32)probes.size(), VK_QUERY_CONTROL_PRECISE_BIT);
+    if (probe_px) vkCmdBeginQuery(cmd, q_occ, (u32)probes.size(), VkQueryControlFlags(::Gpu::Features().occlusion_query_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0));
     u32 prof_draw = ~0u;
     if (prof >= 2) {
         std::string ch;

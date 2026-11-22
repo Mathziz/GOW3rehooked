@@ -21,8 +21,19 @@ bool SupportsBlendInterlock(VkPhysicalDevice pd);
 bool SupportsMaintenance5(VkPhysicalDevice pd);
 // The extensions the renderer cannot run without that `pd` lacks, each after a space (empty: none).
 std::string MissingExtensions(VkPhysicalDevice pd);
-// Vulkan 1.3 device with every feature and extension the renderer uses, plus `extensions` (e.g. the swapchain);
-// `requested` receives each extension asked for, " (MISSING)" after those the device does not list.
+// Optional features that the device actually enabled. CreateDevice asks the GPU (vkGetPhysicalDeviceFeatures2) what it supports and
+// switches off whatever it lacks instead of failing with VK_ERROR_FEATURE_NOT_PRESENT (-8); these are the ones with a fallback
+// at the point of use. Every flag is true until CreateDevice has run.
+struct DeviceFeatures {
+    bool sampler_filter_minmax = true;      // S# MIN/MAX reduction filters; without it the sampler averages (weighted average)
+    bool sampler_mirror_clamp = true;       // MIRROR_CLAMP_TO_EDGE addressing; without it MIRRORED_REPEAT is used
+    bool occlusion_query_precise = true;    // exact sample counts; without it the query only tells whether anything passed
+    bool depth_bounds = true;               // depth bounds test; without it the test stays off
+    bool pipeline_statistics_query = true;  // trace probes only
+};
+const DeviceFeatures& Features();
+// Vulkan 1.3 device with every feature and extension the renderer uses (minus the features `pd` lacks, which are logged), plus
+// `extensions` (e.g. the swapchain); `requested` receives each extension asked for, " (MISSING)" after those the device does not list.
 VkResult CreateDevice(VkPhysicalDevice pd, std::uint32_t family, std::span<const char* const> extensions, VkDevice* device, bool* present_wait = nullptr, bool* reflex = nullptr, bool* unified_layouts = nullptr, std::string* requested = nullptr);
 // TEMP fault (debug runs): a VK_EXT_device_address_binding_report message, searched when the device is lost.
 void TempAddressBinding(const VkDebugUtilsMessengerCallbackDataEXT* data);

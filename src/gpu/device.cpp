@@ -216,11 +216,113 @@ bool SupportsMaintenance5(VkPhysicalDevice pd, std::span<const VkExtensionProper
 constexpr const char* kRequiredExtensions[]{VK_EXT_SHADER_OBJECT_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
                                             VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
 
+DeviceFeatures enabled_features;  // written once by CreateDevice, before any renderer thread starts
+
+void LogFeatures(const std::string& message) {
+#ifndef GOW3_OFFLINE
+    Gow3::Log(message);
+#else
+    std::fprintf(stderr, "%s\n", message.c_str());
+#endif
+}
+
+// The features that the device does not report, split by what losing them costs.
+struct DroppedFeatures {
+    std::string optional;  // the renderer has a fallback (DeviceFeatures)
+    std::string required;  // no fallback: the game may fail to start a shader or draw wrongly without them
+};
+
+// vkCreateDevice fails with VK_ERROR_FEATURE_NOT_PRESENT (-8) when a single requested feature is missing (a GeForce GTX 750 Ti
+// has no min/max sampler filtering, for one). Asks the GPU what it supports (vkGetPhysicalDeviceFeatures2) and switches off every
+// requested feature it lacks; `caps` receives what the optional ones ended up as.
+DroppedFeatures DropUnsupportedFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures& f, VkPhysicalDeviceVulkan11Features& f11,
+                                        VkPhysicalDeviceVulkan12Features& f12, VkPhysicalDeviceVulkan13Features& f13,
+                                        VkPhysicalDeviceShaderObjectFeaturesEXT& so, VkPhysicalDeviceConditionalRenderingFeaturesEXT& cr,
+                                        VkPhysicalDeviceDepthClipControlFeaturesEXT& dcc, DeviceFeatures& caps) {
+    VkPhysicalDeviceVulkan13Features h13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features h12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &h13};
+    VkPhysicalDeviceVulkan11Features h11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &h12};
+    VkPhysicalDeviceShaderObjectFeaturesEXT hso{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT, &h11};
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT hcr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT, &hso};
+    VkPhysicalDeviceDepthClipControlFeaturesEXT hdcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &hcr};
+    VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hdcc};
+    vkGetPhysicalDeviceFeatures2(pd, &have);
+
+    DroppedFeatures dropped;
+    auto keep = [&](VkBool32& want, VkBool32 got, const char* name, bool optional) {
+        if (!want || got) return;
+        want = VK_FALSE;
+        (optional ? dropped.optional : dropped.required) += std::format(" {}", name);
+    };
+#define KEEP(want, got, field, optional) keep((want).field, (got).field, #field, optional)
+    const VkPhysicalDeviceFeatures& hf = have.features;
+    // Core 1.0 features.
+    KEEP(f, hf, shaderInt16, false);
+    KEEP(f, hf, geometryShader, false);
+    KEEP(f, hf, sparseBinding, false);
+    KEEP(f, hf, sparseResidencyBuffer, false);
+    KEEP(f, hf, shaderInt64, false);
+    KEEP(f, hf, independentBlend, false);
+    KEEP(f, hf, dualSrcBlend, false);
+    KEEP(f, hf, samplerAnisotropy, false);
+    KEEP(f, hf, imageCubeArray, false);
+    KEEP(f, hf, fragmentStoresAndAtomics, false);
+    KEEP(f, hf, vertexPipelineStoresAndAtomics, false);
+    KEEP(f, hf, depthClamp, false);
+    KEEP(f, hf, depthBounds, true);
+    KEEP(f, hf, shaderStorageImageReadWithoutFormat, false);
+    KEEP(f, hf, shaderStorageImageWriteWithoutFormat, false);
+    KEEP(f, hf, shaderStorageImageExtendedFormats, false);
+    KEEP(f, hf, shaderStorageImageMultisample, false);
+    KEEP(f, hf, shaderStorageImageArrayDynamicIndexing, false);
+    KEEP(f, hf, depthBiasClamp, false);
+    KEEP(f, hf, logicOp, false);
+    KEEP(f, hf, pipelineStatisticsQuery, true);
+    KEEP(f, hf, occlusionQueryPrecise, true);
+    // Vulkan 1.1.
+    KEEP(f11, h11, storageBuffer16BitAccess, false);
+    // Vulkan 1.2.
+    KEEP(f12, h12, bufferDeviceAddress, false);
+    KEEP(f12, h12, descriptorIndexing, false);
+    KEEP(f12, h12, runtimeDescriptorArray, false);
+    KEEP(f12, h12, descriptorBindingPartiallyBound, false);
+    KEEP(f12, h12, descriptorBindingSampledImageUpdateAfterBind, false);
+    KEEP(f12, h12, descriptorBindingStorageImageUpdateAfterBind, false);
+    KEEP(f12, h12, shaderSampledImageArrayNonUniformIndexing, false);
+    KEEP(f12, h12, shaderStorageImageArrayNonUniformIndexing, false);
+    KEEP(f12, h12, scalarBlockLayout, false);
+    KEEP(f12, h12, shaderInt8, false);
+    KEEP(f12, h12, storageBuffer8BitAccess, false);
+    KEEP(f12, h12, samplerFilterMinmax, true);
+    KEEP(f12, h12, samplerMirrorClampToEdge, true);
+    KEEP(f12, h12, hostQueryReset, false);
+    KEEP(f12, h12, timelineSemaphore, false);
+    // Vulkan 1.3.
+    KEEP(f13, h13, dynamicRendering, false);
+    KEEP(f13, h13, synchronization2, false);
+    KEEP(f13, h13, maintenance4, false);
+    KEEP(f13, h13, shaderDemoteToHelperInvocation, false);
+    KEEP(f13, h13, robustImageAccess, true);
+    // Extensions.
+    KEEP(so, hso, shaderObject, false);
+    KEEP(cr, hcr, conditionalRendering, false);
+    KEEP(dcc, hdcc, depthClipControl, false);
+#undef KEEP
+    caps.sampler_filter_minmax = f12.samplerFilterMinmax;
+    caps.sampler_mirror_clamp = f12.samplerMirrorClampToEdge;
+    caps.occlusion_query_precise = f.occlusionQueryPrecise;
+    caps.depth_bounds = f.depthBounds;
+    caps.pipeline_statistics_query = f.pipelineStatisticsQuery;
+    return dropped;
+}
+
 const auto temp_bind_t0 = std::chrono::steady_clock::now();
 double TempBindMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - temp_bind_t0).count(); }
 } // namespace
 
 // ---- Physical device queries and device creation ----
+
+const DeviceFeatures& Features() { return enabled_features; }
 
 bool QueueFamilySuitable(VkQueueFlags flags) {
     const VkQueueFlags want = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_SPARSE_BINDING_BIT;
@@ -338,6 +440,18 @@ VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* con
             }
         }
     }
+    // Only what the GPU supports is requested: a missing feature no longer makes vkCreateDevice fail with -8. What was switched off
+    // is logged before the device is created.
+    DeviceFeatures caps;
+    const DroppedFeatures dropped = DropUnsupportedFeatures(pd, f, f11, f12, f13, so, cr, dcc, caps);
+    enabled_features = caps;
+    if (dropped.optional.empty() && dropped.required.empty())
+        LogFeatures("Vulkan features: the GPU supports every feature the renderer asks for");
+    if (!dropped.optional.empty())
+        LogFeatures(std::format("Vulkan features switched off, not supported by the GPU (fallback in use):{}", dropped.optional));
+    if (!dropped.required.empty())
+        LogFeatures(std::format("Vulkan features switched off, not supported by the GPU, THAT THE RENDERER NEEDS (the game may fail or draw wrongly):{}",
+                                dropped.required));
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, queue_infos, qci, 0, nullptr, (u32)ext.size(), ext.data()};
     // TEMP fault (debug runs, GOW3_TEMP_FAULT=0 off): VK_EXT_device_fault and NVIDIA diagnostics (checkpoints), read when the device is lost.
     VkPhysicalDeviceFaultFeaturesEXT temp_fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, nullptr, VK_TRUE, VK_FALSE};
