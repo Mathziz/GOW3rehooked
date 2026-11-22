@@ -459,6 +459,38 @@ void ShaderCache::SetWadHot(const std::string& wad, std::vector<Hot> hot) {
     Requeue(wad, h);
 }
 
+void ShaderCache::SetPrepare(std::function<std::uint32_t(std::uint64_t key, std::uint64_t binary, std::uint32_t stage)> fn) {
+    std::scoped_lock l(prepare_cb_lock);
+    prepare_cb = std::move(fn);
+}
+
+void ShaderCache::SetWarmPipelines(std::function<void()> fn) {
+    std::scoped_lock l(prepare_cb_lock);
+    warm_pipelines_cb = std::move(fn);
+}
+
+void ShaderCache::SetPipelineCacheFlusher(std::function<void(bool force)> fn) {
+    std::scoped_lock l(flush_cb_lock);
+    flush_pipeline_cache_cb = std::move(fn);
+}
+
+void ShaderCache::ClearRendererCallbacks() {
+    {
+        std::scoped_lock l(prepare_cb_lock);
+        prepare_cb = {};
+        warm_pipelines_cb = {};
+    }
+    {
+        std::scoped_lock l(flush_cb_lock);
+        flush_pipeline_cache_cb = {};
+    }
+}
+
+void ShaderCache::NotePipelineCacheDirty(std::uint32_t count) {
+    pipeline_dirty.store(count, std::memory_order_release);
+    if (count >= 8) Dirty();
+}
+
 // The game opened the WAD. The binaries of its shaders are read ahead into the system's file cache (not decoded: the memory
 // stays the system's), sorted by place in the file and joined into large pieces, one sequential read each on a hard disk:
 // first those of the shaders the player's runs used there, which are then made ready in the order the runs met them, then
@@ -470,13 +502,25 @@ void ShaderCache::Warm(const std::string& name) {
     std::vector<Loc> used, rest;
     {
         std::shared_lock l(lock);
-        const auto add = [&](std::vector<Loc>& to, std::uint64_t k) {
+        const auto add_bin = [&](std::vector<Loc>& to, std::uint64_t k) {
             if (const auto it = locs[1].find(k); it != locs[1].end() && it->second.packed) to.push_back(it->second);
         };
+        const auto add_spirv = [&](std::vector<Loc>& to, std::uint64_t key) {
+            if (const auto idx = index.find(key); idx != index.end())
+                if (const auto it = locs[0].find(idx->second); it != locs[0].end() && it->second.packed) to.push_back(it->second);
+        };
         if (const auto it = wad_hot.find(wad); it != wad_hot.end()) hot = it->second;
-        for (const Hot& h : hot) add(used, h.binary);
-        if (const auto it = wad_keys.find(wad); it != wad_keys.end())
-            for (std::uint64_t k : it->second.binaries) add(rest, k);
+        for (const Hot& h : hot) {
+            if (h.binary != 0) add_bin(used, h.binary);
+            else add_spirv(used, h.key);
+        }
+        if (const auto it = wad_keys.find(wad); it != wad_keys.end()) {
+            if (!it->second.binaries.empty()) {
+                for (std::uint64_t k : it->second.binaries) add_bin(rest, k);
+            } else {
+                for (std::uint64_t k : it->second.shaders) add_spirv(rest, k);
+            }
+        }
     }
     std::uint64_t bytes = 0, pieces = 0;
     const auto ahead = [&](std::vector<Loc>& at) {
@@ -512,8 +556,15 @@ void ShaderCache::Warm(const std::string& name) {
     };
     ahead(used);
     std::uint32_t made[3]{};  // already there (another WAD's or a draw's), made now, failed
-    if (!hot.empty() && prepare)  // set before the AOT gives the first list (the renderer's setup)
-        for (const Hot& h : hot) ++made[std::min(prepare(h.key, h.binary, h.stage), 2u)];
+    if (!hot.empty()) {
+        for (const Hot& h : hot) {
+            std::scoped_lock l(prepare_cb_lock);
+            if (!prepare_cb) break;
+            ++made[std::min(prepare_cb(h.key, h.binary, h.stage), 2u)];
+        }
+        std::scoped_lock l(prepare_cb_lock);
+        if (warm_pipelines_cb) warm_pipelines_cb();
+    }
     ahead(rest);
     if (!hot.empty() || !rest.empty())
         Gow3::Log(std::format("Shader cache: {}: {:.1f} MB of binaries read ahead in {} pieces; of {} used shaders {} made ready, {} were, {} failed ({:.0f} ms)", name,
@@ -550,6 +601,7 @@ void ShaderCache::Flush(const char* why, bool all_threads) {
         batch.swap(pending);
     }
     Recipes::Instance().Flush();
+    PipelineRecipes::Instance().Flush();
     std::atomic<std::size_t> next = 0;
     const auto work = [&] {
         for (std::size_t k; (k = next++) < batch.size();) {
@@ -568,6 +620,10 @@ void ShaderCache::Flush(const char* why, bool all_threads) {
     {
         std::unique_lock l(lock);
         PutPairs(kIndex, index_new), PutPairs(kGlslMap, glsl_new);
+    }
+    {
+        std::scoped_lock l(flush_cb_lock);
+        if (flush_pipeline_cache_cb) flush_pipeline_cache_cb(all_threads);
     }
     if (!batch.empty())
         std::fprintf(stderr, "Shader cache: wrote %zu shaders (%s) in %.0f ms\n", batch.size(), why,
@@ -609,11 +665,15 @@ void ShaderCache::FlushLoop(const std::stop_token& stop) {
                 waiting = pending.size();
             }
             const Progress progress = Snapshot();
-            const bool loading = streamed_now >= kLoadBytes || wads_now >= kLoadWads, burst = waiting >= kBurst && progress.done == progress.total;
+            const bool loading = streamed_now >= kLoadBytes || wads_now >= kLoadWads;
+            const bool pl_burst = pipeline_dirty.load(std::memory_order_acquire) >= 8 && progress.done == progress.total &&
+                                  progress.pipelines_done == progress.pipelines_total;
+            const bool burst = (waiting >= kBurst && progress.done == progress.total && progress.pipelines_done == progress.pipelines_total) || pl_burst;
             if (!loading && !burst) continue;
             char why[96];
             if (loading) std::snprintf(why, sizeof why, "loading: %llu MB streamed, %u WADs in 2 s", (unsigned long long)(streamed_now >> 20), wads_now);
-            else std::snprintf(why, sizeof why, "compile burst: %zu waiting", waiting);
+            else if (waiting >= kBurst) std::snprintf(why, sizeof why, "compile burst: %zu waiting", waiting);
+            else std::snprintf(why, sizeof why, "pipeline burst: %u dirty", pipeline_dirty.load(std::memory_order_relaxed));
             Flush(why, false);
         }
     }

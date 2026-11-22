@@ -108,6 +108,46 @@ void SaveKept(const std::filesystem::path& path, u64 stamp, const std::vector<Ke
     std::filesystem::rename(temporary, path, ec);
 }
 
+constexpr u32 kKeptPlMagic = 0x50433347, kKeptPlFormat = 1;  // "G3CP"
+struct KeptPlHead { u32 magic, format; u64 stamp; u32 count, reserved; };
+
+bool LoadKeptPipelines(const std::filesystem::path& path, u64 stamp, std::vector<ContractedPipeline>& out) {
+    out.clear();
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    const auto size = in.tellg();
+    if (size < std::streamoff(sizeof(KeptPlHead))) return false;
+    in.seekg(0);
+    KeptPlHead head{};
+    if (!in.read(reinterpret_cast<char*>(&head), sizeof(head))) return false;
+    if (head.magic != kKeptPlMagic || head.format != kKeptPlFormat || head.stamp != stamp) return false;
+    const size_t body = size_t(head.count) * sizeof(ContractedPipeline);
+    if (size_t(size) != sizeof(head) + body) return false;
+    out.resize(head.count);
+    if (body && !in.read(reinterpret_cast<char*>(out.data()), std::streamsize(body))) return out.clear(), false;
+    return true;
+}
+
+void SaveKeptPipelines(const std::filesystem::path& path, u64 stamp, const std::vector<ContractedPipeline>& list) {
+    const KeptPlHead head{kKeptPlMagic, kKeptPlFormat, stamp, u32(list.size()), 0};
+    auto temporary = path;
+    temporary += ".tmp";
+    std::error_code ec;
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(&head), sizeof(head));
+        if (!list.empty()) out.write(reinterpret_cast<const char*>(list.data()), std::streamsize(list.size() * sizeof(ContractedPipeline)));
+        out.flush();
+        if (!out.good()) {
+            out.close();
+            std::filesystem::remove(temporary, ec);
+            return;
+        }
+    }
+    std::filesystem::rename(temporary, path, ec);
+    if (ec) std::filesystem::remove(temporary, ec);
+}
+
 } // namespace
 
 // Gets every variant the game can ask for into the cache, in this order: the recipes (what the player's runs and the JIT
@@ -117,6 +157,7 @@ void SaveKept(const std::filesystem::path& path, u64 stamp, const std::vector<Ke
 // driver update, from the SPIR-V). All CPU threads work on it. A launch in the cooldown after a build compiles nothing, but its
 // WADs still make ready the shaders the player's runs used there.
 void Renderer::Impl::AotBuild() {
+    Aot::has_pipelines_phase.store(caps.path != ShaderPath::Objects, std::memory_order_release);
     struct FinishProgress { ~FinishProgress() { Aot::SetPhase(Aot::Phase::Finished); } } finish_progress;
     const bool build = Gow3::AotBuildAllowed();
     struct FinishBuild { ~FinishBuild() { Gow3::EndAotBuild(); } } finish_build;
@@ -167,15 +208,19 @@ void Renderer::Impl::AotBuild() {
     // What the player's runs used (with a binary), per file of its program, in the order they met it: made ready when the game
     // opens the file (or now, for a file already open).
     const auto give_hot = [&] {
-        if (caps.path != ShaderPath::Objects) return;
         std::vector<std::vector<ShaderCache::Hot>> hot(index.files.size());
         std::vector<u32> files;
         for (const Recipe& r : recipes) {
             if (rect_variant(r)) continue;
-            const u64 key = r.Key(), binary = BinaryKey(cache.ContentOf(key));
+            const u64 key = r.Key();
             files.clear();
-            if (cache.ContainsBinary(binary) && files_of(r, files))
-                for (u32 f : files) hot[f].push_back({key, binary, r.h.stage});
+            if (caps.path == ShaderPath::Objects) {
+                const u64 binary = BinaryKey(cache.ContentOf(key));
+                if (cache.ContainsBinary(binary) && files_of(r, files))
+                    for (u32 f : files) hot[f].push_back({key, binary, r.h.stage});
+            } else if (cache.Contains(key) && files_of(r, files)) {
+                for (u32 f : files) hot[f].push_back({key, 0, r.h.stage});
+            }
         }
         for (u32 f = 0; f < index.files.size(); ++f)
             if (const std::string name = f ? WadName(index.files[f].c_str()) : "EBOOT"; !name.empty() && !hot[f].empty()) cache.SetWadHot(name, std::move(hot[f]));
@@ -316,8 +361,12 @@ void Renderer::Impl::AotBuild() {
 
     // The recipes first, all of them: what the player's runs met and what the JIT had to translate during play.
     std::vector<Job> jobs;
-    for (const Recipe& r : recipes)
-        if (const u64 key = r.Key(); !rect_variant(r) && (!r.h.reserved || blend_interlock) && pending_of(key)) jobs.push_back({r, key, cache.Contains(key), nullptr, {}});
+    std::vector<u64> compute_keys;
+    for (const Recipe& r : recipes) {
+        const u64 key = r.Key();
+        if (r.h.stage == u8(Gcn::Stage::Compute)) compute_keys.push_back(key);
+        if (!rect_variant(r) && (!r.h.reserved || blend_interlock) && pending_of(key)) jobs.push_back({r, key, cache.Contains(key), nullptr, {}});
+    }
     for (Job& job : jobs) place(job);
     // Grouped by WAD (each by its first file, in the order the runs met them): the file keeps what a WAD's runs used together.
     std::stable_sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return (a.files.empty() ? ~0u : a.files[0]) < (b.files.empty() ? ~0u : b.files[0]); });
@@ -338,14 +387,18 @@ void Renderer::Impl::AotBuild() {
     std::unique_ptr<Catalog::Data> catalog;
     jobs.clear();
     Aot::SetPhase(Aot::Phase::Catalog);
+    const bool need_pl = caps.path != ShaderPath::Objects;
     const auto kept_path = cache.Directory() / (PieceHash::UsesAes() ? "contract-hash2-aes.cache" : "contract-hash2-xxh.cache");
+    const auto kept_pl_path = cache.Directory() / (PieceHash::UsesAes() ? "pipeline-contract-hash2-aes.cache" : "pipeline-contract-hash2-xxh.cache");
     const u64 kept_stamp = KeptStamp(index.stamp);
     std::vector<Kept> kept;
+    std::vector<ContractedPipeline> kept_pipelines;
     std::deque<Parser::Program> kept_code;  // where the code of the variants read from the file lies, for their jobs
     size_t wad_total = 0, embedded_pending = 0;
-    if (LoadKept(kept_path, kept_stamp, kept)) {
+    if (LoadKept(kept_path, kept_stamp, kept) && (!need_pl || LoadKeptPipelines(kept_pl_path, kept_stamp, kept_pipelines))) {
         Say("AOT: contract of %zu variants read from the cache (%.1f s)\n", kept.size(), seconds());
         for (Kept& v : kept) {
+            if (v.recipe.h.stage == u8(Gcn::Stage::Compute)) compute_keys.push_back(v.key);
             if (rect_variant(v.recipe)) continue;
             wad_total += v.file != 0;
             if (!pending_of(v.key)) continue;
@@ -355,12 +408,13 @@ void Renderer::Impl::AotBuild() {
             jobs.push_back({std::move(v.recipe), v.key, cache.Contains(v.key), &at, {v.file}});
         }
     } else try {
+        kept.clear(), kept_pipelines.clear();
         catalog = std::make_unique<Catalog::Data>(Catalog::Read(Aot::game_directory, Gow3::Cpu::plan.shader_threads, Aot::sample_log2));
         Say("AOT: catalog of %zu WADs and %zu embedded programs (%.1f s)\n", catalog->files.size(), catalog->embedded.size(), seconds());
         for (const auto& file : catalog->files)
             if (!file.fatal.empty()) Say("AOT:   unreadable: %s\n", file.fatal.c_str());
         std::vector<Contracted> contracts;
-        Contracts(*catalog, contracts);
+        Contracts(*catalog, contracts, need_pl ? &kept_pipelines : nullptr);
         {   // TEMP: how many of the player's recipes the contract predicted (all / with the engine's own fetch shader), and per path
             std::unordered_map<u64, u32> have;  // key -> paths
             u32 made[kContractPaths]{}, hits[kContractPaths]{}, alone[kContractPaths]{};
@@ -404,6 +458,7 @@ void Renderer::Impl::AotBuild() {
             const auto inside = [&](std::span<const u8> s) { return s.empty() || (s.data() >= map.data && s.data() + s.size() <= map.data + map.size); };
             if (file == ~0u || !inside(c.code) || !inside(c.fetch)) complete = false;
             else if (complete) kept.push_back({c.recipe, c.key, u64(c.code.data() - map.data), c.fetch.empty() ? 0 : u64(c.fetch.data() - map.data), file, c.paths, u32(c.code.size()), u32(c.fetch.size())});
+            if (c.recipe.h.stage == u8(Gcn::Stage::Compute)) compute_keys.push_back(c.key);
             if (rect_variant(c.recipe)) continue;
             wad_total += c.file != ~0u;
             if (!pending_of(c.key)) continue;
@@ -414,6 +469,7 @@ void Renderer::Impl::AotBuild() {
         }
         if (complete) {
             SaveKept(kept_path, kept_stamp, kept);
+            if (need_pl) SaveKeptPipelines(kept_pl_path, kept_stamp, kept_pipelines);
             Say("AOT: contract of %zu variants kept for the next launches (%.1f s)\n", kept.size(), seconds());
         }
     } catch (const std::exception& e) {
@@ -428,11 +484,279 @@ void Renderer::Impl::AotBuild() {
     Aot::SetPhase(Aot::Phase::Variants);
     run("contract", jobs);
 
+    if (caps.path != ShaderPath::Objects) {
+        Aot::SetPhase(Aot::Phase::Pipelines);
+        const auto pl_start = std::chrono::steady_clock::now();
+        struct PlJob {
+            GraphicsPipelineKey gkey;
+            bool is_wad = false;
+        };
+        std::vector<PlJob> pl_jobs;
+        std::unordered_set<u64> pl_seen;
+        auto push_pl = [&](u64 vs_key, u64 ps_key, u64 gs_mask, const FixedPipelineState& raw_state, bool is_wad) -> bool {
+            if (!vs_key || (vs_key != kClearRectVsKey && !cache.Contains(vs_key))) return false;
+            const bool has_ps = (raw_state.flags & FixedPipelineState::kHasPs) != 0;
+            if (has_ps && (!ps_key || !cache.Contains(ps_key))) return false;
+            GraphicsPipelineKey gk{vs_key, has_ps ? ps_key : 0ull, (raw_state.flags & FixedPipelineState::kHasGs) ? gs_mask : 0ull, raw_state};
+            gk.state.Canonicalize(caps);
+            const u64 h = gk.Hash();
+            if (!pl_seen.insert(h).second) return false;
+            pl_jobs.push_back({gk, is_wad});
+            return true;
+        };
+        for (const PipelineRecipe& r : PipelineRecipes::Instance().All())
+            push_pl(r.vs_key, r.ps_key, r.gs_mask, r.raw_state, false);
+        for (const ContractedPipeline& cp : kept_pipelines)
+            if (cp.file == ~0u) push_pl(cp.vs_key, cp.ps_key, cp.gs_mask, cp.state, false);
+        size_t wad_pl_total = 0;
+        for (const ContractedPipeline& cp : kept_pipelines)
+            if (cp.file != ~0u && push_pl(cp.vs_key, cp.ps_key, cp.gs_mask, cp.state, true)) ++wad_pl_total;
+        const size_t wad_pl_budget = Aot::lazy ? (wad_pl_total + 3) / 4 : SIZE_MAX;
+
+        {
+            std::unordered_set<u64> cs_seen;
+            std::vector<u64> cs_filtered;
+            for (u64 k : compute_keys)
+                if (cache.Contains(k) && cs_seen.insert(k).second) cs_filtered.push_back(k);
+            compute_keys = std::move(cs_filtered);
+        }
+        for (size_t i = 0; i < compute_keys.size() + pl_jobs.size(); ++i) cache.PipelineQueued();
+
+        struct AotCleanup {
+            VkDevice dev;
+            std::unordered_map<u64, VkPipeline> prerast, frag, foi;
+            std::unordered_map<u64, VkShaderModule> mods;
+            ~AotCleanup() {
+                for (auto& [k, p] : prerast) if (p) vkDestroyPipeline(dev, p, nullptr);
+                for (auto& [k, p] : frag) if (p) vkDestroyPipeline(dev, p, nullptr);
+                for (auto& [k, p] : foi) if (p) vkDestroyPipeline(dev, p, nullptr);
+                for (auto& [k, m] : mods) if (m) vkDestroyShaderModule(dev, m, nullptr);
+            }
+        } temp{dev};
+        std::mutex aot_lock;
+        std::once_flag aot_begin_once;
+        std::atomic<u32> cs_cached{0}, cs_compiled{0}, cs_failed{0};
+        std::atomic<u32> pl_cached{0}, pl_compiled{0}, pl_skipped{0}, pl_failed{0};
+        std::atomic<size_t> wad_compiled{0};
+
+        parallel(compute_keys.size(), [&](size_t i) {
+            const u64 key = compute_keys[i];
+            if (const auto hit = cache.Find(key); hit && !hit->spirv.empty()) {
+                VkPipeline pl = caps.cache_control ? CreateComputePipeline(hit->spirv, true) : VK_NULL_HANDLE;
+                if (pl) {
+                    vkDestroyPipeline(dev, pl, nullptr);
+                    ++cs_cached;
+                } else {
+                    std::call_once(aot_begin_once, Gow3::BeginAotBuild);
+                    pl = CreateComputePipeline(hit->spirv, false);
+                    if (pl) {
+                        vkDestroyPipeline(dev, pl, nullptr);
+                        ++cs_compiled;
+                    } else {
+                        ++cs_failed;
+                    }
+                }
+            } else {
+                ++cs_failed;
+            }
+            cache.PipelineCompleted();
+        });
+
+        auto resolve_mod = [&](u64 key, u64& out_content) -> VkShaderModule {
+            if (key == kClearRectVsKey) return out_content = kClearRectVsKey, clear_rect_ref.mod;
+            out_content = cache.ContentOf(key);
+            if (!out_content) return VK_NULL_HANDLE;
+            {
+                std::scoped_lock l(aot_lock);
+                if (auto it = temp.mods.find(out_content); it != temp.mods.end()) return it->second;
+            }
+            const auto hit = cache.Find(key);
+            if (!hit || hit->spirv.empty()) return VK_NULL_HANDLE;
+            const VkShaderModule mod = CreateShaderModule(hit->spirv);
+            if (!mod) return VK_NULL_HANDLE;
+            std::scoped_lock l(aot_lock);
+            auto [it, inserted] = temp.mods.try_emplace(out_content, mod);
+            if (!inserted) vkDestroyShaderModule(dev, mod, nullptr);
+            return it->second;
+        };
+
+        auto aot_gpl_prerast = [&](u64 vs_content, VkShaderModule vs_mod, VkShaderModule gs_mod, u64 gs_mask, const FixedPipelineState& st) -> VkPipeline {
+            const bool neg_one = !caps.depth_clip_negative_one_to_one && (st.flags & FixedPipelineState::kNegOne);
+            const bool depth_clamp = !caps.depth_clamp_enable && (st.flags & FixedPipelineState::kDepthClamp);
+            const bool has_gs = (st.flags & FixedPipelineState::kHasGs) != 0;
+            struct PreKey {
+                u64 vs, gs;
+                u32 flags, pad;
+            } pk{vs_content, has_gs ? gs_mask : 0ull, u32(neg_one) | u32(depth_clamp) << 1 | u32(has_gs) << 2, 0};
+            const u64 h = PieceHash::Stable64(&pk, sizeof(pk));
+            {
+                std::scoped_lock l(aot_lock);
+                if (auto it = temp.prerast.find(h); it != temp.prerast.end()) return it->second;
+            }
+            const VkPipeline created = CreateGplPreRaster(vs_mod, has_gs ? gs_mod : VK_NULL_HANDLE, neg_one, depth_clamp);
+            if (!created) return VK_NULL_HANDLE;
+            std::scoped_lock l(aot_lock);
+            auto [it, inserted] = temp.prerast.try_emplace(h, created);
+            if (!inserted) vkDestroyPipeline(dev, created, nullptr);
+            return it->second;
+        };
+
+        auto aot_gpl_frag = [&](u64 ps_content, VkShaderModule ps_mod, const FixedPipelineState& st) -> VkPipeline {
+            const bool has_ps = (st.flags & FixedPipelineState::kHasPs) != 0;
+            const u32 samples = caps.rasterization_samples ? 1u : std::max<u32>(1, st.samples);
+            if (!has_ps && samples == 1 && gpl_empty_fs) return gpl_empty_fs;
+            struct FragKey {
+                u64 ps;
+                u32 samples, has_ps;
+            } fk{has_ps ? ps_content : 0ull, samples, has_ps ? 1u : 0u};
+            const u64 h = PieceHash::Stable64(&fk, sizeof(fk));
+            {
+                std::scoped_lock l(aot_lock);
+                if (auto it = temp.frag.find(h); it != temp.frag.end()) return it->second;
+            }
+            const VkPipeline created = CreateGplFragShader(has_ps ? ps_mod : VK_NULL_HANDLE, samples);
+            if (!created) return VK_NULL_HANDLE;
+            std::scoped_lock l(aot_lock);
+            auto [it, inserted] = temp.frag.try_emplace(h, created);
+            if (!inserted) vkDestroyPipeline(dev, created, nullptr);
+            return it->second;
+        };
+
+        auto aot_gpl_foi = [&](const FixedPipelineState& st, bool square_pass) -> VkPipeline {
+            struct FoiKey {
+                VkFormat color_formats[8];
+                VkFormat depth_format;
+                VkFormat stencil_format;
+                u8 color_count;
+                u8 samples;
+                u8 a2c;
+                u8 square_pass;
+                u8 square_color_mask;
+                u8 square_alpha_mask;
+                u8 pad[2];
+                FixedAttachmentBlend blend[8];
+            } fk{};
+            static_assert(sizeof(FoiKey) == 112);
+            std::copy_n(st.color_formats, 8, fk.color_formats);
+            fk.depth_format = st.depth_format;
+            fk.stencil_format = st.stencil_format;
+            fk.color_count = st.color_count;
+            fk.samples = caps.rasterization_samples ? 1 : std::max<u8>(1, st.samples);
+            fk.a2c = (!caps.alpha_to_coverage_enable && (st.flags & FixedPipelineState::kAlphaToCoverage)) ? 1 : 0;
+            fk.square_pass = square_pass ? 1 : 0;
+            fk.square_color_mask = square_pass ? st.square_color_mask : 0;
+            fk.square_alpha_mask = square_pass ? st.square_alpha_mask : 0;
+            std::copy_n(st.blend, 8, fk.blend);
+            const u64 h = PieceHash::Stable64(&fk, sizeof(fk));
+            {
+                std::scoped_lock l(aot_lock);
+                if (auto it = temp.foi.find(h); it != temp.foi.end()) return it->second;
+            }
+            const VkPipeline created = CreateGplFragOutput(st, square_pass);
+            if (!created) return VK_NULL_HANDLE;
+            std::scoped_lock l(aot_lock);
+            auto [it, inserted] = temp.foi.try_emplace(h, created);
+            if (!inserted) vkDestroyPipeline(dev, created, nullptr);
+            return it->second;
+        };
+
+        parallel(pl_jobs.size(), [&](size_t i) {
+            const PlJob& job = pl_jobs[i];
+            const GraphicsPipelineKey& gk = job.gkey;
+            u64 vs_content = 0, ps_content = 0;
+            const VkShaderModule vs_mod = resolve_mod(gk.vs_key, vs_content);
+            if (!vs_mod) {
+                ++pl_failed;
+                cache.PipelineCompleted();
+                return;
+            }
+            const bool has_ps = (gk.state.flags & FixedPipelineState::kHasPs) != 0;
+            const VkShaderModule ps_mod = has_ps ? resolve_mod(gk.ps_key, ps_content) : VK_NULL_HANDLE;
+            if (has_ps && !ps_mod) {
+                ++pl_failed;
+                cache.PipelineCompleted();
+                return;
+            }
+            const bool has_gs = (gk.state.flags & FixedPipelineState::kHasGs) != 0;
+            const ShaderRef gs_ref = has_gs ? RectGs(gk.gs_mask) : ShaderRef{};
+            if (has_gs && !gs_ref.mod) {
+                ++pl_failed;
+                cache.PipelineCompleted();
+                return;
+            }
+            if (caps.path == ShaderPath::Gpl) {
+                const VkPipeline vi = gpl_vi[std::min<u8>(gk.state.topology_class, 2)];
+                const VkPipeline prerast = aot_gpl_prerast(vs_content, vs_mod, gs_ref.mod, gk.gs_mask, gk.state);
+                const VkPipeline fs = aot_gpl_frag(ps_content, ps_mod, gk.state);
+                const VkPipeline foi = aot_gpl_foi(gk.state, false);
+                const bool need_sq = gk.state.NeedsSquarePipeline(caps);
+                const VkPipeline foi_sq = need_sq ? aot_gpl_foi(gk.state, true) : VK_NULL_HANDLE;
+                if (!vi || !prerast || !fs || !foi || (need_sq && !foi_sq)) {
+                    ++pl_failed;
+                    cache.PipelineCompleted();
+                    return;
+                }
+                const VkPipeline libs[4]{vi, prerast, fs, foi};
+                if (const CompiledPipeline hit = LinkGplPair(libs, foi_sq, true, true); hit.main) {
+                    vkDestroyPipeline(dev, hit.main, nullptr);
+                    if (hit.square) vkDestroyPipeline(dev, hit.square, nullptr);
+                    ++pl_cached;
+                    cache.PipelineCompleted();
+                    return;
+                }
+                if (job.is_wad && wad_compiled.fetch_add(1, std::memory_order_relaxed) >= wad_pl_budget) {
+                    ++pl_skipped;
+                    cache.PipelineCompleted();
+                    return;
+                }
+                std::call_once(aot_begin_once, Gow3::BeginAotBuild);
+                if (const CompiledPipeline built = LinkGplPair(libs, foi_sq, true, false); built.main) {
+                    vkDestroyPipeline(dev, built.main, nullptr);
+                    if (built.square) vkDestroyPipeline(dev, built.square, nullptr);
+                    ++pl_compiled;
+                } else {
+                    ++pl_failed;
+                }
+                cache.PipelineCompleted();
+                return;
+            }
+            const ShaderRef vs_ref{gk.vs_key, VK_NULL_HANDLE, vs_mod, VK_NULL_HANDLE};
+            const ShaderRef ps_ref{gk.ps_key, VK_NULL_HANDLE, ps_mod, VK_NULL_HANDLE};
+            if (const CompiledPipeline hit = CreateMonolithicPipeline(vs_ref, ps_ref, gs_ref, gk.state, true); hit.main) {
+                vkDestroyPipeline(dev, hit.main, nullptr);
+                if (hit.square) vkDestroyPipeline(dev, hit.square, nullptr);
+                ++pl_cached;
+                cache.PipelineCompleted();
+                return;
+            }
+            if (job.is_wad && wad_compiled.fetch_add(1, std::memory_order_relaxed) >= wad_pl_budget) {
+                ++pl_skipped;
+                cache.PipelineCompleted();
+                return;
+            }
+            std::call_once(aot_begin_once, Gow3::BeginAotBuild);
+            if (const CompiledPipeline built = CreateMonolithicPipeline(vs_ref, ps_ref, gs_ref, gk.state, false); built.main) {
+                vkDestroyPipeline(dev, built.main, nullptr);
+                if (built.square) vkDestroyPipeline(dev, built.square, nullptr);
+                ++pl_compiled;
+            } else {
+                ++pl_failed;
+            }
+            cache.PipelineCompleted();
+        });
+
+        Say("AOT: pipelines: %zu graphics (%u cached, %u compiled, %u skipped, %u failed), %zu compute (%u cached, %u compiled, %u failed) (%.1f s)\n",
+            pl_jobs.size(), pl_cached.load(), pl_compiled.load(), pl_skipped.load(), pl_failed.load(),
+            compute_keys.size(), cs_cached.load(), cs_compiled.load(), cs_failed.load(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - pl_start).count());
+    }
+
     Aot::SetPhase(Aot::Phase::Finalizing);
     for (u32 f = 0; f < index.files.size(); ++f)
         if (const std::string name = f ? WadName(index.files[f].c_str()) : "EBOOT"; !name.empty() && !wad_keys[f].empty())
             cache.SetWadKeys(name, wad_keys[f], wad_binaries[f]);
     give_hot();  // again, with the binaries this build made
+    if (caps.path != ShaderPath::Objects) SavePipelineCache(true);
     cache.Finish();
     Say("AOT: done (%.1f s)\n", seconds());
 }

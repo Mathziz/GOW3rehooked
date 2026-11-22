@@ -269,20 +269,26 @@ bool Renderer::Impl::Setup(std::string& error) {
     const VkDescriptorSetLayout layouts[2]{set_layout, table_layout};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 2, layouts, 1, &pcr};
     if (const VkResult e = vkCreatePipelineLayout(dev, &plci, nullptr, &layout); e != VK_SUCCESS) Report(std::format("vkCreatePipelineLayout {}", (int)e));
-    if (caps.path != ShaderPath::Objects) CreatePipelineCache();
+    if (caps.path != ShaderPath::Objects) {
+        if (ShaderCache::Instance().Enabled())
+            PipelineRecipes::Instance().Configure(ShaderCache::Instance().Directory());
+        LoadPipelineCache();
+    }
     if (caps.path == ShaderPath::Gpl) SetupGplGlobals();
     if (!SetupClearRect(error)) return false;
     GOW3_DIAG TempDeviceReport(fp);
-    ShaderCache::Instance().prepare = [this](u64 key, u64 binary, u32 stage) { return Prepare(key, binary, stage); };
+    ShaderCache::Instance().SetPrepare([this](u64 key, u64 binary, u32 stage) { return Prepare(key, binary, stage); });
     if (ShaderCache::Instance().Enabled() && ShaderCache::Instance().Kind() == CacheKind::Aot) AotBuild();  // the game waits for the build
+    if (caps.path != ShaderPath::Objects && ShaderCache::Instance().Enabled()) {
+        ShaderCache::Instance().SetWarmPipelines([this] { WarmPipelines(); });
+        ShaderCache::Instance().SetPipelineCacheFlusher([this](bool force) { SavePipelineCache(force); });
+    }
     return true;
 }
 
 Renderer::Renderer() : d(std::make_unique<Impl>()) {}
 Renderer::~Renderer() {
     if (!d->dev) return;
-    ShaderCache::Instance().Finish();
-    Recipes::Instance().Report();
     {
         std::scoped_lock lock(d->pool_lock);
         d->pool_stop = true;
@@ -297,6 +303,11 @@ Renderer::~Renderer() {
     for (auto& w : d->recorders)
         for (auto p : w.pool) vkDestroyCommandPool(d->dev, p, nullptr);
     d->StopCompilers();
+    ShaderCache::Instance().ClearRendererCallbacks();
+    if (d->caps.path != ShaderPath::Objects) d->SavePipelineCache(true);
+    ShaderCache::Instance().Finish();
+    Recipes::Instance().Report();
+    PipelineRecipes::Instance().Report();
     for (auto& [k, f] : d->compiling_pipelines) (void)f.get();
     d->compiling_pipelines.clear();
     for (auto& [k, f] : d->compiling) {

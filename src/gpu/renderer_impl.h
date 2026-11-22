@@ -741,6 +741,7 @@ struct Renderer::Impl {
     std::unordered_map<u64, Variant> variants;
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
     std::atomic<u32> pipeline_cache_dirty{0};
+    std::mutex pipeline_cache_save_lock;
     std::unordered_map<u64, CompiledPipeline> pipelines;   // GraphicsPipelineKey::Hash() -> main/square VkPipeline (under prog_lock)
     // Tier 2 (Gpl): 4-part Graphics Pipeline Library caches + LTO upgrade dedup set (under prog_lock).
     VkPipeline gpl_vi[3]{};                              // Vertex Input Interface: POINT_LIST, LINE_LIST, TRIANGLE_LIST
@@ -804,7 +805,7 @@ struct Renderer::Impl {
     void StopCompilers();
     void AotBuild();
     // shader_contract.cpp: the draw configurations the catalog implies, as recipes (translation keys the runtime would compute).
-    void Contracts(const Catalog::Data& data, std::vector<Contracted>& out);
+    void Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out = nullptr);
     static inline thread_local bool waiting = false;  // the shader a draw asked for is still compiling (Jit::Mode::Async)
     std::mutex compiled_lock;
     std::vector<Stats::Compile> compiled;
@@ -823,9 +824,11 @@ struct Renderer::Impl {
     std::vector<u8> Binary(VkShaderEXT s);  // the driver's binary of a shader object (empty: not available)
     bool ValidateNativePipelineCacheData(std::span<const u8> data) const;
     void CreatePipelineCache(std::span<const u8> initial_data = {});
+    void LoadPipelineCache();
+    void SavePipelineCache(bool force = false);
     void DestroyShaderRef(const ShaderRef& r);
     VkShaderModule CreateShaderModule(std::span<const u32> spirv);
-    VkPipeline CreateComputePipeline(std::span<const u32> spirv);
+    VkPipeline CreateComputePipeline(std::span<const u32> spirv, bool fail_on_compile = false);
     std::vector<VkDynamicState> BuildDynamicStates() const;
     VkPipeline CreateGraphicsPipelineRaw(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                          const FixedPipelineState& state, bool fail_on_compile, bool square_pass);
@@ -842,6 +845,7 @@ struct Renderer::Impl {
     CompiledPipeline LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, bool lto, bool fail_on_compile);
     CompiledPipeline GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                          const FixedPipelineState& raw_state, const CpuRead& cpu);
+    void WarmPipelines();
     VkPipeline IndexProbePipeline(const FixedPipelineState& state);
 
     // ---- Barriers (hazards.cpp) ----

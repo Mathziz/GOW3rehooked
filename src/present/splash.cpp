@@ -98,9 +98,12 @@ private:
         if (!phase || stage != current) phase = now, current = stage, samples.clear(), finish = -1, last = 0, fraction = 0;
         const double elapsed = std::chrono::duration<double>(now - *phase).count();
         const auto delta = [](auto value, auto start) { return value >= start ? value - start : 0; };
-        const auto total = delta(p.total, base.total), done = std::min(delta(p.done, base.done), total);
-        const auto total_weight = delta(p.total_weight, base.total_weight), done_weight = std::min(delta(p.done_weight, base.done_weight), total_weight);
-        const bool measured = stage == Phase::Index || stage == Phase::Recipes || stage == Phase::Variants;
+        const bool is_pipelines = stage == Phase::Pipelines;
+        const auto total = is_pipelines ? delta(p.pipelines_total, base.pipelines_total) : delta(p.total, base.total);
+        const auto done = std::min(is_pipelines ? delta(p.pipelines_done, base.pipelines_done) : delta(p.done, base.done), total);
+        const auto total_weight = is_pipelines ? total : delta(p.total_weight, base.total_weight);
+        const auto done_weight = is_pipelines ? done : std::min(delta(p.done_weight, base.done_weight), total_weight);
+        const bool measured = stage == Phase::Index || stage == Phase::Recipes || stage == Phase::Variants || stage == Phase::Pipelines;
         // A stage with nothing to measure keeps an empty bar (a sweeping glow while it runs); finalizing shows it full.
         if (measured && total_weight) fraction = double(done_weight) / total_weight;
         else if (stage == Phase::Finalizing) fraction = 1;
@@ -122,11 +125,15 @@ private:
                                    : finish < 0 ? "ESTIMATING..." : "REMAINING: " + Duration(std::max(0.0, finish - elapsed));
         const auto count = measured && total ? std::format("{} / {}", FormatCount(done), FormatCount(total)) : std::string{};
 
-        const char* stage_label = stage == Phase::Index     ? "STAGE I · READING FILES"
-                                : stage == Phase::Recipes   ? "STAGE II · SHADER RECIPES"
-                                : stage == Phase::Catalog   ? "STAGE III · READING THE CATALOG"
-                                : stage == Phase::Variants  ? "STAGE IV · SHADERS"
-                                : stage == Phase::Finalizing? "STAGE V · FINALIZING"
+        const char* finalizing_label = Gpu::Aot::has_pipelines_phase.load(std::memory_order_acquire)
+                                           ? "STAGE VI · FINALIZING"
+                                           : "STAGE V · FINALIZING";
+        const char* stage_label = stage == Phase::Index      ? "STAGE I · READING FILES"
+                                : stage == Phase::Recipes    ? "STAGE II · SHADER RECIPES"
+                                : stage == Phase::Catalog    ? "STAGE III · READING THE CATALOG"
+                                : stage == Phase::Variants   ? "STAGE IV · SHADERS"
+                                : stage == Phase::Pipelines  ? "STAGE V · PIPELINES"
+                                : stage == Phase::Finalizing ? finalizing_label
                                 : "STAGE · STARTING";
 
         const float H = size.y, W = size.x;

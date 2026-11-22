@@ -10,9 +10,11 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 #include "gpu/shaders/gcn_translator.h"
+#include "gpu/shaders/shader_runtime.h"
 
 namespace Gpu {
 struct RecipeHead {
@@ -54,6 +56,35 @@ private:
     FILE* file = nullptr;
     std::vector<std::uint8_t> staged;  // records not written yet
     std::vector<Recipe> recipes;
+    std::unordered_set<std::uint64_t> keys;
+};
+
+struct PipelineRecipe {
+    std::uint64_t vs_key = 0;
+    std::uint64_t ps_key = 0;
+    std::uint64_t gs_mask = 0;
+    FixedPipelineState raw_state{};  // un-canonicalized, portable across GPUs with different EDS3 caps
+    std::uint64_t RawHash() const { return GraphicsPipelineKey{vs_key, ps_key, gs_mask, raw_state}.Hash(); }
+};
+static_assert(std::is_trivially_copyable_v<PipelineRecipe>);
+static_assert(sizeof(PipelineRecipe) == 136);
+
+class PipelineRecipes {
+public:
+    static PipelineRecipes& Instance();
+    void Configure(const std::filesystem::path& dir);
+    void Note(std::uint64_t vs_key, std::uint64_t ps_key, std::uint64_t gs_mask, const FixedPipelineState& raw_state);
+    void Report() const;
+    void Flush();
+    std::vector<PipelineRecipe> All() const;
+
+private:
+    bool enabled = false;
+    std::uint32_t fresh = 0;
+    mutable std::mutex lock;
+    FILE* file = nullptr;
+    std::vector<std::uint8_t> staged;
+    std::vector<PipelineRecipe> recipes;
     std::unordered_set<std::uint64_t> keys;
 };
 } // namespace Gpu

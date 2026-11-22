@@ -99,7 +99,11 @@ public:
         std::uint32_t stage;
     };
     void SetWadHot(const std::string& wad, std::vector<Hot> hot);
-    std::function<std::uint32_t(std::uint64_t key, std::uint64_t binary, std::uint32_t stage)> prepare;
+    void SetPrepare(std::function<std::uint32_t(std::uint64_t key, std::uint64_t binary, std::uint32_t stage)> fn);
+    void SetWarmPipelines(std::function<void()> fn);
+    void SetPipelineCacheFlusher(std::function<void(bool force)> fn);
+    void ClearRendererCallbacks();
+    void NotePipelineCacheDirty(std::uint32_t count);
     void WadOpened(const char* path);
     // End of the run: trains the dictionaries and flushes.
     void Finish();
@@ -176,6 +180,11 @@ private:
     std::deque<std::string> wad_queue;
     std::unordered_set<std::uint64_t> wad_seen;
     std::jthread wad_thread;
+    std::mutex prepare_cb_lock, flush_cb_lock;
+    std::function<std::uint32_t(std::uint64_t key, std::uint64_t binary, std::uint32_t stage)> prepare_cb;
+    std::function<void()> warm_pipelines_cb;
+    std::function<void(bool force)> flush_pipeline_cache_cb;
+    std::atomic<std::uint32_t> pipeline_dirty{0};
     std::atomic<std::uint32_t> done{0}, total{0}, pipeline_done{0}, pipeline_total{0};
     std::atomic<std::uint64_t> done_weight{0}, total_weight{0};
 };

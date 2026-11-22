@@ -2,10 +2,12 @@
 // Shader runtime: identifies a draw's programs, builds the translation key and gets the shader object, translating on a miss.
 #include "gpu/shaders/shader_runtime.h"
 #include <bit>
+#include <zstd.h>
 #include "gpu/shaders/shader_jit.h"
 #include "gpu/shaders/shader_recipes.h"
 #include "gpu/textures.h"
 #include "gpu/renderer_impl.h"
+#include "main/host.h"
 
 namespace Gpu {
 namespace {
@@ -556,6 +558,87 @@ void Renderer::Impl::CreatePipelineCache(std::span<const u8> initial_data) {
     if (e != VK_SUCCESS) Report(std::format("vkCreatePipelineCache {}", (int)e)), pipeline_cache = VK_NULL_HANDLE;
 }
 
+void Renderer::Impl::LoadPipelineCache() {
+    if (caps.path == ShaderPath::Objects) return;
+    ShaderCache& sc = ShaderCache::Instance();
+    if (!sc.Enabled()) return CreatePipelineCache({});
+    const auto path = sc.Directory() / (PieceHash::UsesAes() ? "pipeline-cache-hash2-aes.bin" : "pipeline-cache-hash2-xxh.bin");
+    struct Header {
+        u32 magic, format;
+        u64 binary_seed, raw_size, packed_size, raw_hash;
+    };
+    static_assert(sizeof(Header) == 40);
+    constexpr u32 kMagic = 0x43503347, kFormat = 1;  // "G3PC"
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) return CreatePipelineCache({});
+    const auto total = in.tellg();
+    if (total < std::streamoff(sizeof(Header))) return CreatePipelineCache({});
+    in.seekg(0);
+    Header hdr{};
+    if (!in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr))) return CreatePipelineCache({});
+    if (hdr.magic != kMagic || hdr.format != kFormat || hdr.binary_seed != binary_seed || hdr.raw_size == 0 ||
+        hdr.raw_size > (512ull << 20) || hdr.packed_size == 0 || u64(total) != sizeof(Header) + hdr.packed_size)
+        return CreatePipelineCache({});
+    std::vector<u8> packed(size_t(hdr.packed_size));
+    if (!in.read(reinterpret_cast<char*>(packed.data()), std::streamsize(packed.size()))) return CreatePipelineCache({});
+    std::vector<u8> raw(size_t(hdr.raw_size));
+    const size_t got = ZSTD_decompress(raw.data(), raw.size(), packed.data(), packed.size());
+    if (ZSTD_isError(got) || got != hdr.raw_size) return CreatePipelineCache({});
+    if (PieceHash::Stable64(raw.data(), raw.size()) != hdr.raw_hash || !ValidateNativePipelineCacheData(raw))
+        return CreatePipelineCache({});
+    CreatePipelineCache(raw);
+    Gow3::Log(std::format("Pipeline cache: loaded {:.1f} MB ({:.1f} MB compressed)", raw.size() / 1048576.0, packed.size() / 1048576.0));
+}
+
+void Renderer::Impl::SavePipelineCache(bool force) {
+    ShaderCache& sc = ShaderCache::Instance();
+    if (caps.path == ShaderPath::Objects || !pipeline_cache || !sc.Enabled()) return;
+    std::scoped_lock l(pipeline_cache_save_lock);
+    const u32 before = pipeline_cache_dirty.load(std::memory_order_acquire);
+    if ((!force && before < 8) || before == 0) return;
+    size_t size = 0;
+    if (vkGetPipelineCacheData(dev, pipeline_cache, &size, nullptr) != VK_SUCCESS || !size) return;
+    std::vector<u8> raw(size);
+    if (vkGetPipelineCacheData(dev, pipeline_cache, &size, raw.data()) != VK_SUCCESS || !size) return;
+    raw.resize(size);
+    std::vector<u8> packed(ZSTD_compressBound(raw.size()));
+    const size_t packed_size = ZSTD_compress(packed.data(), packed.size(), raw.data(), raw.size(), 3);
+    if (ZSTD_isError(packed_size) || !packed_size) return;
+    packed.resize(packed_size);
+    struct Header {
+        u32 magic, format;
+        u64 binary_seed, raw_size, packed_size, raw_hash;
+    };
+    static_assert(sizeof(Header) == 40);
+    constexpr u32 kMagic = 0x43503347, kFormat = 1;  // "G3PC"
+    const Header hdr{kMagic, kFormat, binary_seed, u64(raw.size()), u64(packed.size()), PieceHash::Stable64(raw.data(), raw.size())};
+    const auto path = sc.Directory() / (PieceHash::UsesAes() ? "pipeline-cache-hash2-aes.bin" : "pipeline-cache-hash2-xxh.bin");
+    auto tmp = path;
+    tmp += ".tmp";
+    std::error_code ec;
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+        out.write(reinterpret_cast<const char*>(packed.data()), std::streamsize(packed.size()));
+        out.flush();
+        if (!out.good()) {
+            out.close();
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    const u32 prev = pipeline_cache_dirty.fetch_sub(before, std::memory_order_acq_rel);
+    const u32 left = prev >= before ? prev - before : 0;
+    if (prev < before) pipeline_cache_dirty.store(0, std::memory_order_release);
+    sc.NotePipelineCacheDirty(left);
+    Gow3::Log(std::format("Pipeline cache: saved {:.1f} MB ({:.1f} MB compressed)", raw.size() / 1048576.0, packed.size() / 1048576.0));
+}
+
 void Renderer::Impl::DestroyShaderRef(const ShaderRef& r) {
     if (r.obj && DestroyShader) DestroyShader(dev, r.obj, nullptr);
     if (r.mod) vkDestroyShaderModule(dev, r.mod, nullptr);
@@ -573,7 +656,8 @@ VkShaderModule Renderer::Impl::CreateShaderModule(std::span<const u32> spirv) {
     return mod;
 }
 
-VkPipeline Renderer::Impl::CreateComputePipeline(std::span<const u32> spirv) {
+VkPipeline Renderer::Impl::CreateComputePipeline(std::span<const u32> spirv, bool fail_on_compile) {
+    if (fail_on_compile && !caps.cache_control) return VK_NULL_HANDLE;
     if (spirv.empty()) return VK_NULL_HANDLE;
     VkShaderModule mod = VK_NULL_HANDLE;
     VkShaderModuleCreateInfo mod_ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, spirv.size_bytes(), spirv.data()};
@@ -584,16 +668,17 @@ VkPipeline Renderer::Impl::CreateComputePipeline(std::span<const u32> spirv) {
         if (!mod) return VK_NULL_HANDLE;
         stage.module = mod;
     }
-    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stage, layout};
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr,
+                                   fail_on_compile ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0u, stage, layout};
     VkPipeline pl = VK_NULL_HANDLE;
     const VkResult e = vkCreateComputePipelines(dev, pipeline_cache, 1, &ci, nullptr, &pl);
     if (mod) vkDestroyShaderModule(dev, mod, nullptr);
-    if (e != VK_SUCCESS) {
-        Report(std::format("vkCreateComputePipelines {}: {} bytes", (int)e, spirv.size_bytes()));
-        return VK_NULL_HANDLE;
+    if (e == VK_SUCCESS) {
+        if (!fail_on_compile) ShaderCache::Instance().NotePipelineCacheDirty(pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed) + 1);
+        return pl;
     }
-    pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
-    return pl;
+    if (e < 0) Report(std::format("vkCreateComputePipelines {}: {} bytes", (int)e, spirv.size_bytes()));
+    return VK_NULL_HANDLE;
 }
 
 std::vector<VkDynamicState> Renderer::Impl::BuildDynamicStates() const {
@@ -703,7 +788,7 @@ VkPipeline Renderer::Impl::CreateGraphicsPipelineRaw(const ShaderRef& vs, const 
     VkPipeline pl = VK_NULL_HANDLE;
     const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl);
     if (e == VK_SUCCESS) {
-        if (!fail_on_compile) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+        if (!fail_on_compile) ShaderCache::Instance().NotePipelineCacheDirty(pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed) + 1);
         return pl;
     }
     if (e < 0) Report(std::format("vkCreateGraphicsPipelines {}: vs {:x} ps {:x}", (int)e, vs.key, ps.key));
@@ -978,7 +1063,7 @@ VkPipeline Renderer::Impl::LinkGplPipeline(const VkPipeline (&libs)[4], bool lto
     VkPipeline pl = VK_NULL_HANDLE;
     const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl);
     if (e == VK_SUCCESS) {
-        if (lto && !fail_on_compile) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+        if (lto && !fail_on_compile) ShaderCache::Instance().NotePipelineCacheDirty(pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed) + 1);
         return pl;
     }
     if (e < 0) Report(std::format("vkCreateGraphicsPipelines GPL Link(lto={}) {}", lto, (int)e));
@@ -1012,6 +1097,9 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
         std::shared_lock lock(prog_lock);
         if (auto it = pipelines.find(h); it != pipelines.end()) return pm[h] = it->second;
     }
+    if (!stats.trace && !boom_on)
+        PipelineRecipes::Instance().Note(vs.key, ps ? ps.key : 0ull,
+                                         (raw_state.flags & FixedPipelineState::kHasGs) ? gs.key : 0ull, raw_state);
     if (caps.path == ShaderPath::Gpl) {
         const VkPipeline vi = gpl_vi[std::min<u8>(gkey.state.topology_class, 2)];
         const VkPipeline prerast = GetGplPreRaster(vs, gs, gkey.state);
@@ -1103,6 +1191,60 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
     Stalled(stall_waits, stall_wait_ns, [&] { pl = f.get(); });
     if (!pl.main) return {};
     return pm[h] = pl;
+}
+
+void Renderer::Impl::WarmPipelines() {
+    if (caps.path == ShaderPath::Objects || !caps.cache_control) return;
+    const auto recipes = PipelineRecipes::Instance().All();
+    for (const PipelineRecipe& r : recipes) {
+        GraphicsPipelineKey gk{r.vs_key, (r.raw_state.flags & FixedPipelineState::kHasPs) ? r.ps_key : 0ull,
+                               (r.raw_state.flags & FixedPipelineState::kHasGs) ? r.gs_mask : 0ull, r.raw_state};
+        gk.state.Canonicalize(caps);
+        const u64 h = gk.Hash();
+        ShaderRef vs{}, ps{}, gs{};
+        {
+            std::shared_lock lock(prog_lock);
+            if (pipelines.contains(h) || compiling_pipelines.contains(h)) continue;
+            if (gk.vs_key == kClearRectVsKey) {
+                vs = clear_rect_ref;
+            } else if (auto it = shaders.find(gk.vs_key); it != shaders.end()) {
+                vs = it->second;
+            }
+            if (!vs.mod) continue;
+            if (gk.ps_key) {
+                auto it = shaders.find(gk.ps_key);
+                if (it == shaders.end() || !it->second.mod) continue;
+                ps = it->second;
+            }
+            if (gk.state.flags & FixedPipelineState::kHasGs) {
+                auto it = rect_gs.find(gk.gs_mask);
+                if (it == rect_gs.end() || !it->second.mod) continue;
+                gs = it->second;
+            }
+        }
+        CompiledPipeline pl{};
+        if (caps.path == ShaderPath::Gpl) {
+            const VkPipeline vi = gpl_vi[std::min<u8>(gk.state.topology_class, 2)];
+            const VkPipeline prerast = GetGplPreRaster(vs, gs, gk.state);
+            const VkPipeline fs = GetGplFragShader(ps, gk.state);
+            const VkPipeline foi = GetGplFragOutput(gk.state, false);
+            const bool need_sq = gk.state.NeedsSquarePipeline(caps);
+            const VkPipeline foi_sq = need_sq ? GetGplFragOutput(gk.state, true) : VK_NULL_HANDLE;
+            if (vi && prerast && fs && foi && (!need_sq || foi_sq)) {
+                const VkPipeline libs[4]{vi, prerast, fs, foi};
+                pl = LinkGplPair(libs, foi_sq, true, true);
+            }
+        } else {
+            pl = CreateMonolithicPipeline(vs, ps, gs, gk.state, true);
+        }
+        if (!pl.main) continue;
+        std::unique_lock lock(prog_lock);
+        auto [it, inserted] = pipelines.try_emplace(h, pl);
+        if (!inserted) {
+            vkDestroyPipeline(dev, pl.main, nullptr);
+            if (pl.square) vkDestroyPipeline(dev, pl.square, nullptr);
+        }
+    }
 }
 
 VkPipeline Renderer::Impl::IndexProbePipeline(const FixedPipelineState& raw_state) {

@@ -113,15 +113,32 @@ Compiled Renderer::Impl::Compile(Gcn::Stage stage, u64 prog, u64 key, Gcn::Input
 }
 
 u32 Renderer::Impl::Prepare(u64 key, u64 binary, u32 stage) {
-    if (caps.path != ShaderPath::Objects) return 0;
     static constexpr VkShaderStageFlagBits vk_stage[]{VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
     if (stage >= std::size(vk_stage)) return 2;
     {
         std::shared_lock lock(prog_lock);
         if (shaders.contains(key) || compiling.contains(key)) return 0;
     }
-    const auto bin = ShaderCache::Instance().FindBinary(binary);
     const bool vertex = stage == u32(Gcn::Stage::Vertex);
+    if (caps.path != ShaderPath::Objects) {
+        const auto hit = ShaderCache::Instance().Find(key);
+        if (!hit || hit->spirv.empty()) return 2;
+        ShaderRef ref{key};
+        if (stage == u32(Gcn::Stage::Compute)) {
+            ref.pl = CreateComputePipeline(hit->spirv);
+        } else {
+            ref.mod = CreateShaderModule(hit->spirv);
+            if (caps.path == ShaderPath::Gpl && ref.mod)
+                ref.pl = vertex ? CreateGplPreRaster(ref.mod, VK_NULL_HANDLE, false, false) : CreateGplFragShader(ref.mod, 1);
+        }
+        if (!ref) return 2;
+        std::unique_lock lock(prog_lock);
+        if (shaders.contains(key)) return lock.unlock(), DestroyShaderRef(ref), 0;
+        if (vertex) vs_outputs[key] = hit->out_mask;
+        shaders[key] = ref;
+        return 1;
+    }
+    const auto bin = ShaderCache::Instance().FindBinary(binary);
     const VkShaderEXT s = bin ? CreateFrom(VK_SHADER_CODE_TYPE_BINARY_EXT, bin->data.data(), bin->data.size(), vk_stage[stage],
                                            vertex ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_GEOMETRY_BIT : 0)
                               : VK_NULL_HANDLE;

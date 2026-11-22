@@ -12,8 +12,9 @@ namespace Gpu::Aot {
 inline std::filesystem::path game_directory;  // set at startup: where the WADs are
 inline bool lazy = false;                   // fixed quarter of all WAD variants per eligible launch; EBOOT and recipes in full
 inline unsigned sample_log2 = 1;
-enum class Phase { Waiting, Index, Recipes, Catalog, Variants, Finalizing, Finished };
+enum class Phase { Waiting, Index, Recipes, Catalog, Variants, Pipelines, Finalizing, Finished };
 inline std::atomic<Phase> phase{Phase::Waiting};
+inline std::atomic<bool> has_pipelines_phase{false};
 inline ShaderCache::Progress phase_start[static_cast<unsigned>(Phase::Finished)]{};
 inline void SetPhase(Phase next) {
     if (next != Phase::Finished) phase_start[static_cast<unsigned>(next)] = ShaderCache::Instance().Snapshot();

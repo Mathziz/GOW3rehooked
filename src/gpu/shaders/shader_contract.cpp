@@ -33,6 +33,8 @@ struct Job {
     u8 mrt_map{0xE4};                    // export swizzle of the active targets: 0xE4 identity, 0xC6 BGRA
     std::array<u32, 16> words{};         // vertex buffer table: the V# word 3 of each slot
     std::vector<std::vector<std::pair<u32, CatImage>>> srts;  // per SRT root: T# by dword offset
+    u32 pair_id = ~0u;
+    std::vector<u32> pair_ids;
 };
 struct Key {
     u64 low, high;
@@ -128,7 +130,7 @@ Job Base(const Mapping& f, const CatShader& shader, u32 source, std::span<const 
 }
 } // namespace
 
-void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted>& out) {
+void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out) {
     const auto begin = std::chrono::steady_clock::now();
     const u32 sample_log2 = data.sample_log2;
     CatImage fallback = Catalog::ApiFormat(0xfac00a);
@@ -140,10 +142,20 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
 
     std::vector<Job> jobs;
     std::unordered_map<Key, size_t, KeyHash> seen;  // configuration -> its place in `jobs`
+    struct PairMeta {
+        u32 file = ~0u;
+        bool is_material = false;
+        u8 samples = 0;
+    };
+    std::vector<PairMeta> pair_metas;
     const auto add = [&](const Job& job) {
         const auto [at, fresh] = seen.emplace(Signature(job), jobs.size());
         if (fresh) jobs.push_back(job);
         jobs[at->second].paths |= 1u << job.path;
+        if (job.pair_id != ~0u) {
+            auto& ids = jobs[at->second].pair_ids;
+            if (std::find(ids.begin(), ids.end(), job.pair_id) == ids.end()) ids.push_back(job.pair_id);
+        }
     };
     // Pixel jobs vary where pass code decides at draw time: image type and the sRGB view of generic slots. Only the plain case
     // is made: the catalog's sampler flags and the BGRA scene target (0xC6, 99.8% of the pixel recipes met in play); other
@@ -198,9 +210,9 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         return api ? (api & 15) << 15 | (api >> 8 & 7) << 12 | (api >> 12 & 4095) : NullWord;
     };
     // Recipe streams the mesh does not supply stay on the engine's null V#; without a mesh every stream is bound.
-    const auto vertex_job = [&](const Mapping& f, const CatRecipe& recipe, u32 source, const std::vector<Stream>* streams) {
+    const auto vertex_job = [&](const Mapping& f, const CatRecipe& recipe, u32 source, const std::vector<Stream>* streams, u32 pair_id) {
         Job job = Base(f, *recipe.vs, source);
-        job.vertex = true, job.words.fill(NullWord);
+        job.vertex = true, job.words.fill(NullWord), job.pair_id = pair_id;
         for (const auto& binding : recipe.vertex) {
             if (streams && std::ranges::find(*streams, binding.source, &Stream::source) == streams->end()) continue;
             job.words[binding.slot] = binding.word;
@@ -208,11 +220,12 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         return job;
     };
     // Pass views win for pass semantics; otherwise the material's texture, or nothing when no material is known.
-    const auto pixel_jobs = [&](const Mapping& f, const CatRecipe& recipe, u32 source, const std::map<u32, CatImage>* material) {
+    const auto pixel_jobs = [&](const Mapping& f, const CatRecipe& recipe, u32 source, const std::map<u32, CatImage>* material, u32 pair_id) {
         std::optional<u32> exact;
         if (material) exact = (recipe.permutation == ~u64{} ? 0 : u32(recipe.permutation)) & 2 ? 14u : 9u;
         Job job = Base(f, *recipe.ps, source, HeaderBytes(f, *recipe.vs));
         job.path = material ? kPsMaterial : kPsPass;
+        job.pair_id = pair_id;
         u32 msaa{}, generic{};
         for (const auto& binding : recipe.textures) {
             const auto* view = view_of(binding.source);
@@ -267,6 +280,17 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         const auto& recipes = file.recipes;
         std::unordered_map<u32, std::vector<size_t>> families;
         for (size_t i = 0; i < recipes.size(); ++i) families[recipes[i].shader_key].push_back(i);
+        std::unordered_set<u32> material_keys;
+        for (const auto& material : file.materials) if (!material.pass_supplies_shader) for (const auto& layer : material.layers) material_keys.insert(layer.shader_key);
+        const u32 pair_base = u32(pair_metas.size());
+        if (pipelines_out) {
+            pair_metas.reserve(pair_base + recipes.size());
+            for (const auto& r : recipes) {
+                const bool is_mat = material_keys.contains(r.shader_key);
+                const u8 samp = is_mat ? u8((r.permutation != ~u64{} && (r.permutation & 2)) ? (1u << sample_log2) : 1u) : u8(0);
+                pair_metas.push_back({index_file, is_mat, samp});
+            }
+        }
         // Model meshes: the mesh streams bind for every layer recipe of the material.
         std::set<size_t> reached;
         std::set<std::pair<size_t, u64>> meshes_seen;
@@ -278,7 +302,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 if (!recipe.vs) continue;
                 reached.insert(index);
                 if (!meshes_seen.emplace(index, presence(recipe, streams) | u64(material.flags & 0x40) << 32).second) continue;
-                const auto job = vertex_job(f, recipe, index_file, &streams);
+                const auto job = vertex_job(f, recipe, index_file, &streams, pipelines_out ? pair_base + u32(index) : ~0u);
                 vertex_variants(job, kVsMesh);
                 // Bit-0x40 materials render as TextFX glyphs with a fixed declaration.
                 if (material.flags & 0x40) {
@@ -290,8 +314,6 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
             }
         } catch (const std::exception& error) { setup_failed(error); }
         // Material layers: each texture semantic samples the material's texture with its sRGB flag.
-        std::unordered_set<u32> material_keys;
-        for (const auto& material : file.materials) if (!material.pass_supplies_shader) for (const auto& layer : material.layers) material_keys.insert(layer.shader_key);
         for (const auto& material : file.materials) {
             if (material.pass_supplies_shader) continue;
             try {
@@ -307,22 +329,25 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                         images[semantic] = image;
                     }
                     for (const size_t index : families[layer.shader_key])
-                        if (const auto& recipe = recipes[index]; recipe.ps && recipe.vs) pixel_jobs(f, recipe, index_file, &images);
+                        if (const auto& recipe = recipes[index]; recipe.ps && recipe.vs)
+                            pixel_jobs(f, recipe, index_file, &images, pipelines_out ? pair_base + u32(index) : ~0u);
                 }
             } catch (const std::exception& error) { setup_failed(error); }
         }
         for (size_t index = 0; index < recipes.size(); ++index) try {
             const auto& recipe = recipes[index];
+            const u32 pid = pipelines_out ? pair_base + u32(index) : ~0u;
             // Procedural recipes (pass code binds the streams): the recipe's own declaration, and each stream set the meshes
             // supply. Other component counts pass code may pick at run time come from the recipes.
             if (recipe.vs && !reached.contains(index)) {
-                const auto job = vertex_job(f, recipe, index_file, nullptr);
+                const auto job = vertex_job(f, recipe, index_file, nullptr, pid);
                 vertex_variants(job, kVsProcedural);
                 std::set<u32> masks;
-                for (const auto& streams : layouts) if (masks.insert(presence(recipe, streams)).second) vertex_variants(vertex_job(f, recipe, index_file, &streams), kVsLayout);
+                for (const auto& streams : layouts)
+                    if (masks.insert(presence(recipe, streams)).second) vertex_variants(vertex_job(f, recipe, index_file, &streams, pid), kVsLayout);
                 // Pass code may also widen several streams to four components at once (e.g. xyz1 -> xyzw).
             }
-            if (recipe.ps && recipe.vs && !material_keys.contains(recipe.shader_key)) pixel_jobs(f, recipe, index_file, nullptr);
+            if (recipe.ps && recipe.vs && !material_keys.contains(recipe.shader_key)) pixel_jobs(f, recipe, index_file, nullptr, pid);
         } catch (const std::exception& error) { setup_failed(error); }
     }
     const Mapping& eboot = *data.eboot;
@@ -350,16 +375,18 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         } catch (const std::exception& error) { setup_failed(error); }
     }
     for (const auto& [_, pair] : groups) try {
+        const u32 pid = pipelines_out ? u32(pair_metas.size()) : ~0u;
+        if (pipelines_out) pair_metas.push_back({~0u, false, 0});
         const auto vs = pair.find(1), ps = pair.find(0);
         if (vs != pair.end()) {
             Job job = Base(eboot, *vs->second, ~0u);
-            job.vertex = true, job.words.fill(NullWord);
+            job.vertex = true, job.words.fill(NullWord), job.pair_id = pid;
             vertex_variants(job, kVsEmbedded);
         }
         if (ps != pair.end() && vs != pair.end()) {
             // Pass code binds the samplers the header declares; their slots need not match the image slots.
             Job job = Base(eboot, *ps->second, ~0u, HeaderBytes(eboot, *vs->second));
-            job.path = kPsEmbedded;
+            job.path = kPsEmbedded, job.pair_id = pid;
             for (const auto& usage : ps->second->usage) if (usage[0] == 1 && usage[1] < 32) job.samplers |= 1u << usage[1];
             pixel_variants(job, 0, std::nullopt);
         }
@@ -373,8 +400,17 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
     // descriptors the configuration implies, and the runtime's own SpecifySlots turns them into specs and the key.
     // Jobs of one program are adjacent, so a worker analyses a program once per chunk.
     std::ranges::sort(jobs, [](const Job& a, const Job& b) { return std::less<const void*>{}(a.shader, b.shader); });
+    struct PairEntry {
+        u32 pair_id;
+        u64 key;
+        u32 col_format;
+        u32 paths;
+        u8 stage;
+        bool rect;
+    };
     struct Mine {
         std::vector<Contracted> list;
+        std::vector<PairEntry> pairs;
         std::map<std::string, u32> why;
     };
     const u32 threads = Gow3::Cpu::plan.shader_threads;
@@ -505,6 +541,10 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                             if (cur.generated) c.recipe.fetch = cur.fetch;
                             else if (!cur.fetch.empty()) c.fetch = {f.data + s.footer + 28, cur.fetch.size() * 4};
                             mine[t].list.push_back(std::move(c));
+                            if (pipelines_out && !job.pair_ids.empty() && (stage == Gcn::Stage::Vertex || stage == Gcn::Stage::Pixel)) {
+                                for (u32 pid : job.pair_ids)
+                                    mine[t].pairs.push_back({pid, p.key, in.col_format, job.paths, u8(stage), job.rect});
+                            }
                         };
                         add_contract();
                         if (cur.code_hash == Gcn::MotionVectorResolveCodeHash()) {
@@ -546,6 +586,145 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         else out[at->second].paths |= c.paths;
     std::fprintf(stderr, "AOT: contract: %zu variants from %zu configurations (%.1f s)\n", out.size(), jobs.size(),
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    if (pipelines_out) {
+        pipelines_out->clear();
+        struct PsCand {
+            u64 key;
+            u32 col_format;
+        };
+        struct Bucket {
+            std::vector<u64> primary_vs, fallback_vs;
+            std::vector<PsCand> primary_ps, fallback_ps;
+        };
+        std::vector<Bucket> buckets(pair_metas.size());
+        for (const Mine& m : mine) {
+            for (const PairEntry& e : m.pairs) {
+                if (e.pair_id >= buckets.size()) continue;
+                Bucket& b = buckets[e.pair_id];
+                if (e.stage == u8(Gcn::Stage::Vertex) && !e.rect) {
+                    const bool prim = (e.paths & ((1u << kVsMesh) | (1u << kVsProcedural) | (1u << kVsEmbedded))) != 0;
+                    auto& dst = prim ? b.primary_vs : b.fallback_vs;
+                    if (std::find(dst.begin(), dst.end(), e.key) == dst.end()) dst.push_back(e.key);
+                } else if (e.stage == u8(Gcn::Stage::Pixel)) {
+                    const bool prim = (e.paths & ((1u << kPsMaterial) | (1u << kPsPass) | (1u << kPsEmbedded))) != 0;
+                    auto& dst = prim ? b.primary_ps : b.fallback_ps;
+                    if (std::none_of(dst.begin(), dst.end(), [&](const PsCand& c) { return c.key == e.key && c.col_format == e.col_format; }))
+                        dst.push_back({e.key, e.col_format});
+                }
+            }
+        }
+        VkFormat scene_fmt = SurfaceFormat(data.scene_color.data_format, data.scene_color.num_format);
+        if (scene_fmt == VK_FORMAT_UNDEFINED) scene_fmt = VK_FORMAT_R8G8B8A8_SRGB;
+
+        std::vector<ContractedPipeline> derived;
+        auto emit = [&](u64 vs_key, u64 ps_key, u32 file, const FixedPipelineState& st) {
+            derived.push_back({vs_key, ps_key, 0ull, file, 0u, st});
+        };
+        for (size_t pid = 0; pid < pair_metas.size(); ++pid) {
+            const PairMeta& meta = pair_metas[pid];
+            const Bucket& b = buckets[pid];
+            const auto& vs_list = !b.primary_vs.empty() ? b.primary_vs : b.fallback_vs;
+            const auto& ps_list = !b.primary_ps.empty() ? b.primary_ps : b.fallback_ps;
+            if (vs_list.empty()) continue;
+            if (ps_list.empty()) {
+                const u8 ms_samples = meta.samples ? meta.samples : u8(1u << sample_log2);
+                const size_t lim = std::min<size_t>(vs_list.size(), 8);
+                for (size_t vi = 0; vi < lim; ++vi) {
+                    FixedPipelineState z_ms{};
+                    z_ms.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                    z_ms.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                    z_ms.samples = ms_samples;
+                    z_ms.topology_class = 2;
+                    emit(vs_list[vi], 0, meta.file, z_ms);
+
+                    FixedPipelineState z_shadow{};
+                    z_shadow.depth_format = VK_FORMAT_D32_SFLOAT;
+                    z_shadow.samples = 1;
+                    z_shadow.topology_class = 2;
+                    emit(vs_list[vi], 0, meta.file, z_shadow);
+                }
+                continue;
+            }
+            u32 pair_count = 0;
+            for (u64 vs_key : vs_list) {
+                for (const PsCand& pc : ps_list) {
+                    if (pair_count >= 32) break;
+                    ++pair_count;
+                    u32 color_count = 0;
+                    for (u32 k = 0; k < 8; ++k)
+                        if (pc.col_format >> (4 * k) & 0xF) color_count = k + 1;
+                    FixedPipelineState s{};
+                    s.color_count = u8(color_count);
+                    for (u32 k = 0; k < color_count; ++k) {
+                        if (pc.col_format >> (4 * k) & 0xF)
+                            s.color_formats[k] = (k == 0) ? scene_fmt : VK_FORMAT_R8G8B8A8_UNORM;
+                        s.blend[k] = {0, 0xF,
+                                      u8(VK_BLEND_FACTOR_ONE), u8(VK_BLEND_FACTOR_ZERO), u8(VK_BLEND_OP_ADD),
+                                      u8(VK_BLEND_FACTOR_ONE), u8(VK_BLEND_FACTOR_ZERO), u8(VK_BLEND_OP_ADD)};
+                    }
+                    s.topology_class = 2;
+                    s.flags = FixedPipelineState::kHasPs;
+                    if (meta.is_material) {
+                        s.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                        s.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                        s.samples = meta.samples;
+                        emit(vs_key, pc.key, meta.file, s);
+                        if (color_count > 0) {
+                            FixedPipelineState alpha = s;
+                            alpha.blend[0] = {1, 0xF,
+                                              u8(VK_BLEND_FACTOR_SRC_ALPHA), u8(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA), u8(VK_BLEND_OP_ADD),
+                                              u8(VK_BLEND_FACTOR_SRC_ALPHA), u8(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA), u8(VK_BLEND_OP_ADD)};
+                            emit(vs_key, pc.key, meta.file, alpha);
+                        }
+                    } else if (color_count == 0) {
+                        s.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                        s.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                        s.samples = u8(1u << sample_log2);
+                        emit(vs_key, pc.key, meta.file, s);
+                        if (sample_log2 > 0) {
+                            s.samples = 1;
+                            emit(vs_key, pc.key, meta.file, s);
+                        }
+                    } else {
+                        FixedPipelineState pass1x = s;
+                        pass1x.samples = 1;
+                        emit(vs_key, pc.key, meta.file, pass1x);
+                        FixedPipelineState msaa = s;
+                        msaa.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                        msaa.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                        msaa.samples = u8(1u << sample_log2);
+                        emit(vs_key, pc.key, meta.file, msaa);
+                    }
+                }
+                if (pair_count >= 32) break;
+            }
+        }
+        auto raw_hash = [](const ContractedPipeline& p) {
+            return GraphicsPipelineKey{p.vs_key, p.ps_key, p.gs_mask, p.state}.Hash();
+        };
+        std::ranges::sort(derived, {}, [&](const ContractedPipeline& p) {
+            return std::tuple{p.file + 1, p.vs_key, p.ps_key, p.gs_mask, raw_hash(p)};
+        });
+        std::unordered_multimap<u64, size_t> seen_pl;
+        pipelines_out->reserve(derived.size());
+        for (const ContractedPipeline& cp : derived) {
+            const u64 h = raw_hash(cp);
+            auto [lo, hi] = seen_pl.equal_range(h);
+            bool dup = false;
+            for (auto it = lo; it != hi; ++it) {
+                const ContractedPipeline& prev = (*pipelines_out)[it->second];
+                if (prev.vs_key == cp.vs_key && prev.ps_key == cp.ps_key && prev.gs_mask == cp.gs_mask && prev.state == cp.state) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                seen_pl.emplace(h, pipelines_out->size());
+                pipelines_out->push_back(cp);
+            }
+        }
+        std::fprintf(stderr, "AOT: contract: %zu pipeline pairs derived\n", pipelines_out->size());
+    }
     std::vector<std::pair<u32, std::string>> ranked;  // the most frequent reasons first
     ranked.reserve(why.size());
     for (const auto& [reason, count] : why) ranked.emplace_back(count, reason);

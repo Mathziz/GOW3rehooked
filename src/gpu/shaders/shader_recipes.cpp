@@ -148,4 +148,86 @@ std::vector<Recipe> Recipes::All() const {
     std::scoped_lock l(lock);
     return recipes;
 }
+
+namespace {
+constexpr std::uint32_t kPlMagic = 0x52503347, kPlFormat = 1;  // "G3PR"
+} // namespace
+
+PipelineRecipes& PipelineRecipes::Instance() {
+    static PipelineRecipes r;
+    return r;
+}
+
+void PipelineRecipes::Configure(const std::filesystem::path& dir) {
+    std::scoped_lock l(lock);
+    if (enabled) return;
+    std::filesystem::create_directories(dir);
+    const auto path = dir / (PieceHash::UsesAes() ? "pipeline-recipes-hash2-aes.bin" : "pipeline-recipes-hash2-xxh.bin");
+    std::uintmax_t good = 8;
+    bool valid = false;
+#ifdef _WIN32
+    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+#else
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {
+#endif
+        std::uint32_t head[2];
+        valid = std::fread(head, 4, 2, f) == 2 && head[0] == kPlMagic && head[1] == kPlFormat;
+        for (PipelineRecipe r{}; valid && std::fread(&r, sizeof(r), 1, f) == 1; good += sizeof(r)) {
+            if (keys.insert(r.RawHash()).second) recipes.push_back(r);
+        }
+        std::fclose(f);
+    }
+    if (valid) {
+        std::error_code ec;
+        std::filesystem::resize_file(path, good, ec);
+    }
+#ifdef _WIN32
+    file = _wfopen(path.c_str(), valid ? L"ab" : L"wb");
+#else
+    file = std::fopen(path.c_str(), valid ? "ab" : "wb");
+#endif
+    if (!file) return;
+    if (!valid) {
+        const std::uint32_t head[2]{kPlMagic, kPlFormat};
+        std::fwrite(head, 4, 2, file);
+        std::fflush(file);
+    }
+    enabled = true;
+}
+
+void PipelineRecipes::Note(std::uint64_t vs_key, std::uint64_t ps_key, std::uint64_t gs_mask, const FixedPipelineState& raw_state) {
+    if (!vs_key) return;
+    PipelineRecipe r{vs_key, ps_key, (raw_state.flags & FixedPipelineState::kHasGs) ? gs_mask : 0ull, raw_state};
+    r.raw_state.pad[0] = r.raw_state.pad[1] = 0;
+    for (u32 k = r.raw_state.color_count; k < 8; ++k)
+        r.raw_state.color_formats[k] = VK_FORMAT_UNDEFINED, r.raw_state.blend[k] = {};
+    const u64 h = r.RawHash();
+    {
+        std::scoped_lock l(lock);
+        if (!enabled || !keys.insert(h).second) return;
+        ++fresh;
+        const auto* p = reinterpret_cast<const std::uint8_t*>(&r);
+        staged.insert(staged.end(), p, p + sizeof(r));
+        recipes.push_back(r);
+    }
+    ShaderCache::Instance().Dirty();
+}
+
+void PipelineRecipes::Flush() {
+    std::scoped_lock l(lock);
+    if (staged.empty() || !file) return;
+    std::fwrite(staged.data(), 1, staged.size(), file);
+    std::fflush(file);
+    staged.clear();
+}
+
+void PipelineRecipes::Report() const {
+    std::scoped_lock l(lock);
+    if (enabled) std::fprintf(stderr, "PipelineRecipes: %zu kept, %u new this run\n", recipes.size(), fresh);
+}
+
+std::vector<PipelineRecipe> PipelineRecipes::All() const {
+    std::scoped_lock l(lock);
+    return recipes;
+}
 } // namespace Gpu
