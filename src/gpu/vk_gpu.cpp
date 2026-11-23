@@ -385,7 +385,8 @@ Stats& Renderer::GetStats() {
         auto& s = d->stats;
         {
             std::scoped_lock lock(d->image_lock);
-            s.vram_mb[1] = float(d->image_blocks.size() * d->image_block_size) * mb, s.vram_mb[2] = float(d->image_free) * mb;
+            s.vram_mb[1] = float(d->image_blocks.size() * d->image_block_size) * mb, s.vram_mb[2] = float(d->image_free[0] + d->image_free[1]) * mb;
+            s.vram_mb[5] = float(std::count_if(d->image_blocks.begin(), d->image_blocks.end(), [](auto& b) { return b.lasting; }) * d->image_block_size) * mb;
         }
         s.vram_mb[0] = float(d->mirror_chunks.load(std::memory_order_relaxed)) * mb;
         s.vram_mb[3] = float(d->dedicated_images.load(std::memory_order_relaxed)) * mb;
@@ -1956,7 +1957,7 @@ void Renderer::Impl::ProbeColor(const Target* t, const VkRect2D& sc) {
         Tex& one = probe_img[t->fmt];
         if (!one.img) {
             one = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, t->fmt, 16, 16, 1, 1, VK_SAMPLE_COUNT_1_BIT,
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, true);
             if (!one.img) return;
             ToGeneral(cmd, one.img, VK_IMAGE_ASPECT_COLOR_BIT);
         }

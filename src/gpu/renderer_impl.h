@@ -436,7 +436,7 @@ struct Renderer::Impl {
     bool SetupTextures();
     void DestroyTextures();
     Tex MakeImage(VkImageType type, VkImageViewType vtype, VkFormat fmt, u32 w, u32 h, u32 depth, u32 layers, VkSampleCountFlagBits samples,
-                  VkImageUsageFlags usage, VkImageAspectFlags aspect, u32 levels = 1, VkImageCreateFlags flags = 0);
+                  VkImageUsageFlags usage, VkImageAspectFlags aspect, u32 levels = 1, VkImageCreateFlags flags = 0, bool lasting = false);
     // Image memory, suballocated from 128 MB blocks (first fit, aligned; freed ranges merge): vkAllocateMemory is a kernel
     // call that zeroes the pages, which held the recording for up to milliseconds per new texture. The next block is made
     // on another thread when less than half a block is free; meanwhile, and above 32 MB, an image gets its own allocation.
@@ -447,12 +447,13 @@ struct Renderer::Impl {
         VkDeviceMemory mem;
         u32 type;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+        bool lasting = false;  // targets, their copies and the dummies: images no guest memory reloads
     };
     std::mutex image_lock;
     std::vector<ImageBlock> image_blocks;
-    VkDeviceSize image_free = 0;
+    VkDeviceSize image_free[2]{};  // free bytes of the texture blocks [0] and the lasting ones [1]
     std::future<void> image_growing;
-    void ImageMemory(const VkMemoryRequirements& r, Tex& t);
+    void ImageMemory(const VkMemoryRequirements& r, Tex& t, bool lasting);
     void FreeImage(const Tex& t);
     bool ReclaimEmptyImageBlocks();
     // `usage`: the image's, when it is a storage image too: a view in a format without storage support (SRGB) leaves it out.

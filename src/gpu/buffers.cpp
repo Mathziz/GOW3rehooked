@@ -96,7 +96,7 @@ VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFla
     {
         std::scoped_lock lock(image_lock);
         img_bytes = u64(image_blocks.size()) * image_block_size;
-        img_free_bytes = image_free;
+        img_free_bytes = image_free[0] + image_free[1];
     }
     const std::string msg = std::format(
         "vkAllocateMemory {}: {} bytes, type {} of {:x}, want {:x} (held MB: mirror {}, img_blocks {} free {}, ded_img {}, dev_buf {})",

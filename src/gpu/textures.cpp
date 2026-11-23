@@ -1612,7 +1612,7 @@ bool Renderer::Impl::SetupTextures() {
             const bool storage = k < 3 && kinds[k].samples == VK_SAMPLE_COUNT_1_BIT;
             auto t = MakeImage(kinds[k].type, kinds[k].view, cls_fmt[c], 1, 1, 1, kinds[k].layers, kinds[k].samples,
                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
-                               VK_IMAGE_ASPECT_COLOR_BIT);
+                               VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, true);
             if (!t.img) return false;
             dummies.push_back(t);
             infos.push_back({VK_NULL_HANDLE, t.view, VK_IMAGE_LAYOUT_GENERAL});
@@ -1675,7 +1675,7 @@ void Renderer::Impl::DestroyTextures() {
 
 Renderer::Impl::Tex Renderer::Impl::MakeImage(VkImageType type, VkImageViewType vtype, VkFormat fmt, u32 w, u32 h, u32 depth, u32 layers,
                                               VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageAspectFlags aspect, u32 levels,
-                                              VkImageCreateFlags flags) {
+                                              VkImageCreateFlags flags, bool lasting) {
     TempTimer temp_timer{temp_make_ns, temp_makes};
     Tex t{.usage = usage};
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1688,7 +1688,7 @@ Renderer::Impl::Tex Renderer::Impl::MakeImage(VkImageType type, VkImageViewType 
                Tex{};
     VkMemoryRequirements r;
     vkGetImageMemoryRequirements(dev, t.img, &r);
-    ImageMemory(r, t);
+    ImageMemory(r, t, lasting);
     if (!t.mem) {
         vkDestroyImage(dev, t.img, nullptr);
         return Tex{};
@@ -1706,20 +1706,20 @@ Renderer::Impl::Tex Renderer::Impl::MakeImage(VkImageType type, VkImageViewType 
     return t;
 }
 
-void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t) {
+void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t, bool lasting) {
     const u32 type = Type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (r.size <= image_block_size / 4 && type != ~0u) {
         std::scoped_lock lock(image_lock);
-        if (image_free < image_block_size / 2 && (!image_growing.valid() || image_growing.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
-            image_growing = std::async(std::launch::async, [this, bits = r.memoryTypeBits] {
+        if (image_free[lasting] < image_block_size / 2 && (!image_growing.valid() || image_growing.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
+            image_growing = std::async(std::launch::async, [this, bits = r.memoryTypeBits, lasting] {
                 const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, image_block_size, DeviceType(bits, image_block_size)};
                 VkDeviceMemory m = VK_NULL_HANDLE;
                 if (vkAllocateMemory(dev, &ai, nullptr, &m) != VK_SUCCESS) return alloc_pressure.store(true, std::memory_order_relaxed);
                 std::scoped_lock lock(image_lock);
-                image_blocks.push_back({m, ai.memoryTypeIndex, {{0, image_block_size}}}), image_free += image_block_size;
+                image_blocks.push_back({m, ai.memoryTypeIndex, {{0, image_block_size}}, lasting}), image_free[lasting] += image_block_size;
             });
         for (auto& b : image_blocks) {
-            if (!(r.memoryTypeBits >> b.type & 1)) continue;
+            if (b.lasting != lasting || !(r.memoryTypeBits >> b.type & 1)) continue;
             for (auto it = b.free.begin(); it != b.free.end(); ++it) {
                 const auto [lo, n] = *it;
                 const VkDeviceSize at = (lo + r.alignment - 1) / r.alignment * r.alignment;
@@ -1727,7 +1727,7 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t) {
                 b.free.erase(it);
                 if (at > lo) b.free.emplace(lo, at - lo);
                 if (lo + n > at + r.size) b.free.emplace(at + r.size, lo + n - at - r.size);
-                image_free -= r.size, t.mem = b.mem, t.mem_offset = at, t.mem_size = r.size;
+                image_free[lasting] -= r.size, t.mem = b.mem, t.mem_offset = at, t.mem_size = r.size;
                 return;
             }
         }
@@ -1748,11 +1748,11 @@ void Renderer::Impl::FreeImage(const Tex& t) {
             auto it = b.free.emplace(t.mem_offset, t.mem_size).first;
             if (auto next = std::next(it); next != b.free.end() && it->first + it->second == next->first) it->second += next->second, b.free.erase(next);
             if (auto prev = it; it != b.free.begin() && (--prev)->first + prev->second == it->first) prev->second += it->second, b.free.erase(it);
-            image_free += t.mem_size;
+            image_free[b.lasting] += t.mem_size;
             // A block free as a whole goes back to the driver (a level load's peak otherwise stays allocated for good),
-            // keeping image_reserve_blocks of room for the next textures.
-            if (b.free.size() == 1 && b.free.begin()->second == image_block_size && image_free - image_block_size >= image_reserve_blocks * image_block_size)
-                empty = b.mem, image_free -= image_block_size, image_blocks.erase(block);
+            // keeping image_reserve_blocks of room for the next textures; a lasting one always goes.
+            if (b.free.size() == 1 && b.free.begin()->second == image_block_size && (b.lasting || image_free[0] - image_block_size >= image_reserve_blocks * image_block_size))
+                empty = b.mem, image_free[b.lasting] -= image_block_size, image_blocks.erase(block);
             break;
         }
     }
@@ -1766,7 +1766,7 @@ bool Renderer::Impl::ReclaimEmptyImageBlocks() {
         for (auto it = image_blocks.begin(); it != image_blocks.end();) {
             if (it->free.size() == 1 && it->free.begin()->second == image_block_size) {
                 empty.push_back(it->mem);
-                image_free -= image_block_size;
+                image_free[it->lasting] -= image_block_size;
                 it = image_blocks.erase(it);
             } else {
                 ++it;
@@ -1985,7 +1985,7 @@ const Renderer::Impl::Target* Renderer::Impl::GetTarget(u64 base, u32 pitch, u32
     if (storage) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     Target t{base, w, h, pitch, height, samples, fmt, depth, stencil,
              MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, fmt, w, h, 1, 1, VkSampleCountFlagBits(samples), usage, aspect, 1,
-                       flags),
+                       flags, true),
              frame, frame};
     if (!t.t.img) return Note("render target allocation failed"), nullptr;
     // New targets start cleared, in GENERAL for their whole life (phase 3 simplicity).
@@ -2050,7 +2050,7 @@ u32 Renderer::Impl::TargetTexture(Target& rt, const u32* t, int kind, u32 bindin
         if (twin && !rt.storage_copy.img) {
             rt.storage_copy = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, f, rt.w, rt.h, 1, 1, VK_SAMPLE_COUNT_1_BIT,
                                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                        VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+                                        VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, true);
             if (!rt.storage_copy.img) return Note("storage twin of a render target not creatable"), 0;
             fresh.push_back({rt.storage_copy.img, VK_IMAGE_ASPECT_COLOR_BIT});
         }
@@ -2109,7 +2109,7 @@ u32 Renderer::Impl::StencilTexture(Target& target, const u32* t, u32 binding) {
     std::scoped_lock res(res_lock);
     if (!target.stencil_copy.img) {
         target.stencil_copy = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8_UNORM, target.w, target.h, 1, 1, VK_SAMPLE_COUNT_1_BIT,
-                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, true);
         if (!target.stencil_copy.img) return Note("stencil texture creation failed"), 0;
         fresh.push_back({target.stencil_copy.img, VK_IMAGE_ASPECT_COLOR_BIT});
     }
