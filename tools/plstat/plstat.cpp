@@ -2,7 +2,8 @@
 // plstat: the graphics pipelines a run used (pipelines-*.bin, GOW3_TEMP_PIPELOG) against what the AOT derives
 // (pipeline-contract-*.cache), the player's pipeline recipes (in a format 2 pipelines file; earlier builds:
 // pipeline-recipes-*.bin) and the shader contract (contract-*.cache). Without a pipelines file the recipes stand for the run.
-//   plstat [--dir <shader_cache>] [--caps <hex>] [--list N] [pipelines-*.bin ...]
+//   plstat [--dir <shader_cache>] [--caps <hex>] [--list N] [--srnf 0|1] [--samples N] [--interlock 0|1] [--like <shader_cache>] [pipelines-*.bin ...]
+// --like: another GPU's derivation and pipeline recipes, translated to this folder's GPU by Recipe::Id (what shipping them gives).
 #define _CRT_SECURE_NO_WARNINGS
 #include <algorithm>
 #include <cctype>
@@ -18,6 +19,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#define XXH_INLINE_ALL
+#include "gpu/piece_hash.h"
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
@@ -162,6 +165,29 @@ u32 Fields(const State& u, const State& c) {
     return n;
 }
 
+// ProgramKey + TranslationKey (shader_runtime.cpp) of a recipe: its 200-byte RecipeHead and spec words; `srnf` as the GPU sets it.
+u64 RecipeKey(const u8* h, const u64* spec, u32 n, bool srnf, bool aes) {
+    u64 code, fetch;
+    u32 rsrc1, rsrc2, ena, addr, col, interlock;
+    std::memcpy(&code, h, 8), std::memcpy(&fetch, h + 8, 8), std::memcpy(&rsrc1, h + 16, 4), std::memcpy(&rsrc2, h + 20, 4);
+    std::memcpy(&ena, h + 24, 4), std::memcpy(&addr, h + 28, 4), std::memcpy(&col, h + 32, 4), std::memcpy(&interlock, h + 196, 4);
+    const u8 stage = h[194], rect = h[195];
+    namespace PH = Gpu::PieceHash;
+    if (stage == 1 && code == (aes ? 0x7110443d8f45cc4dull : 0xb452868e19ed3cceull)) code ^= 0x6d6f74696f6e3031ull;  // MotionBlurCodeHash
+    const u64 hashes[2]{code, fetch};
+    u64 key = PH::ShaderSpecKey(spec, n * 8ull, PH::ShaderKey(hashes, sizeof(hashes), u64(stage) << 32 | rsrc2) ^ rsrc1 ^ (rect ? 1ull << 63 : 0));
+    if (stage == 2) key = PH::ShaderKey(h + 36, 12, key);
+    if (stage == 1) key = PH::ShaderKey(h + 48, 128, PH::ShaderKey(h + 176, 16, key ^ ena ^ u64(addr) << 32 ^ col));
+    if (interlock &= 0xFFFF) key = PH::ShaderKey(&interlock, 4, key);
+    return srnf ? key ^ 0x53544F524E4F5244ull : key;
+}
+// Recipe::Id: the head without the GPU's srnf bit, then the spec words.
+u64 RecipeId(const u8* h, const u64* spec, u32 n) {
+    u8 head[200];
+    std::memcpy(head, h, 200), head[198] &= ~1u;
+    return XXH3_64bits_withSeed(spec, n * 8ull, XXH3_64bits(head, sizeof(head)));
+}
+
 std::vector<u8> ReadAll(const fs::path& p) {
     std::ifstream in(p, std::ios::binary | std::ios::ate);
     if (!in) return {};
@@ -174,6 +200,132 @@ fs::path Pick(const fs::path& dir, const char* stem, const char* ext) {
     for (const char* h : {"aes", "xxh"})
         if (fs::path p = dir / (std::string(stem) + "-hash2-" + h + ext); fs::exists(p)) return p;
     return {};
+}
+u64 Code(const u8* h) { u64 c; std::memcpy(&c, h, 8); return c; }
+
+// A shader_cache folder's programs by Recipe::Id: its contract's variants and its recipes, keyed for the target GPU's srnf bit
+// (default: the folder's own, which its contract carries; the contract's stored keys check the rebuild), its pipeline recipes
+// and its scene sample count (../settings/config.cfg).
+struct Folder {
+    struct Local { u64 key, code; bool holds, recipe, ps; };
+    bool srnf = false, aes = true;
+    u32 votes[2]{}, checked = 0, rebuilt = 0, sample_log2 = 0;
+    std::unordered_map<u64, Local> by_id;  // Id -> key on the target GPU
+    std::unordered_map<u64, u64> id_of;    // key on the folder's own GPU -> Id
+    std::vector<std::array<u8, 144>> pipelines;  // PipelineRecipe records
+    fs::path recipes_path;
+};
+Folder Scan(const fs::path& dir, int srnf_arg, int samples_arg, bool interlock, int target_srnf) {
+    Folder f;
+    f.recipes_path = Pick(dir, "recipes", ".bin");
+    f.aes = f.recipes_path.filename().string().find("-aes") != std::string::npos;
+    const auto holds_of = [](u32 reserved, const std::vector<u64>& spec) {
+        return (reserved & 0xFFFF) || std::any_of(spec.begin(), spec.end(), [](u64 w) { return (w & 15) >= 6; });
+    };
+    struct Variant { std::vector<u64> spec; const u8* h; bool recipe; };
+    std::vector<Variant> variants;
+    const auto c = ReadAll(Pick(dir, "contract", ".cache"));
+    {
+        u32 count = 0;
+        if (c.size() >= 24) std::memcpy(&count, c.data() + 16, 4);
+        for (size_t at = 24, k = 0; k < count && at + 248 <= c.size(); ++k) {
+            u16 nspec;
+            u32 fetch_words;
+            u64 key;
+            std::memcpy(&nspec, c.data() + at + 192, 2), std::memcpy(&key, c.data() + at + 200, 8), std::memcpy(&fetch_words, c.data() + at + 240, 4);
+            Variant& v = variants.emplace_back(Variant{std::vector<u64>(nspec), c.data() + at, false});
+            std::memcpy(v.spec.data(), c.data() + at + 248, nspec * 8ull);
+            const bool bit = c[at + 198] & 1;
+            ++f.votes[bit], ++f.checked, f.rebuilt += RecipeKey(v.h, v.spec.data(), nspec, bit, f.aes) == key;
+            at += 248 + nspec * 8ull + fetch_words * 4ull;
+        }
+    }
+    f.srnf = srnf_arg >= 0 ? srnf_arg != 0 : f.votes[1] > f.votes[0];
+    const bool target = target_srnf >= 0 ? target_srnf != 0 : f.srnf;
+    if (samples_arg > 0) f.sample_log2 = u32(std::countr_zero(u32(samples_arg)));
+    else if (std::ifstream cfg(dir.parent_path() / "settings" / "config.cfg"); cfg)
+        for (std::string line; std::getline(cfg, line);)
+            if (line.rfind("msaa=", 0) == 0) f.sample_log2 = u32(std::countr_zero(u32(std::max(1, std::atoi(line.c_str() + 5)))));
+    const auto b = ReadAll(f.recipes_path);
+    for (size_t at = 8; at + 8 <= b.size();) {
+        u32 type, size;
+        std::memcpy(&type, b.data() + at, 4), std::memcpy(&size, b.data() + at + 4, 4);
+        if (at + 8 + size > b.size()) break;
+        const u8* h = b.data() + at + 8;
+        if ((type == 1 || type == 3) && size >= 200) {
+            u16 nspec;
+            u64 fetch;
+            u32 reserved;
+            std::memcpy(&nspec, h + 192, 2), std::memcpy(&fetch, h + 8, 8), std::memcpy(&reserved, h + 196, 4);
+            if (!(type == 1 && fetch) && (interlock || !(reserved & 0xFFFF))) {  // as Recipes::Configure and Recipes::Pipelines keep them
+                Variant& v = variants.emplace_back(Variant{std::vector<u64>(nspec), h, true});
+                std::memcpy(v.spec.data(), h + 200, nspec * 8ull);
+            }
+        } else if (type == 4 && size >= 144) std::memcpy(f.pipelines.emplace_back().data(), h, 144);
+        at += 8 + size;
+    }
+    f.by_id.emplace(kClearRectVs, Folder::Local{kClearRectVs, 0, false, true, false}), f.id_of.emplace(kClearRectVs, kClearRectVs);
+    for (const Variant& v : variants) {
+        const u32 n = u32(v.spec.size());
+        u32 reserved;
+        std::memcpy(&reserved, v.h + 196, 4);
+        const u64 id = RecipeId(v.h, v.spec.data(), n);
+        f.id_of.emplace(RecipeKey(v.h, v.spec.data(), n, reserved >> 16 & 1, f.aes), id);
+        auto [it, fresh] = f.by_id.try_emplace(id, Folder::Local{RecipeKey(v.h, v.spec.data(), n, target, f.aes), Code(v.h), holds_of(reserved, v.spec), v.recipe, v.h[194] == 1});
+        it->second.recipe |= v.recipe;
+    }
+    return f;
+}
+// Code hashes of the PS programs the folders' recipes met (what opens a gated derived pipeline).
+std::unordered_set<u64> MetCodes(std::initializer_list<const Folder*> folders) {
+    std::unordered_set<u64> met;
+    for (const Folder* f : folders)
+        for (const auto& [id, l] : f->by_id) if (l.recipe && l.ps) met.insert(l.code);
+    return met;
+}
+// A pipeline-contract file: format 1 (144-byte records, sample counts as derived) or 2 (152: the PS gate, the scene as 0).
+// Gated pipelines whose PS code `met` lacks are left out; the scene's sample count becomes `scene`.
+std::vector<Contracted> LoadContract(const fs::path& dir, const std::unordered_set<u64>& met, u8 scene, u32* gated = nullptr, u32* format = nullptr) {
+    const auto b = ReadAll(Pick(dir, "pipeline-contract", ".cache"));
+    std::vector<Contracted> out;
+    u32 count = 0, left = 0;
+    if (b.size() >= 24) std::memcpy(&count, b.data() + 16, 4);
+    const size_t rec = count ? (b.size() - 24) / count : 0;
+    if ((rec != 144 && rec != 152) || 24 + u64(count) * rec != b.size()) return out;
+    for (u32 k = 0; k < count; ++k) {
+        const u8* p = b.data() + 24 + k * rec;
+        const size_t tail = rec == 152 ? 32 : 24;  // file, pad, state
+        Contracted c{};
+        u64 gate = 0;
+        std::memcpy(&c.vs, p, 24);
+        if (rec == 152) std::memcpy(&gate, p + 24, 8);
+        std::memcpy(&c.file, p + tail, 8), std::memcpy(&c.st, p + tail + 8, sizeof(State));
+        if (gate && !met.contains(gate)) { ++left; continue; }
+        if (!c.st.samples) c.st.samples = scene;
+        out.push_back(c);
+    }
+    if (gated) *gated = left;
+    if (format) *format = rec == 152 ? 2 : 1;
+    return out;
+}
+
+// Recipes::Pipelines: `from`'s pipeline recipes with `on`'s programs (recipes only) and scene sample count.
+struct Resolved { std::vector<PlRecipe> list; u32 no_prog = 0, other_samples = 0, by_log2[8]{}; };
+Resolved Resolve(const Folder& from, const Folder& on) {
+    Resolved out;
+    for (const auto& r : from.pipelines) {
+        u64 vs, ps, gs;
+        State st;
+        std::memcpy(&vs, r.data(), 8), std::memcpy(&ps, r.data() + 8, 8), std::memcpy(&gs, r.data() + 16, 8), std::memcpy(&st, r.data() + 24, sizeof(st));
+        const u8 log2 = r[136];
+        ++out.by_log2[log2 & 7];
+        const auto v = on.by_id.find(vs), p = ps ? on.by_id.find(ps) : on.by_id.end();
+        if (v == on.by_id.end() || !v->second.recipe || (ps && (p == on.by_id.end() || !p->second.recipe))) { ++out.no_prog; continue; }
+        if (log2 != on.sample_log2 && (v->second.holds || (ps && p->second.holds))) { ++out.other_samples; continue; }
+        if (!st.samples) st.samples = u8(1u << on.sample_log2);
+        out.list.push_back({v->second.key, ps ? p->second.key : 0, gs, st});
+    }
+    return out;
 }
 
 struct Used {  // a pipeline of the run under the given caps
@@ -195,9 +347,11 @@ const char* Pct(u64 a, u64 b) {
 }
 
 int main(int argc, char** argv) {
-    fs::path dir, game_dir;
+    fs::path dir, game_dir, like;
     u32 caps_arg = ~0u;
     size_t list = 20;
+    int srnf_arg = -1, samples_arg = 0;  // recipes resolved for a GPU: -1 / 0 = as the contract / config.cfg say
+    bool interlock = true;
     std::vector<fs::path> uses;
     std::unordered_set<std::string> opened;  // --opened <file>: WAD names the run opened, one per line
     for (int i = 1; i < argc; ++i) {
@@ -211,6 +365,10 @@ int main(int argc, char** argv) {
         }
         else if (a == "--caps" && i + 1 < argc) caps_arg = u32(std::strtoul(argv[++i], nullptr, 16));
         else if (a == "--list" && i + 1 < argc) list = size_t(std::atoi(argv[++i]));
+        else if (a == "--like" && i + 1 < argc) like = argv[++i];
+        else if (a == "--srnf" && i + 1 < argc) srnf_arg = std::atoi(argv[++i]);
+        else if (a == "--interlock" && i + 1 < argc) interlock = std::atoi(argv[++i]) != 0;
+        else if (a == "--samples" && i + 1 < argc) samples_arg = std::atoi(argv[++i]);
         else uses.push_back(a);
     }
     if (dir.empty()) {
@@ -251,20 +409,22 @@ int main(int argc, char** argv) {
         const auto recipes_bytes = ReadAll(Pick(dir, "pipeline-recipes", ".bin"));
         for (size_t at = 8; at + sizeof(PlRecipe) <= recipes_bytes.size(); at += sizeof(PlRecipe)) std::memcpy(&recipes.emplace_back(), recipes_bytes.data() + at, sizeof(PlRecipe));
     }
+    const Folder here = Scan(dir, srnf_arg, samples_arg, interlock, -1);
+    if (recipes.empty()) {  // since 537300ec: type-4 records of the recipes file, programs by Recipe::Id, resolved as Recipes::Pipelines does
+        const Resolved r = Resolve(here, here);
+        recipes = r.list;
+        std::printf("Pipeline recipes in %s: %zu (scene x1 %u, x2 %u, x4 %u); resolved for srnf %d (contract votes %u/%u, keys rebuilt %u of %u), samples x%u, "
+                    "interlock %d: %zu, programs without a recipe %u, held to another sample count %u\n",
+                    here.recipes_path.filename().string().c_str(), here.pipelines.size(), r.by_log2[0], r.by_log2[1], r.by_log2[2], here.srnf, here.votes[0],
+                    here.votes[1], here.rebuilt, here.checked, 1u << here.sample_log2, interlock, recipes.size(), r.no_prog, r.other_samples);
+    }
     const bool from_recipes = uses.empty();
     if (from_recipes)
         for (const PlRecipe& r : recipes) states.push_back({r.vs, r.ps, r.gs, 0, r.raw, 0, 1, 0, 0, 1});
 
-    const auto contract_bytes = ReadAll(Pick(dir, "pipeline-contract", ".cache"));
-    std::vector<Contracted> contract;
-    if (contract_bytes.size() >= 24) {
-        u32 count;
-        std::memcpy(&count, contract_bytes.data() + 16, 4);
-        if (24 + u64(count) * sizeof(Contracted) == contract_bytes.size()) {
-            contract.resize(count);
-            std::memcpy(contract.data(), contract_bytes.data() + 24, count * sizeof(Contracted));
-        }
-    }
+    u32 gated = 0, contract_format = 0;
+    const std::vector<Contracted> contract = LoadContract(dir, MetCodes({&here}), u8(1u << here.sample_log2), &gated, &contract_format);
+    if (contract_format == 2) std::printf("Pipeline contract (format 2): %u derived pipelines wait for their PS program in the recipes\n", gated);
     // Shader contract: translation keys of the variants the AOT derives (stage 0 VS, 1 PS).
     std::unordered_map<u64, u32> shader_stage;
     {
@@ -509,6 +669,105 @@ int main(int argc, char** argv) {
             if (t.count == 1 && t.fmt[0] == 37 && t.depth) t.fmt[0] = 43, t.samples = 2;
             o.push_back(t);
         });
+    }
+
+    // ---- What-if: another folder's derivation (its recipes met other PS programs) and pipeline recipes shipped to this GPU ----
+    if (!like.empty()) {
+        const Folder there = Scan(like, -1, 0, interlock, here.srnf);
+        // Their derivation as this GPU would build it with both folders' recipes (shipped + the player's).
+        const std::vector<Contracted> theirs = LoadContract(like, MetCodes({&here, &there}), u8(1u << here.sample_log2));
+        // A format-1 derivation's scene sample count: the largest of its states (x1 when it was made without MSAA).
+        const auto scene_of = [](const std::vector<Contracted>& list) { u8 m = 1; for (const Contracted& c : list) m = std::max(m, c.st.samples); return m; };
+        const u8 ours = u8(1u << here.sample_log2), own_scene = scene_of(contract), their_scene = scene_of(theirs);
+        const auto rescene = [&](State s, u8 from) { if (s.samples == from) s.samples = ours; return s; };
+        const auto key_of = [&](u64 k) -> u64 {
+            if (!k) return 0;
+            const auto i = there.id_of.find(k);
+            const auto j = i == there.id_of.end() ? there.by_id.end() : there.by_id.find(i->second);
+            return j == there.by_id.end() ? ~0ull : j->second.key;
+        };
+        std::unordered_set<Key, KeyHash> own, translated, shipped;
+        u32 lost = 0;
+        for (const Contracted& c : contract) own.insert(MakeKey(c.vs, c.ps, c.gs, rescene(c.st, own_scene), caps));
+        for (const Contracted& c : theirs) {
+            const u64 vs = key_of(c.vs), ps = key_of(c.ps);
+            if (vs == ~0ull || ps == ~0ull) { ++lost; continue; }
+            translated.insert(MakeKey(vs, ps, c.gs, rescene(c.st, their_scene), caps));
+        }
+        Folder merged = there;  // the shipped recipes joined to this folder's, as Recipes::Pipelines would see them here
+        merged.sample_log2 = here.sample_log2;
+        for (const auto& [id, l] : here.by_id) merged.by_id.try_emplace(id, l).first->second.recipe |= l.recipe;
+        const Resolved r = Resolve(there, merged);
+        for (const PlRecipe& p : r.list) shipped.insert(MakeKey(p.vs, p.ps, p.gs, p.raw, caps));
+        std::printf("\nWhat-if with %s (srnf %d, scene x%u; its %zu derived pipelines, %u of them with a program this GPU lacks; %zu of its %zu pipeline recipes "
+                    "resolved here, %u without a program, %u held to x%u):\n", like.string().c_str(), there.srnf, their_scene, theirs.size(), lost, r.list.size(),
+                    there.pipelines.size(), r.no_prog, r.other_samples, 1u << there.sample_log2);
+        const auto score = [&](const char* name, std::initializer_list<const std::unordered_set<Key, KeyHash>*> sets) {
+            std::unordered_set<Key, KeyHash> all;
+            for (const auto* s : sets) all.insert(s->begin(), s->end());
+            u64 hit = 0, d = 0;
+            for (const auto& [k, u] : used) if (all.contains(k)) ++hit, d += u.draws;
+            std::printf("  %-58s %6zu derived, %5llu of the run's %zu pipelines exact (%s, %s of draws)\n", name, all.size(), (unsigned long long)hit, used.size(),
+                        Pct(hit, used.size()), Pct(d, draws));
+        };
+        char own_name[96];
+        std::snprintf(own_name, sizeof own_name, "own derivation, scene x%u -> x%u", own_scene, ours);
+        score(own_name, {&own});
+        score("theirs translated", {&translated});
+        score("their pipeline recipes shipped", {&shipped});
+        score("theirs translated + shipped", {&translated, &shipped});
+        score("own rescened + theirs translated + shipped", {&own, &translated, &shipped});
+        {   // Their derived pipelines split by whether their recipes met the programs: what an order by that buys a lazy budget.
+            std::unordered_set<Key, KeyHash> part[4];  // bit 0: VS met, bit 1: PS met (or none)
+            const auto met = [&](u64 k) { if (!k || k == kClearRectVs) return true; const auto i = there.id_of.find(k); return i != there.id_of.end() && there.by_id.at(i->second).recipe; };
+            for (const Contracted& c : theirs) {
+                const u64 vs = key_of(c.vs), ps = key_of(c.ps);
+                if (vs == ~0ull || ps == ~0ull) continue;
+                part[met(c.vs) | met((c.st.flags & kHasPs) ? c.ps : 0) << 1].insert(MakeKey(vs, ps, c.gs, rescene(c.st, their_scene), caps));
+            }
+            static constexpr const char* names[]{"neither program met", "VS met only", "PS met only", "both met"};
+            for (u32 p = 4; p-- > 0;) {
+                u64 hit = 0;
+                for (const auto& [k, u] : used) hit += part[p].contains(k);
+                std::printf("    theirs, %-22s %6zu derived, %5llu used here (%s yield)\n", names[p], part[p].size(), (unsigned long long)hit, Pct(hit, part[p].size()));
+            }
+            // VS met only: was the PS program's code met (another variant of it) or never?
+            std::unordered_set<u64> codes;
+            for (const auto& [id, l] : there.by_id) if (l.recipe && l.code) codes.insert(l.code);
+            std::unordered_set<Key, KeyHash> by_code[2];
+            for (const Contracted& c : theirs) {
+                const u64 vs = key_of(c.vs), ps = key_of(c.ps);
+                if (vs == ~0ull || ps == ~0ull || !met(c.vs) || met((c.st.flags & kHasPs) ? c.ps : 0)) continue;
+                const auto i = there.id_of.find(c.ps);
+                by_code[codes.contains(there.by_id.at(i->second).code)].insert(MakeKey(vs, ps, c.gs, rescene(c.st, their_scene), caps));
+            }
+            for (u32 p = 2; p-- > 0;) {
+                u64 hit = 0;
+                for (const auto& [k, u] : used) hit += by_code[p].contains(k);
+                std::printf("      VS met, PS variant not: code %-9s %6zu derived, %5llu used here (%s yield)\n", p ? "met" : "never met", by_code[p].size(),
+                            (unsigned long long)hit, Pct(hit, by_code[p].size()));
+            }
+        }
+        // What would still compile in play: the closest state of the same programs, or which program no derivation has.
+        std::unordered_map<Key, std::vector<State>, KeyHash> union_pairs;
+        for (const auto* s : {&own, &translated, &shipped})
+            for (const Key& k : *s) union_pairs[{k.vs, k.ps, k.gs, {}}].push_back(k.st);
+        std::unordered_set<u64> union_vs, union_ps;
+        for (const auto& [t, l] : union_pairs) union_vs.insert(t.vs), union_ps.insert(t.ps);
+        std::map<std::string, u32> why;
+        for (const auto& [k, u] : used) {
+            if (const auto it = union_pairs.find({k.vs, k.ps, k.gs, {}}); it != union_pairs.end()) {
+                if (std::find(it->second.begin(), it->second.end(), k.st) != it->second.end()) continue;
+                const State* best = &it->second[0];
+                for (const State& s : it->second) if (Fields(k.st, s) < Fields(k.st, *best)) best = &s;
+                ++why["state: " + Diff(k.st, *best) + " | " + Describe(k.st, true)];
+            } else
+                ++why[std::string(union_vs.contains(k.vs) ? "" : "VS* ") + (k.ps && !union_ps.contains(k.ps) ? "PS* " : "") + "not paired | " + Describe(k.st, true)];
+        }
+        std::vector<std::pair<std::string, u32>> v(why.begin(), why.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        std::printf("  still missed (pipelines; * = in no derived pipeline):\n");
+        for (size_t i = 0; i < v.size() && i < 25; ++i) std::printf("    %4u  %s\n", v[i].second, v[i].first.c_str());
     }
 
     // ---- Compiles during play, by the frame the run first needed them ----

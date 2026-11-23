@@ -8,7 +8,8 @@ foreach ($line in Get-Content -LiteralPath "$env:GOW3_SDK_DIR\EWDK\EWDK-LLVM.env
 $env:INCLUDE = ((@('ucrt', 'shared', 'um') | ForEach-Object { Join-Path $env:WindowsSdkDir "Include\$($env:Version_Number)\$_" }) + $env:INCLUDE) -join ';'
 $env:LIB = ((@('ucrt', 'um') | ForEach-Object { Join-Path $env:WindowsSdkDir "Lib\$($env:Version_Number)\$_\x64" }) + $env:LIB) -join ';'
 $src = Join-Path $PSScriptRoot 'plstat.cpp'
-& (Join-Path $env:LLVM_ROOT 'bin\clang-cl.exe') /nologo /O2 /std:c++20 /EHsc /utf-8 /W3 /Z7 -fuse-ld=lld $src `
+$root = Resolve-Path (Join-Path $PSScriptRoot '..\..\src')  # piece_hash.h (recipe keys) and xxhash
+& (Join-Path $env:LLVM_ROOT 'bin\clang-cl.exe') /nologo /O2 /std:c++20 /EHsc /utf-8 /W3 /Z7 /clang:-maes /clang:-msse4.2 -fuse-ld=lld "/I$root" "/I$root\externals\xxhash" $src `
     "/Fe$(Join-Path $PSScriptRoot 'plstat.exe')" "/Fo$(Join-Path $PSScriptRoot 'plstat.obj')" /link /DEBUG
 if ($LASTEXITCODE -ne 0) { Write-Error "BUILD FAILED ($LASTEXITCODE)" -ErrorAction Continue; exit 1 }
 'BUILD SUCCEEDED: plstat.exe'
