@@ -173,10 +173,14 @@ void Renderer::Impl::AotBuild() {
     const bool no_srnf = !caps.storage_image_read_without_format;
     // The recipes as this GPU's runtime keys them, whichever GPU met them (the release's come from another one).
     std::vector<Recipe> recipes = Recipes::Instance().All();
-    {
-        std::unordered_set<u64> adapted;
-        std::erase_if(recipes, [&](Recipe& r) { return r.Adapt(no_srnf), !adapted.insert(r.Key()).second; });
-    }
+    // What the recipes met orders the lazy AOT's work: their variants' keys (with the contract's PS variants of the programs
+    // they met, added below) and their PS programs' code.
+    std::unordered_set<u64> met_keys, met_ps;
+    std::erase_if(recipes, [&](Recipe& r) { return r.Adapt(no_srnf), !met_keys.insert(r.Key()).second; });
+    for (const Recipe& r : recipes) if (r.h.stage == u8(Gcn::Stage::Pixel)) met_ps.insert(r.h.code_hash);
+    const auto note_met = [&](const Recipe& r, u64 key) {
+        if (r.h.stage == u8(Gcn::Stage::Pixel) && met_ps.contains(r.h.code_hash)) met_keys.insert(key);
+    };
     const auto pending_of = [&](u64 key) {
         return !cache.Contains(key) || (caps.path == ShaderPath::Objects && !cache.ContainsBinary(BinaryKey(cache.ContentOf(key))));
     };
@@ -408,6 +412,7 @@ void Renderer::Impl::AotBuild() {
     if (LoadKept(kept_path, kept_stamp, kept) && (!need_pl || LoadKeptPipelines(kept_pl_path, kept_pl_stamp, kept_pipelines))) {
         Say("AOT: contract of %zu variants read from the cache (%.1f s)\n", kept.size(), seconds());
         for (Kept& v : kept) {
+            note_met(v.recipe, v.key);
             if (v.recipe.h.stage == u8(Gcn::Stage::Compute)) compute_keys.push_back(v.key);
             if (rect_variant(v.recipe)) continue;
             wad_total += v.file != 0;
@@ -468,6 +473,7 @@ void Renderer::Impl::AotBuild() {
             const auto inside = [&](std::span<const u8> s) { return s.empty() || (s.data() >= map.data && s.data() + s.size() <= map.data + map.size); };
             if (file == ~0u || !inside(c.code) || !inside(c.fetch)) complete = false;
             else if (complete) kept.push_back({c.recipe, c.key, u64(c.code.data() - map.data), c.fetch.empty() ? 0 : u64(c.fetch.data() - map.data), file, c.paths, u32(c.code.size()), u32(c.fetch.size())});
+            note_met(c.recipe, c.key);
             if (c.recipe.h.stage == u8(Gcn::Stage::Compute)) compute_keys.push_back(c.key);
             if (rect_variant(c.recipe)) continue;
             wad_total += c.file != ~0u;
@@ -487,7 +493,14 @@ void Renderer::Impl::AotBuild() {
     }
     const size_t pending = jobs.size();
     const size_t wad_budget = (wad_total + 3) / 4;
-    // Both contract paths keep EBOOT first, then the WADs in parse order.
+    // Lazy AOT builds a quarter of the WAD variants per launch, the likeliest first: the EBOOT's, the PS variants of programs the
+    // recipes met, the other PS, then the VS (the recipes' own are built already); parse order within each.
+    const auto rank = [&](const Job& j) {
+        if (!j.files.empty() && j.files[0] == 0) return 0;
+        const auto stage = Gcn::Stage(j.recipe.h.stage);
+        return stage == Gcn::Stage::Vertex ? 3 : stage == Gcn::Stage::Pixel && met_ps.contains(j.recipe.h.code_hash) ? 1 : 2;
+    };
+    std::ranges::stable_sort(jobs, {}, rank);
     if (Aot::lazy) jobs.resize(std::min(pending, embedded_pending + wad_budget));
     Say("AOT: contract: %zu WAD variants total, %zu pending (%zu embedded), %zu started now%s\n",
         wad_total, pending, embedded_pending, jobs.size(), Aot::lazy ? " (lazy: 25% of WAD total)" : "");
@@ -503,35 +516,44 @@ void Renderer::Impl::AotBuild() {
         };
         std::vector<PlJob> pl_jobs;
         std::unordered_set<u64> pl_seen;
-        auto push_pl = [&](u64 vs_key, u64 ps_key, u64 gs_mask, const FixedPipelineState& raw_state, bool is_wad) -> bool {
-            if (!vs_key || (vs_key != kClearRectVsKey && !cache.Contains(vs_key))) return false;
+        // 1: queued; 0: new, its programs not in the cache yet; -1: queued or counted before.
+        auto push_pl = [&](u64 vs_key, u64 ps_key, u64 gs_mask, const FixedPipelineState& raw_state, bool is_wad) -> int {
             const bool has_ps = (raw_state.flags & FixedPipelineState::kHasPs) != 0;
-            if (has_ps && (!ps_key || !cache.Contains(ps_key))) return false;
             GraphicsPipelineKey gk{vs_key, has_ps ? ps_key : 0ull, (raw_state.flags & FixedPipelineState::kHasGs) ? gs_mask : 0ull, raw_state};
             gk.state.Canonicalize(caps);
-            const u64 h = gk.Hash();
-            if (!pl_seen.insert(h).second) return false;
+            if (!pl_seen.insert(gk.Hash()).second) return -1;
+            if (!vs_key || (vs_key != kClearRectVsKey && !cache.Contains(vs_key)) || (has_ps && (!ps_key || !cache.Contains(ps_key)))) return 0;
             pl_jobs.push_back({gk, is_wad});
-            return true;
+            return 1;
         };
         for (const GraphicsPipelineKey& r : Recipes::Instance().Pipelines(no_srnf, blend_interlock)) push_pl(r.vs_key, r.ps_key, r.gs_mask, r.state, false);
         // The derived pipelines as this launch builds them: one gated on a PS program waits until the recipes meet its code; the
         // scene's sample count is this launch's.
-        std::unordered_set<u64> met_ps;
-        for (const Recipe& r : recipes) if (r.h.stage == u8(Gcn::Stage::Pixel)) met_ps.insert(r.h.code_hash);
         size_t gated = 0;
         const auto push_derived = [&](const ContractedPipeline& cp, bool is_wad) {
-            if (cp.gate && !met_ps.contains(cp.gate)) return ++gated, false;
+            if (cp.gate && !met_ps.contains(cp.gate)) return ++gated, -1;
             FixedPipelineState st = cp.state;
             if (!st.samples) st.samples = u8(1u << Aot::sample_log2);
             return push_pl(cp.vs_key, cp.ps_key, cp.gs_mask, st, is_wad);
         };
         for (const ContractedPipeline& cp : kept_pipelines)
             if (cp.file == ~0u) push_derived(cp, false);
-        size_t wad_pl_total = 0;
-        for (const ContractedPipeline& cp : kept_pipelines)
-            if (cp.file != ~0u && push_derived(cp, true)) ++wad_pl_total;
+        // Lazy AOT compiles a quarter of the WAD pipelines the gates let through (with their programs built or not yet) per
+        // launch, the likeliest first: the VS variant and the PS program the recipes met, then a met VS with another PS, then
+        // the rest; parse order within each.
+        const auto group = [&](const ContractedPipeline& cp) {
+            if (cp.vs_key != kClearRectVsKey && !met_keys.contains(cp.vs_key)) return 2;
+            return !cp.ps_key || met_keys.contains(cp.ps_key) ? 0 : 1;
+        };
+        size_t by_group[3]{};
+        for (int g = 0; g < 3; ++g)
+            for (const ContractedPipeline& cp : kept_pipelines)
+                if (cp.file != ~0u && group(cp) == g) by_group[g] += push_derived(cp, true) >= 0;
+        const size_t wad_pl_total = by_group[0] + by_group[1] + by_group[2];
         const size_t wad_pl_budget = Aot::lazy ? (wad_pl_total + 3) / 4 : SIZE_MAX;
+        Say("AOT: pipelines: %zu WAD derived (%zu of programs the recipes met, %zu of a met VS, %zu other), %zu wait for their PS in "
+            "the recipes; %zu queued now (programs built)%s\n", wad_pl_total, by_group[0], by_group[1], by_group[2], gated,
+            size_t(std::ranges::count(pl_jobs, true, &PlJob::is_wad)), Aot::lazy ? ", lazy: up to 25% of the WAD derived compiled" : "");
 
         {
             std::unordered_set<u64> cs_seen;
@@ -765,9 +787,8 @@ void Renderer::Impl::AotBuild() {
             cache.PipelineCompleted();
         });
 
-        Say("AOT: pipelines: %zu graphics (%u cached, %u compiled, %u skipped, %u failed; %zu derived wait for their PS in the recipes), "
-            "%zu compute (%u cached, %u compiled, %u failed) (%.1f s)\n",
-            pl_jobs.size(), pl_cached.load(), pl_compiled.load(), pl_skipped.load(), pl_failed.load(), gated,
+        Say("AOT: pipelines: %zu graphics (%u cached, %u compiled, %u skipped, %u failed), %zu compute (%u cached, %u compiled, %u failed) (%.1f s)\n",
+            pl_jobs.size(), pl_cached.load(), pl_compiled.load(), pl_skipped.load(), pl_failed.load(),
             compute_keys.size(), cs_cached.load(), cs_compiled.load(), cs_failed.load(),
             std::chrono::duration<double>(std::chrono::steady_clock::now() - pl_start).count());
     }
