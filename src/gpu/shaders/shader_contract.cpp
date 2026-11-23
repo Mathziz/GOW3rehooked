@@ -40,6 +40,8 @@ struct Key {
     u64 low, high;
     bool operator==(const Key&) const = default;
 };
+// How a material draws: translucent, then its CB_BLEND color and alpha functions (color 0xff: no blending), sources and destinations.
+using MaterialClass = std::array<u8, 7>;
 struct KeyHash { size_t operator()(const Key& key) const { return key.low; } };
 template<class T> void Append(std::vector<u8>& out, const T& value) {
     const auto* p = reinterpret_cast<const u8*>(&value);
@@ -144,8 +146,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
     std::unordered_map<Key, size_t, KeyHash> seen;  // configuration -> its place in `jobs`
     struct PairMeta {
         u32 file = ~0u;
-        bool is_material = false;
-        u8 samples = 0;
+        std::vector<MaterialClass> classes;  // empty: not a material's technique
     };
     std::vector<PairMeta> pair_metas;
     const auto add = [&](const Job& job) {
@@ -284,12 +285,17 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         for (const auto& material : file.materials) if (!material.pass_supplies_shader) for (const auto& layer : material.layers) material_keys.insert(layer.shader_key);
         const u32 pair_base = u32(pair_metas.size());
         if (pipelines_out) {
-            pair_metas.reserve(pair_base + recipes.size());
-            for (const auto& r : recipes) {
-                const bool is_mat = material_keys.contains(r.shader_key);
-                const u8 samp = is_mat ? u8((r.permutation != ~u64{} && (r.permutation & 2)) ? (1u << sample_log2) : 1u) : u8(0);
-                pair_metas.push_back({index_file, is_mat, samp});
+            // The distinct render classes of the materials drawing with each technique: translucent, then the blend (0xff: none).
+            std::unordered_map<u32, std::vector<MaterialClass>> classes;
+            for (const auto& material : file.materials) {
+                if (material.pass_supplies_shader) continue;
+                MaterialClass c{u8(material.Translucent()), 0xff};
+                if (material.blend[0] != 0xff) std::ranges::copy(material.blend, c.begin() + 1);
+                for (const auto& layer : material.layers)
+                    if (auto& list = classes[layer.shader_key]; std::ranges::find(list, c) == list.end()) list.push_back(c);
             }
+            pair_metas.reserve(pair_base + recipes.size());
+            for (const auto& r : recipes) pair_metas.push_back({index_file, classes[r.shader_key]});
         }
         // Model meshes: the mesh streams bind for every layer recipe of the material.
         std::set<size_t> reached;
@@ -376,7 +382,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
     }
     for (const auto& [_, pair] : groups) try {
         const u32 pid = pipelines_out ? u32(pair_metas.size()) : ~0u;
-        if (pipelines_out) pair_metas.push_back({~0u, false, 0});
+        if (pipelines_out) pair_metas.push_back({~0u, {}});
         const auto vs = pair.find(1), ps = pair.find(0);
         if (vs != pair.end()) {
             Job job = Base(eboot, *vs->second, ~0u);
@@ -615,8 +621,22 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 }
             }
         }
-        VkFormat scene_fmt = SurfaceFormat(data.scene_color.data_format, data.scene_color.num_format);
-        if (scene_fmt == VK_FORMAT_UNDEFINED) scene_fmt = VK_FORMAT_R8G8B8A8_SRGB;
+        // Every draw of the engine uses the [-1, 1] clip space. The scene target is sampled as its UNORM image and rendered
+        // through its sRGB view: opaque materials draw there multisampled; translucent ones (and screen passes) draw to
+        // single-sampled UNORM targets. A run's pipelines confirmed each rule (pipelines-*.bin through tools\plstat).
+        const VkFormat scene_fmt = SurfaceFormat(data.scene_color.data_format, data.scene_color.num_format);
+        VkFormat scene_srgb = SurfaceFormat(data.scene_color.data_format, 9);
+        if (scene_srgb == VK_FORMAT_UNDEFINED) scene_srgb = VK_FORMAT_R8G8B8A8_SRGB;
+        const u8 scene_samples = u8(1u << sample_log2);
+        constexpr u8 kClip = FixedPipelineState::kNegOne;
+        // A material class's blend as the draw sets it: the runtime's MIN/MAX rewrite; no blending: the zero CB_BLEND_CONTROL.
+        const auto blend_of = [](const MaterialClass& c) -> FixedAttachmentBlend {
+            if (c[1] == 0xff) return {0, 0xF};
+            u32 cf = c[1], cs = c[3], cd = c[5];
+            u32 af = c[2] == 0xff ? cf : c[2], as = c[2] == 0xff ? cs : c[4], ad = c[2] == 0xff ? cd : c[6];
+            RewriteMinMax(cs, cf, cd, true, false), RewriteMinMax(as, af, ad, true, true);
+            return {1, 0xF, u8(BlendFactor(cs)), u8(BlendFactor(cd)), u8(BlendOp(cf)), u8(BlendFactor(as)), u8(BlendFactor(ad)), u8(BlendOp(af))};
+        };
 
         std::vector<ContractedPipeline> derived;
         auto emit = [&](u64 vs_key, u64 ps_key, u32 file, const FixedPipelineState& st) {
@@ -629,20 +649,21 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
             const auto& ps_list = !b.primary_ps.empty() ? b.primary_ps : b.fallback_ps;
             if (vs_list.empty()) continue;
             if (ps_list.empty()) {
-                const u8 ms_samples = meta.samples ? meta.samples : u8(1u << sample_log2);
                 const size_t lim = std::min<size_t>(vs_list.size(), 8);
                 for (size_t vi = 0; vi < lim; ++vi) {
                     FixedPipelineState z_ms{};
                     z_ms.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
                     z_ms.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-                    z_ms.samples = ms_samples;
+                    z_ms.samples = scene_samples;
                     z_ms.topology_class = 2;
+                    z_ms.flags = kClip;
                     emit(vs_list[vi], 0, meta.file, z_ms);
 
                     FixedPipelineState z_shadow{};
                     z_shadow.depth_format = VK_FORMAT_D32_SFLOAT;
                     z_shadow.samples = 1;
                     z_shadow.topology_class = 2;
+                    z_shadow.flags = kClip;
                     emit(vs_list[vi], 0, meta.file, z_shadow);
                 }
                 continue;
@@ -660,23 +681,21 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                     for (u32 k = 0; k < color_count; ++k) {
                         if (pc.col_format >> (4 * k) & 0xF)
                             s.color_formats[k] = (k == 0) ? scene_fmt : VK_FORMAT_R8G8B8A8_UNORM;
-                        s.blend[k] = {0, 0xF,
-                                      u8(VK_BLEND_FACTOR_ONE), u8(VK_BLEND_FACTOR_ZERO), u8(VK_BLEND_OP_ADD),
-                                      u8(VK_BLEND_FACTOR_ONE), u8(VK_BLEND_FACTOR_ZERO), u8(VK_BLEND_OP_ADD)};
+                        s.blend[k] = {0, 0xF};
                     }
                     s.topology_class = 2;
-                    s.flags = FixedPipelineState::kHasPs;
-                    if (meta.is_material) {
+                    s.flags = FixedPipelineState::kHasPs | kClip;
+                    if (!meta.classes.empty()) {
                         s.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
                         s.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-                        s.samples = meta.samples;
-                        emit(vs_key, pc.key, meta.file, s);
-                        if (color_count > 0) {
-                            FixedPipelineState alpha = s;
-                            alpha.blend[0] = {1, 0xF,
-                                              u8(VK_BLEND_FACTOR_SRC_ALPHA), u8(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA), u8(VK_BLEND_OP_ADD),
-                                              u8(VK_BLEND_FACTOR_SRC_ALPHA), u8(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA), u8(VK_BLEND_OP_ADD)};
-                            emit(vs_key, pc.key, meta.file, alpha);
+                        for (const MaterialClass& c : meta.classes) {
+                            FixedPipelineState m = s;
+                            m.samples = c[0] ? 1 : scene_samples;
+                            for (u32 k = 0; k < color_count; ++k) {
+                                if (m.color_formats[k]) m.color_formats[k] = k == 0 && !c[0] ? scene_srgb : VK_FORMAT_R8G8B8A8_UNORM;
+                                m.blend[k] = blend_of(c);
+                            }
+                            emit(vs_key, pc.key, meta.file, m);
                         }
                     } else if (color_count == 0) {
                         s.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
@@ -691,6 +710,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                         FixedPipelineState pass1x = s;
                         pass1x.samples = 1;
                         emit(vs_key, pc.key, meta.file, pass1x);
+                        if (pass1x.color_formats[0]) pass1x.color_formats[0] = scene_srgb, emit(vs_key, pc.key, meta.file, pass1x);
                         FixedPipelineState msaa = s;
                         msaa.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
                         msaa.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;

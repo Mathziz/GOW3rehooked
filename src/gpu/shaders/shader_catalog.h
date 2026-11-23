@@ -65,7 +65,11 @@ struct Material {
     struct Layer { u32 shader_key{}; std::vector<std::pair<u32, std::string>> textures; };
     u32 flags{};
     bool pass_supplies_shader{};
+    // Blend of its render-state block, as CB_BLEND fields: color and alpha function (0xff: no blending), source factors, destination factors.
+    std::array<u8, 6> blend{0xff, 0xff, 1, 1, 0, 0};
     std::vector<Layer> layers;
+    // Drawn in the translucent pass (single-sampled UNORM targets) rather than in the multisampled sRGB scene.
+    bool Translucent() const { return (flags & 0x8000) || blend[0] != 0xff; }
 };
 struct Stream {
     u32 source{}, stride{};

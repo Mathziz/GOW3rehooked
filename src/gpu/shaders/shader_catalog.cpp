@@ -268,13 +268,19 @@ File Scan(const std::filesystem::path& path, const std::array<u32, 24>& formats)
                     }
                     layer += 0x80 + size_t(count) * 0x68;
                 }
-                // The render-state block is validated as the engine walks it; its values do not reach the shaders.
+                // The render-state block: its entry 1 (32 bytes) holds the blend at bytes 16-21; its values do not reach the shaders.
                 if (f.Read<u16>(base + 0x52)) {
                     f.Range(layer, 8, end);
                     const auto count = f.Read<u16>(layer + 2);
                     const auto table = layer + f.Read<u16>(layer + 4);
                     f.Range(table, size_t(count) * 4, end);
-                    for (u32 n = 0; n < count; ++n) if (f.Read<u16>(table + n * 4) == 1) { f.Range(layer + f.Read<u16>(table + n * 4 + 2), 32, end); break; }
+                    for (u32 n = 0; n < count; ++n)
+                        if (f.Read<u16>(table + n * 4) == 1) {
+                            const size_t state = layer + f.Read<u16>(table + n * 4 + 2);
+                            f.Range(state, 32, end);
+                            std::memcpy(material.blend.data(), f.data + state + 16, material.blend.size());
+                            break;
+                        }
                 }
                 result.materials.push_back(std::move(material)); material_names.push_back(name);
             } else if (type == 0x520001) {
