@@ -789,7 +789,8 @@ struct Renderer::Impl {
     // `waited`: a draw waits for it (a driver binary's load), so it runs at normal priority even in Async mode.
     std::shared_future<Compiled> Async(Gcn::Stage stage, u64 prog, const Prepared& p, bool miss, bool waited = false);
     ShaderRef ResolveCachedModule(Gcn::Stage stage, u64 key);
-    std::shared_future<CompiledPipeline> AsyncPipeline(u64 h, ShaderRef vs, ShaderRef ps, ShaderRef gs, FixedPipelineState state, bool miss);
+    // `probe`: first look for it in the pipeline cache (a load, no compile); `urgent`: a draw needs it now (else Discover's).
+    std::shared_future<CompiledPipeline> AsyncPipeline(u64 h, ShaderRef vs, ShaderRef ps, ShaderRef gs, FixedPipelineState state, bool probe, bool urgent);
     bool ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool has_ps, FixedPipelineState& out) const;
     void EnqueuePipeline(u64 vs_key, u64 ps_key, bool has_gs, const FixedPipelineState& raw_state);
     // The compile workers: tasks by priority (0: a draw needs it now, 1: found ahead by Discover).

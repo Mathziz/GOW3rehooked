@@ -1199,7 +1199,10 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
             if (pl.main) return pm[rh] = KeepPipeline(h, pl, origin);
         }
     }
-    if (!stats.trace && caps.cache_control)
+    // A pipeline in the pipeline cache (built by the AOT or an earlier run) still costs the driver a load. Async: the load
+    // runs on a worker ahead of the compiles, and the draw waits a frame or two instead of the recording; Sync: here.
+    const bool probe_here = Jit::mode != Jit::Mode::Async;
+    if (!stats.trace && caps.cache_control && probe_here)
         if (const CompiledPipeline hit = CreateMonolithicPipeline(vs, ps, gs, gkey.state, true); hit.main) return pm[rh] = KeepPipeline(h, hit, kPlHit);
     if (stats.trace) {
         const CompiledPipeline created = CreateMonolithicPipeline(vs, ps, gs, gkey.state, false);
@@ -1212,7 +1215,7 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
         std::unique_lock lock(prog_lock);
         if (auto it = pipelines.find(h); it != pipelines.end()) return pm[rh] = it->second;
         auto [it, fresh] = compiling_pipelines.try_emplace(h);
-        if (fresh) it->second = AsyncPipeline(h, vs, ps, gs, gkey.state, true);
+        if (fresh) it->second = AsyncPipeline(h, vs, ps, gs, gkey.state, !probe_here, true);
         f = it->second;
     }
     const bool ready = f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;

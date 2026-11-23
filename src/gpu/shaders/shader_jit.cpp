@@ -297,11 +297,11 @@ ShaderRef Renderer::Impl::ResolveCachedModule(Gcn::Stage stage, u64 key) {
 }
 
 std::shared_future<CompiledPipeline> Renderer::Impl::AsyncPipeline(u64 h, ShaderRef vs, ShaderRef ps, ShaderRef gs,
-                                                                   FixedPipelineState state, bool miss) {
+                                                                   FixedPipelineState state, bool probe, bool urgent) {
     stall_compiles.fetch_add(1, std::memory_order_relaxed);
     ShaderCache::Instance().PipelineQueued();
     auto task = std::make_shared<std::packaged_task<CompiledPipeline()>>(
-        [this, h, vs, ps, gs, state, miss]() mutable {
+        [this, h, vs, ps, gs, state, probe, urgent]() mutable {
             {
                 std::unique_lock lock(prog_lock);
                 if (auto it = pipelines.find(h); it != pipelines.end()) {
@@ -327,9 +327,9 @@ std::shared_future<CompiledPipeline> Renderer::Impl::AsyncPipeline(u64 h, Shader
             }
             CompiledPipeline pl{};
             const auto t = std::chrono::steady_clock::now();
-            PlOrigin origin = kPlAheadHit;
-            if (caps.cache_control && !miss) pl = CreateMonolithicPipeline(vs, ps, gs, state, true);
-            if (!pl.main) pl = CreateMonolithicPipeline(vs, ps, gs, state, false), origin = miss ? kPlMiss : kPlAhead;
+            PlOrigin origin = urgent ? kPlHit : kPlAheadHit;
+            if (caps.cache_control && probe) pl = CreateMonolithicPipeline(vs, ps, gs, state, true);
+            if (!pl.main) pl = CreateMonolithicPipeline(vs, ps, gs, state, false), origin = urgent ? kPlMiss : kPlAhead;
             const u32 us = u32(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count());
             CompiledPipeline ret = pl;
             {
@@ -348,7 +348,7 @@ std::shared_future<CompiledPipeline> Renderer::Impl::AsyncPipeline(u64 h, Shader
             return ret;
         });
     auto future = task->get_future().share();
-    Queue([task] { (*task)(); }, miss ? 0 : 1);
+    Queue([task] { (*task)(); }, urgent ? 0 : 1);
     return future;
 }
 
@@ -509,7 +509,7 @@ void Renderer::Impl::EnqueuePipeline(u64 vs_key, u64 ps_key, bool has_gs, const 
     }
     std::unique_lock lock(prog_lock);
     if (!pipelines.contains(h) && !compiling_pipelines.contains(h))
-        compiling_pipelines.emplace(h, AsyncPipeline(h, vs, ps, gs, gkey.state, false));
+        compiling_pipelines.emplace(h, AsyncPipeline(h, vs, ps, gs, gkey.state, true, false));
 }
 
 // The rest of the frame from the packet being executed, registers only: the programs its draws and dispatches select
