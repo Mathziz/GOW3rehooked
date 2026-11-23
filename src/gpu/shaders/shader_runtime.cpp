@@ -334,6 +334,9 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
     if (clear_rect) return out_mask = 1, clear_rect_ref;
     auto& memo = Memos().shaders;  // compiled shaders stay
     if (const auto* m = memo.Find(key)) return out_mask = m->second, m->first;
+    // First use of this variant on the thread (translated now, found in the cache or made ready ahead by Discover or a
+    // warm pass): kept as a recipe for the AOT.
+    if (!stats.trace && !p.in.probe && !p.in.boom) Recipes::Instance().Note(key, p.in, p.spec, ShaderCache::Instance().Contains(key));
     {
         std::shared_lock lock(prog_lock);
         if (found()) return memo[key] = {shaders.find(key)->second, out_mask}, shaders.find(key)->second;
@@ -343,8 +346,6 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
     // reveals together load or translate at once on those threads, not one after another here; the block waits for each.
     if (!stats.trace && !in_worker && !discovered) discovered = true, Discover(cpu, {walk_chain.size(), 0}, false);
     else if (!stats.trace && in_worker && block_now && !block_discovered) block_discovered = true, Discover(cpu, block_now->to, true);
-    // First use of this variant in the run (translated now or found in the cache): kept as a recipe for the AOT.
-    if (!stats.trace && !p.in.probe && !p.in.boom) Recipes::Instance().Note(key, p.in, p.spec, ShaderCache::Instance().Contains(key));
     Compiled c;
     if (stats.trace) {
         c = Compile(stage, prog, key, p.in,std::vector<u32>(p.in.code.begin(), p.in.code.end()), std::vector<u32>(p.in.fetch.begin(), p.in.fetch.end()),
