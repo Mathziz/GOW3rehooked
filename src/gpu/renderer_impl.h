@@ -691,7 +691,7 @@ struct Renderer::Impl {
         Flat<u32> samplers;
         Flat<MemoTex> tex;                       // T# hash + binding
         Flat<std::pair<ShaderRef, u64>> shaders; // translation key -> shader, VS output mask
-        Flat<CompiledPipeline> pipelines;        // GraphicsPipelineKey::Hash() -> main/square VkPipeline
+        Flat<CompiledPipeline> pipelines;        // GraphicsPipelineKey::Hash() of the draw's raw state -> main/square VkPipeline
         Flat<ProgUse> progs;                     // program key -> its slots and last inputs
     };
     static thread_local Memo memo;
@@ -857,7 +857,7 @@ struct Renderer::Impl {
     std::deque<TempPlState> temp_pl_states;
     std::unordered_map<u64, TempPlState*> temp_pl_by_raw;
     std::unordered_map<u64, TempPlMade> temp_pl_made;  // canonical key -> how it was made
-    void TempPlUse(const GraphicsPipelineKey& k, const FixedPipelineState& raw, u64 h);
+    void TempPlUse(const GraphicsPipelineKey& k, u64 rh);  // k: the draw's raw state, rh its hash
     void TempPlOrigin(u64 h, PlOrigin origin, u32 us);
     void TempPlWait(u64 h);
     void TempPlWrite();

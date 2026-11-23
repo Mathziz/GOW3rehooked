@@ -1155,19 +1155,20 @@ CompiledPipeline Renderer::Impl::LinkGplPair(const VkPipeline (&main_libs)[4], V
 
 CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                                      const FixedPipelineState& raw_state, const CpuRead& cpu) {
+    // The thread's memo goes by the draw's own state; the first draw of one on this thread records it for the next launches'
+    // AOT (whether or not its pipeline exists already) and finds the pipeline by the state with the dynamic parts zeroed.
     GraphicsPipelineKey gkey{vs.key, ps ? ps.key : 0ull, (raw_state.flags & FixedPipelineState::kHasGs) ? gs.key : 0ull, raw_state};
+    const u64 rh = gkey.Hash();
+    if (temp_pipelog) TempPlUse(gkey, rh);
+    auto& pm = Memos().pipelines;
+    if (const auto* m = pm.Find(rh)) return *m;
+    if (!stats.trace && !boom_on) PipelineRecipes::Instance().Note(gkey.vs_key, gkey.ps_key, gkey.gs_mask, raw_state);
     gkey.state.Canonicalize(caps);
     const u64 h = gkey.Hash();
-    if (temp_pipelog) TempPlUse(gkey, raw_state, h);
-    auto& pm = Memos().pipelines;
-    if (const auto* m = pm.Find(h)) return *m;
     {
         std::shared_lock lock(prog_lock);
-        if (auto it = pipelines.find(h); it != pipelines.end()) return pm[h] = it->second;
+        if (auto it = pipelines.find(h); it != pipelines.end()) return pm[rh] = it->second;
     }
-    if (!stats.trace && !boom_on)
-        PipelineRecipes::Instance().Note(vs.key, ps ? ps.key : 0ull,
-                                         (raw_state.flags & FixedPipelineState::kHasGs) ? gs.key : 0ull, raw_state);
     if (caps.path == ShaderPath::Gpl && (gkey.state.flags & FixedPipelineState::kHasPs)) {
         const VkPipeline vi = gpl_vi[std::min<u8>(gkey.state.topology_class, 2)];
         const VkPipeline prerast = GetGplPreRaster(vs, gs, gkey.state);
@@ -1180,21 +1181,21 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
             CompiledPipeline pl = LinkGplPair(libs, foi_sq, true, true);
             const PlOrigin origin = pl.main ? kPlGplLto : kPlGplLink;
             if (!pl.main) pl = LinkGplPair(libs, foi_sq, false, false);
-            if (pl.main) return pm[h] = KeepPipeline(h, pl, origin);
+            if (pl.main) return pm[rh] = KeepPipeline(h, pl, origin);
         }
     }
     if (!stats.trace && caps.cache_control)
-        if (const CompiledPipeline hit = CreateMonolithicPipeline(vs, ps, gs, gkey.state, true); hit.main) return pm[h] = KeepPipeline(h, hit, kPlHit);
+        if (const CompiledPipeline hit = CreateMonolithicPipeline(vs, ps, gs, gkey.state, true); hit.main) return pm[rh] = KeepPipeline(h, hit, kPlHit);
     if (stats.trace) {
         const CompiledPipeline created = CreateMonolithicPipeline(vs, ps, gs, gkey.state, false);
-        return created.main ? pm[h] = KeepPipeline(h, created, kPlTrace) : CompiledPipeline{};
+        return created.main ? pm[rh] = KeepPipeline(h, created, kPlTrace) : CompiledPipeline{};
     }
     if (!in_worker && !discovered) discovered = true, Discover(cpu, {walk_chain.size(), 0}, false);
     else if (in_worker && block_now && !block_discovered) block_discovered = true, Discover(cpu, block_now->to, true);
     std::shared_future<CompiledPipeline> f;
     {
         std::unique_lock lock(prog_lock);
-        if (auto it = pipelines.find(h); it != pipelines.end()) return pm[h] = it->second;
+        if (auto it = pipelines.find(h); it != pipelines.end()) return pm[rh] = it->second;
         auto [it, fresh] = compiling_pipelines.try_emplace(h);
         if (fresh) it->second = AsyncPipeline(h, vs, ps, gs, gkey.state, true);
         f = it->second;
@@ -1205,7 +1206,7 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
     CompiledPipeline pl{};
     Stalled(stall_waits, stall_wait_ns, [&] { pl = f.get(); });
     if (!pl.main) return {};
-    return pm[h] = pl;
+    return pm[rh] = pl;
 }
 
 CompiledPipeline Renderer::Impl::KeepPipeline(u64 h, CompiledPipeline pl, PlOrigin origin, u32 us) {
@@ -1220,16 +1221,17 @@ CompiledPipeline Renderer::Impl::KeepPipeline(u64 h, CompiledPipeline pl, PlOrig
     return it->second;
 }
 
-void Renderer::Impl::TempPlUse(const GraphicsPipelineKey& k, const FixedPipelineState& raw, u64 h) {
-    const u64 rh = GraphicsPipelineKey{k.vs_key, k.ps_key, k.gs_mask, raw}.Hash();
+void Renderer::Impl::TempPlUse(const GraphicsPipelineKey& k, u64 rh) {
     TempPlLocal& l = temp_pl_local[rh];
     const u32 now = frame;
     if (!l.s) {
         const ShaderCache& sc = ShaderCache::Instance();
         const u32 flags = u32(sc.Contains(k.vs_key)) | u32(k.ps_key && sc.Contains(k.ps_key)) << 1;
+        GraphicsPipelineKey canon = k;
+        canon.state.Canonicalize(caps);
         std::scoped_lock lock(temp_pl_lock);
         TempPlState*& s = temp_pl_by_raw[rh];
-        if (!s) s = &temp_pl_states.emplace_back(TempPlState{k.vs_key, k.ps_key, k.gs_mask, h, raw, now, 0, ~0u, flags, 0});
+        if (!s) s = &temp_pl_states.emplace_back(TempPlState{k.vs_key, k.ps_key, k.gs_mask, canon.Hash(), k.state, now, 0, ~0u, flags, 0});
         l = {s, ~0u, 0};
     }
     if (l.frame == now) return void(++l.draws);
