@@ -39,7 +39,7 @@ struct Job {
 
 // The contract of the game's data (what shader_contract.cpp derives from reading the EBOOT and every WAD), kept so the next
 // launches do not read them again: each variant with where its code lies in the parser's files. Only a complete reading is
-// kept, and only while the game's files, the sample count and the versions of what it derives are what it was made from.
+// kept, and only while the game's files, the sample class and the versions of what it derives are what it was made from.
 struct Kept {
     Recipe recipe;
     u64 key, code_start, fetch_start;
@@ -49,9 +49,13 @@ constexpr u32 kKeptMagic = 0x43433347, kKeptFormat = 1;  // "G3CC"; kKeptFormat:
 struct KeptHead { u32 magic, format; u64 stamp; u32 count, reserved; };
 struct KeptFixed { RecipeHead h; u64 key, code_start, fetch_start; u32 file, paths, code_size, fetch_size, fetch_words, reserved; };
 
+// The scene's sample count as the contract sees it: its multisampled views are the same at x1 and x2 (one sample class), the
+// pipelines leave it 0. A switch between x1 and x2 keeps the contract.
+u32 SampleClass() { return std::max(Aot::sample_log2, 1u); }
+
 // `version`: of the rules the kept list comes from (kKeptFormat, kAotPipelineVersion); its keys follow kAotCacheVersion.
 u64 KeptStamp(u64 files_stamp, bool no_storage_read_nofmt, u32 version) {
-    const u64 parts[]{files_stamp, Aot::sample_log2, kAotCacheVersion, version};
+    const u64 parts[]{files_stamp, SampleClass(), kAotCacheVersion, version};
     const u64 h = PieceHash::Stable64(parts, sizeof(parts));
     return no_storage_read_nofmt ? (h ^ 0x53544F524E4F5244ull) : h;
 }
@@ -108,7 +112,7 @@ void SaveKept(const std::filesystem::path& path, u64 stamp, const std::vector<Ke
     std::filesystem::rename(temporary, path, ec);
 }
 
-constexpr u32 kKeptPlMagic = 0x50433347, kKeptPlFormat = 1;  // "G3CP"
+constexpr u32 kKeptPlMagic = 0x50433347, kKeptPlFormat = 2;  // "G3CP"; 2: ContractedPipeline with its gate
 struct KeptPlHead { u32 magic, format; u64 stamp; u32 count, reserved; };
 
 bool LoadKeptPipelines(const std::filesystem::path& path, u64 stamp, std::vector<ContractedPipeline>& out) {
@@ -415,14 +419,12 @@ void Renderer::Impl::AotBuild() {
         }
     } else try {
         kept.clear(), kept_pipelines.clear();
-        catalog = std::make_unique<Catalog::Data>(Catalog::Read(Aot::game_directory, Gow3::Cpu::plan.shader_threads, Aot::sample_log2));
+        catalog = std::make_unique<Catalog::Data>(Catalog::Read(Aot::game_directory, Gow3::Cpu::plan.shader_threads, SampleClass()));
         Say("AOT: catalog of %zu WADs and %zu embedded programs (%.1f s)\n", catalog->files.size(), catalog->embedded.size(), seconds());
         for (const auto& file : catalog->files)
             if (!file.fatal.empty()) Say("AOT:   unreadable: %s\n", file.fatal.c_str());
         std::vector<Contracted> contracts;
-        std::unordered_set<u64> met_ps;
-        for (const Recipe& r : recipes) if (r.h.stage == u8(Gcn::Stage::Pixel)) met_ps.insert(r.h.code_hash);
-        Contracts(*catalog, contracts, need_pl ? &kept_pipelines : nullptr, met_ps);
+        Contracts(*catalog, contracts, need_pl ? &kept_pipelines : nullptr);
         {   // TEMP: how many of the player's recipes the contract predicted (all / with the engine's own fetch shader), and per path
             std::unordered_map<u64, u32> have;  // key -> paths
             u32 made[kContractPaths]{}, hits[kContractPaths]{}, alone[kContractPaths]{};
@@ -513,11 +515,22 @@ void Renderer::Impl::AotBuild() {
             return true;
         };
         for (const GraphicsPipelineKey& r : Recipes::Instance().Pipelines(no_srnf, blend_interlock)) push_pl(r.vs_key, r.ps_key, r.gs_mask, r.state, false);
+        // The derived pipelines as this launch builds them: one gated on a PS program waits until the recipes meet its code; the
+        // scene's sample count is this launch's.
+        std::unordered_set<u64> met_ps;
+        for (const Recipe& r : recipes) if (r.h.stage == u8(Gcn::Stage::Pixel)) met_ps.insert(r.h.code_hash);
+        size_t gated = 0;
+        const auto push_derived = [&](const ContractedPipeline& cp, bool is_wad) {
+            if (cp.gate && !met_ps.contains(cp.gate)) return ++gated, false;
+            FixedPipelineState st = cp.state;
+            if (!st.samples) st.samples = u8(1u << Aot::sample_log2);
+            return push_pl(cp.vs_key, cp.ps_key, cp.gs_mask, st, is_wad);
+        };
         for (const ContractedPipeline& cp : kept_pipelines)
-            if (cp.file == ~0u) push_pl(cp.vs_key, cp.ps_key, cp.gs_mask, cp.state, false);
+            if (cp.file == ~0u) push_derived(cp, false);
         size_t wad_pl_total = 0;
         for (const ContractedPipeline& cp : kept_pipelines)
-            if (cp.file != ~0u && push_pl(cp.vs_key, cp.ps_key, cp.gs_mask, cp.state, true)) ++wad_pl_total;
+            if (cp.file != ~0u && push_derived(cp, true)) ++wad_pl_total;
         const size_t wad_pl_budget = Aot::lazy ? (wad_pl_total + 3) / 4 : SIZE_MAX;
 
         {
@@ -752,8 +765,9 @@ void Renderer::Impl::AotBuild() {
             cache.PipelineCompleted();
         });
 
-        Say("AOT: pipelines: %zu graphics (%u cached, %u compiled, %u skipped, %u failed), %zu compute (%u cached, %u compiled, %u failed) (%.1f s)\n",
-            pl_jobs.size(), pl_cached.load(), pl_compiled.load(), pl_skipped.load(), pl_failed.load(),
+        Say("AOT: pipelines: %zu graphics (%u cached, %u compiled, %u skipped, %u failed; %zu derived wait for their PS in the recipes), "
+            "%zu compute (%u cached, %u compiled, %u failed) (%.1f s)\n",
+            pl_jobs.size(), pl_cached.load(), pl_compiled.load(), pl_skipped.load(), pl_failed.load(), gated,
             compute_keys.size(), cs_cached.load(), cs_compiled.load(), cs_failed.load(),
             std::chrono::duration<double>(std::chrono::steady_clock::now() - pl_start).count());
     }
@@ -763,7 +777,7 @@ void Renderer::Impl::AotBuild() {
         if (const std::string name = f ? WadName(index.files[f].c_str()) : "EBOOT"; !name.empty() && !wad_keys[f].empty())
             cache.SetWadKeys(name, wad_keys[f], wad_binaries[f]);
     give_hot();  // again, with the binaries this build made
-    if (caps.path != ShaderPath::Objects) SavePipelineCache(true);
+    if (caps.path != ShaderPath::Objects) SavePipelineCache();
     cache.Finish();
     Say("AOT: done (%.1f s)\n", seconds());
 }

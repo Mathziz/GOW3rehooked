@@ -31,8 +31,9 @@ enum class CacheKind { Jit, Aot };
 // the translator's output, the shader layouts, the key (the AOT's also for its order). A file of another version is discarded
 // (and rewritten) when the game starts; the recipes are kept apart. 1: the first public release.
 // kAotPipelineVersion: the pipelines the AOT derives from the game's files (shader_contract.cpp's pipeline rules). Bumping it
-// derives them again and keeps every cache: the driver judges its own pipeline cache. 2: material permutation rules.
-inline constexpr std::uint32_t kJitCacheVersion = 1, kAotCacheVersion = 1, kAotPipelineVersion = 2;
+// derives them again and keeps every cache: the driver judges its own pipeline cache. 2: material permutation rules. 3: gated
+// on the recipes and the scene's sample count when built (the kept list holds neither).
+inline constexpr std::uint32_t kJitCacheVersion = 1, kAotCacheVersion = 1, kAotPipelineVersion = 3;
 
 struct CachedShader {
     std::uint32_t stage = 0;
@@ -103,9 +104,8 @@ public:
     void SetWadHot(const std::string& wad, std::vector<Hot> hot);
     void SetPrepare(std::function<std::uint32_t(std::uint64_t key, std::uint64_t binary, std::uint32_t stage)> fn);
     void SetWarmPipelines(std::function<void()> fn);
-    void SetPipelineCacheFlusher(std::function<void(bool force)> fn);
+    void SetPipelineCacheFlusher(std::function<void(bool exit)> fn);  // called by every flush; `exit`: the last one
     void ClearRendererCallbacks();
-    void NotePipelineCacheDirty(std::uint32_t count);
     void WadOpened(const char* path);
     // End of the run: trains the dictionaries and flushes.
     void Finish();
@@ -185,8 +185,7 @@ private:
     std::mutex prepare_cb_lock, flush_cb_lock;
     std::function<std::uint32_t(std::uint64_t key, std::uint64_t binary, std::uint32_t stage)> prepare_cb;
     std::function<void()> warm_pipelines_cb;
-    std::function<void(bool force)> flush_pipeline_cache_cb;
-    std::atomic<std::uint32_t> pipeline_dirty{0};
+    std::function<void(bool exit)> flush_pipeline_cache_cb;
     std::atomic<std::uint32_t> done{0}, total{0}, pipeline_done{0}, pipeline_total{0};
     std::atomic<std::uint64_t> done_weight{0}, total_weight{0};
 };

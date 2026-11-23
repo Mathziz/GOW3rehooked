@@ -21,14 +21,16 @@ struct Contracted {
     std::uint32_t paths = 0;                    // bit per ContractPath that produced this variant
 };
 
+// Kept apart from the recipes and the sample count: what depends on them is resolved when the AOT builds.
 struct ContractedPipeline {
     std::uint64_t vs_key = 0;
     std::uint64_t ps_key = 0;
     std::uint64_t gs_mask = 0;
-    std::uint32_t file = ~0u;  // Catalog::Data::files index, ~0u: EBOOT
+    std::uint64_t gate = 0;      // code hash of the PS program the recipes must have met (0: always built)
+    std::uint32_t file = ~0u;    // Catalog::Data::files index, ~0u: EBOOT
     std::uint32_t pad = 0;
-    FixedPipelineState state{};
+    FixedPipelineState state{};  // samples 0: the scene's sample count
 };
 static_assert(std::is_trivially_copyable_v<ContractedPipeline>);
-static_assert(sizeof(ContractedPipeline) == 144);
+static_assert(sizeof(ContractedPipeline) == 152);
 } // namespace Gpu

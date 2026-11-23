@@ -741,10 +741,9 @@ struct Renderer::Impl {
     std::unordered_map<u64, u64> vs_outputs;               // VS translation key -> output mask
     std::unordered_map<u64, Variant> variants;
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
-    std::atomic<u32> pipeline_cache_dirty{0};
+    std::atomic<u32> pipeline_cache_dirty{0};  // pipelines compiled since the last save
     std::mutex pipeline_cache_save_lock;
-    std::chrono::steady_clock::time_point pipeline_cache_saved{};  // under pipeline_cache_save_lock
-    size_t pipeline_cache_bytes = 0;                                // the last save's (or load's) size, under the same
+    size_t pipeline_cache_bytes = 0;  // the last save's (or load's) size, under pipeline_cache_save_lock
     std::unordered_map<u64, CompiledPipeline> pipelines;   // GraphicsPipelineKey::Hash() -> main/square VkPipeline (under prog_lock)
     // Tier 2 (Gpl): 4-part Graphics Pipeline Library caches (under prog_lock).
     VkPipeline gpl_vi[3]{};                              // Vertex Input Interface: POINT_LIST, LINE_LIST, TRIANGLE_LIST
@@ -807,10 +806,9 @@ struct Renderer::Impl {
     void Queue(std::function<void()> task, u32 priority);
     void StopCompilers();
     void AotBuild();
-    // shader_contract.cpp: the draw configurations the catalog implies, as recipes (translation keys the runtime would compute).
-    // met_ps: code hashes of the PS programs the recipes hold (pipelines of runtime-chosen permutations need them).
-    void Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out,
-                   const std::unordered_set<u64>& met_ps);
+    // shader_contract.cpp: the draw configurations the catalog implies, as recipes (translation keys the runtime would compute),
+    // and the pipelines they imply (gated on PS programs the recipes must meet, scene sample count 0).
+    void Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out);
     static inline thread_local bool waiting = false;  // the shader a draw asked for is still compiling (Jit::Mode::Async)
     std::mutex compiled_lock;
     std::vector<Stats::Compile> compiled;
@@ -830,7 +828,7 @@ struct Renderer::Impl {
     bool ValidateNativePipelineCacheData(std::span<const u8> data) const;
     void CreatePipelineCache(std::span<const u8> initial_data = {});
     void LoadPipelineCache();
-    void SavePipelineCache(bool force = false);
+    void SavePipelineCache();  // at the exit and the startup AOT's end only
     void DestroyShaderRef(const ShaderRef& r);
     VkShaderModule CreateShaderModule(std::span<const u32> spirv);
     VkPipeline CreateComputePipeline(std::span<const u32> spirv, bool fail_on_compile = false);

@@ -658,16 +658,14 @@ void Renderer::Impl::LoadPipelineCache() {
     Gow3::Log(std::format("Pipeline cache: loaded {:.1f} MB ({:.1f} MB compressed)", raw.size() / 1048576.0, packed.size() / 1048576.0));
 }
 
-void Renderer::Impl::SavePipelineCache(bool force) {
+// A save serializes, hashes and compresses the whole cache while the driver holds it (its compiles wait): only at the exit
+// and at the end of the startup AOT, never in play. A crash loses the session's pipelines, which the pipeline recipes rebuild.
+void Renderer::Impl::SavePipelineCache() {
     ShaderCache& sc = ShaderCache::Instance();
     if (caps.path == ShaderPath::Objects || !pipeline_cache || !sc.Enabled()) return;
     std::scoped_lock l(pipeline_cache_save_lock);
     const u32 before = pipeline_cache_dirty.load(std::memory_order_acquire);
-    if ((!force && before < 8) || before == 0) return;
-    // A save serializes, hashes and compresses the whole cache while the driver holds it: once it is large, at most every
-    // five minutes outside the exit and the AOT's end.
-    const auto now = std::chrono::steady_clock::now();
-    if (!force && pipeline_cache_bytes > (32u << 20) && now - pipeline_cache_saved < std::chrono::minutes(5)) return;
+    if (before == 0) return;
     // One serialization when the last size is known (a guess with room), two otherwise or once it outgrew the guess.
     size_t size = pipeline_cache_bytes ? pipeline_cache_bytes + pipeline_cache_bytes / 8 + (1u << 20) : 0;
     std::unique_ptr<u8[]> raw;
@@ -710,11 +708,8 @@ void Renderer::Impl::SavePipelineCache(bool force) {
         std::filesystem::remove(tmp, ec);
         return;
     }
-    pipeline_cache_bytes = size, pipeline_cache_saved = now;
-    const u32 prev = pipeline_cache_dirty.fetch_sub(before, std::memory_order_acq_rel);
-    const u32 left = prev >= before ? prev - before : 0;
-    if (prev < before) pipeline_cache_dirty.store(0, std::memory_order_release);
-    sc.NotePipelineCacheDirty(left);
+    pipeline_cache_bytes = size;
+    pipeline_cache_dirty.fetch_sub(before, std::memory_order_acq_rel);
     Gow3::Log(std::format("Pipeline cache: saved {:.1f} MB ({:.1f} MB compressed)", size / 1048576.0, packed_size / 1048576.0));
 }
 
@@ -753,7 +748,7 @@ VkPipeline Renderer::Impl::CreateComputePipeline(std::span<const u32> spirv, boo
     const VkResult e = vkCreateComputePipelines(dev, pipeline_cache, 1, &ci, nullptr, &pl);
     if (mod) vkDestroyShaderModule(dev, mod, nullptr);
     if (e == VK_SUCCESS) {
-        if (!fail_on_compile) ShaderCache::Instance().NotePipelineCacheDirty(pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed) + 1);
+        if (!fail_on_compile) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
         return pl;
     }
     if (e < 0) Report(std::format("vkCreateComputePipelines {}: {} bytes", (int)e, spirv.size_bytes()));
@@ -869,7 +864,7 @@ VkPipeline Renderer::Impl::CreateGraphicsPipelineRaw(const ShaderRef& vs, const 
     VkPipeline pl = VK_NULL_HANDLE;
     const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl);
     if (e == VK_SUCCESS) {
-        if (!fail_on_compile) ShaderCache::Instance().NotePipelineCacheDirty(pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed) + 1);
+        if (!fail_on_compile) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
         return pl;
     }
     if (e < 0) Report(std::format("vkCreateGraphicsPipelines {}: vs {:x} ps {:x}", (int)e, vs.key, ps.key));
@@ -1146,7 +1141,7 @@ VkPipeline Renderer::Impl::LinkGplPipeline(const VkPipeline (&libs)[4], bool lto
     VkPipeline pl = VK_NULL_HANDLE;
     const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl);
     if (e == VK_SUCCESS) {
-        if (lto && !fail_on_compile) ShaderCache::Instance().NotePipelineCacheDirty(pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed) + 1);
+        if (lto && !fail_on_compile) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
         return pl;
     }
     if (e < 0) Report(std::format("vkCreateGraphicsPipelines GPL Link(lto={}) {}", lto, (int)e));

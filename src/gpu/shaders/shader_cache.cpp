@@ -469,7 +469,7 @@ void ShaderCache::SetWarmPipelines(std::function<void()> fn) {
     warm_pipelines_cb = std::move(fn);
 }
 
-void ShaderCache::SetPipelineCacheFlusher(std::function<void(bool force)> fn) {
+void ShaderCache::SetPipelineCacheFlusher(std::function<void(bool exit)> fn) {
     std::scoped_lock l(flush_cb_lock);
     flush_pipeline_cache_cb = std::move(fn);
 }
@@ -484,11 +484,6 @@ void ShaderCache::ClearRendererCallbacks() {
         std::scoped_lock l(flush_cb_lock);
         flush_pipeline_cache_cb = {};
     }
-}
-
-void ShaderCache::NotePipelineCacheDirty(std::uint32_t count) {
-    pipeline_dirty.store(count, std::memory_order_release);
-    if (count >= 8) Dirty();
 }
 
 // The game opened the WAD. The binaries of its shaders are read ahead into the system's file cache (not decoded: the memory
@@ -665,14 +660,11 @@ void ShaderCache::FlushLoop(const std::stop_token& stop) {
             }
             const Progress progress = Snapshot();
             const bool loading = streamed_now >= kLoadBytes || wads_now >= kLoadWads;
-            const bool pl_burst = pipeline_dirty.load(std::memory_order_acquire) >= 8 && progress.done == progress.total &&
-                                  progress.pipelines_done == progress.pipelines_total;
-            const bool burst = (waiting >= kBurst && progress.done == progress.total && progress.pipelines_done == progress.pipelines_total) || pl_burst;
+            const bool burst = waiting >= kBurst && progress.done == progress.total && progress.pipelines_done == progress.pipelines_total;
             if (!loading && !burst) continue;
             char why[96];
             if (loading) std::snprintf(why, sizeof why, "loading: %llu MB streamed, %u WADs in 2 s", (unsigned long long)(streamed_now >> 20), wads_now);
-            else if (waiting >= kBurst) std::snprintf(why, sizeof why, "compile burst: %zu waiting", waiting);
-            else std::snprintf(why, sizeof why, "pipeline burst: %u dirty", pipeline_dirty.load(std::memory_order_relaxed));
+            else std::snprintf(why, sizeof why, "compile burst: %zu waiting", waiting);
             Flush(why, false);
         }
     }

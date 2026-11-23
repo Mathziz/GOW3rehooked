@@ -132,8 +132,7 @@ Job Base(const Mapping& f, const CatShader& shader, u32 source, std::span<const 
 }
 } // namespace
 
-void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out,
-                               const std::unordered_set<u64>& met_ps) {
+void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out) {
     const auto begin = std::chrono::steady_clock::now();
     const u32 sample_log2 = data.sample_log2;
     CatImage fallback = Catalog::ApiFormat(0xfac00a);
@@ -148,7 +147,8 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
     struct PairMeta {
         u32 file = ~0u;
         std::vector<MaterialClass> classes;  // empty: not a material's technique
-        bool derive = true, met = false;     // pipelines derived; the recipes met its PS program (or it has none)
+        bool derive = true;                  // pipelines derived
+        u64 code = 0, gate = 0;              // its PS program's code hash (0: none or unreadable); the gate of all its pipelines
     };
     std::vector<PairMeta> pair_metas;
     const auto add = [&](const Job& job) {
@@ -299,17 +299,19 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
             // A material draw picks its technique's permutation from selector 0x23 (bit 1: the part receives a dynamic shadow,
             // set by s_shadowJobList) and 0x49 (bit 2: a flag of the render job); bit 0 is never set, and a permutation the
             // family lacks falls back to its base recipe (~0). Shadow receivers and those fallbacks follow the scene at run
-            // time: they are derived for the PS programs the recipes met.
+            // time: their pipelines are gated on the PS program, built once the recipes met its code.
             std::unordered_set<u32> plain;  // families with permutation 0
             for (const auto& r : recipes) if (r.permutation == 0) plain.insert(r.shader_key);
             pair_metas.reserve(pair_base + recipes.size());
             for (const auto& r : recipes) {
                 PairMeta& m = pair_metas.emplace_back(PairMeta{index_file, classes[r.shader_key]});
                 if (m.classes.empty()) continue;
-                m.met = !r.ps || (r.ps->code <= r.ps->footer && r.ps->footer <= f.size &&
-                                  met_ps.contains(::Gpu::PieceHash::ShaderCode(f.data + r.ps->code, r.ps->footer - r.ps->code)));
+                if (r.ps && r.ps->code <= r.ps->footer && r.ps->footer <= f.size)
+                    m.code = ::Gpu::PieceHash::ShaderCode(f.data + r.ps->code, r.ps->footer - r.ps->code);
                 const u64 p = r.permutation;
-                m.derive = p == ~u64{} ? !plain.contains(r.shader_key) || m.met : !(p & 1) && (!(p & 2) || m.met);
+                const bool follows_scene = p == ~u64{} ? plain.contains(r.shader_key) : (p & 2) != 0;
+                m.gate = follows_scene ? m.code : 0;
+                m.derive = (p == ~u64{} || !(p & 1)) && !(follows_scene && r.ps && !m.code);  // an unreadable program is never met
             }
         }
         // Model meshes: the mesh streams bind for every layer recipe of the material.
@@ -643,7 +645,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         const VkFormat scene_fmt = SurfaceFormat(data.scene_color.data_format, data.scene_color.num_format);
         VkFormat scene_srgb = SurfaceFormat(data.scene_color.data_format, 9);
         if (scene_srgb == VK_FORMAT_UNDEFINED) scene_srgb = VK_FORMAT_R8G8B8A8_SRGB;
-        const u8 scene_samples = u8(1u << sample_log2);
+        constexpr u8 scene_samples = 0;  // the scene's sample count, set when the AOT builds
         constexpr u8 kClip = FixedPipelineState::kNegOne;
         // A material class's blend as the draw sets it: the runtime's MIN/MAX rewrite; no blending: the zero CB_BLEND_CONTROL.
         const auto blend_of = [](const MaterialClass& c) -> FixedAttachmentBlend {
@@ -655,8 +657,8 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         };
 
         std::vector<ContractedPipeline> derived;
-        auto emit = [&](u64 vs_key, u64 ps_key, u32 file, const FixedPipelineState& st) {
-            derived.push_back({vs_key, ps_key, 0ull, file, 0u, st});
+        auto emit = [&](u64 vs_key, u64 ps_key, u32 file, const FixedPipelineState& st, u64 gate) {
+            derived.push_back({vs_key, ps_key, 0ull, gate, file, 0u, st});
         };
         constexpr VkFormat kUnorm = VK_FORMAT_R8G8B8A8_UNORM;
         // What a pair draws: every target its recipe implies; pass code's model meshes; a screen pass sampling the scene through sRGB views.
@@ -683,14 +685,14 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                     z_ms.samples = scene_samples;
                     z_ms.topology_class = 2;
                     z_ms.flags = kClip;
-                    emit(vs_list[vi], 0, meta.file, z_ms);
+                    emit(vs_list[vi], 0, meta.file, z_ms, meta.gate);
 
                     FixedPipelineState z_shadow{};
                     z_shadow.depth_format = VK_FORMAT_D32_SFLOAT;
                     z_shadow.samples = 1;
                     z_shadow.topology_class = 2;
                     z_shadow.flags = kClip;
-                    emit(vs_list[vi], 0, meta.file, z_shadow);
+                    emit(vs_list[vi], 0, meta.file, z_shadow, meta.gate);
                 }
                 continue;
             }
@@ -700,6 +702,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 u32 count = 0;
                 for (u32 k = 0; k < 8; ++k)
                     if (pc.col_format >> (4 * k) & 0xF) count = k + 1;
+                u64 gate = meta.gate;
                 // The pair on `n` color targets (MRT0 `first`, the others `rest`), with the D32S8 depth when `depth`.
                 const auto put = [&](u32 n, VkFormat first, VkFormat rest, bool depth, u8 samples, const MaterialClass* c = nullptr) {
                     FixedPipelineState s{};
@@ -710,20 +713,19 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                     }
                     if (depth) s.depth_format = s.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
                     s.samples = samples, s.topology_class = 2, s.flags = FixedPipelineState::kHasPs | kClip;
-                    emit(vs_key, pc.key, meta.file, s);
+                    emit(vs_key, pc.key, meta.file, s, gate);
                 };
-                // Depth only (a pass binds no color target whatever the PS exports): the scene's depth and the single-sampled one.
-                const auto depth_only = [&] {
-                    put(0, {}, {}, true, scene_samples);
-                    if (scene_samples > 1) put(0, {}, {}, true, 1);
-                };
+                // Depth only (a pass binds no color target whatever the PS exports): the scene's depth and the single-sampled one
+                // (the same state without MSAA, built once).
+                const auto depth_only = [&] { put(0, {}, {}, true, scene_samples), put(0, {}, {}, true, 1); };
                 if (draws == kScreenSrgb) {
                     put(count, scene_srgb, scene_srgb, false, 1);
                 } else if (!meta.classes.empty()) {
-                    // Several targets are single-sampled UNORM ones; opaque materials were never seen there: only PS the recipes met.
+                    // Several targets are single-sampled UNORM ones; opaque materials were never seen there: gated on the PS.
                     for (const MaterialClass& c : meta.classes)
                         if (count < 2 && !c[0]) put(count, scene_srgb, kUnorm, true, scene_samples, &c);
-                        else if (c[0] || meta.met) put(count, kUnorm, kUnorm, true, 1, &c);
+                        else if (c[0]) put(count, kUnorm, kUnorm, true, 1, &c);
+                        else if (meta.code) gate = meta.code, put(count, kUnorm, kUnorm, true, 1, &c), gate = meta.gate;
                 } else if (count == 0) {
                     depth_only();
                 } else if (pass) {
@@ -753,9 +755,10 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
             auto [lo, hi] = seen_pl.equal_range(h);
             bool dup = false;
             for (auto it = lo; it != hi; ++it) {
-                const ContractedPipeline& prev = (*pipelines_out)[it->second];
+                ContractedPipeline& prev = (*pipelines_out)[it->second];
                 if (prev.vs_key == cp.vs_key && prev.ps_key == cp.ps_key && prev.gs_mask == cp.gs_mask && prev.state == cp.state) {
                     dup = true;
+                    if (!cp.gate) prev.gate = 0;  // another pair derives it without a gate
                     break;
                 }
             }

@@ -282,9 +282,10 @@ bool Renderer::Impl::Setup(std::string& error) {
     if (ShaderCache::Instance().Enabled() && ShaderCache::Instance().Kind() == CacheKind::Aot) AotBuild();  // the game waits for the build
     if (caps.path != ShaderPath::Objects && ShaderCache::Instance().Enabled()) {
         ShaderCache::Instance().SetWarmPipelines([this] { WarmPipelines(); });
-        ShaderCache::Instance().SetPipelineCacheFlusher([this](bool force) {
-            SavePipelineCache(force);
-            if (force) TempPlWrite();  // TEMP: the exit's flush
+        ShaderCache::Instance().SetPipelineCacheFlusher([this](bool exit) {
+            if (!exit) return;  // the flushes in play leave the pipeline cache alone
+            SavePipelineCache();
+            TempPlWrite();  // TEMP: the exit's flush
         });
     }
     return true;
@@ -308,7 +309,7 @@ Renderer::~Renderer() {
         for (auto p : w.pool) vkDestroyCommandPool(d->dev, p, nullptr);
     d->StopCompilers();
     ShaderCache::Instance().ClearRendererCallbacks();
-    if (d->caps.path != ShaderPath::Objects) d->SavePipelineCache(true);
+    if (d->caps.path != ShaderPath::Objects) d->SavePipelineCache();
     ShaderCache::Instance().Finish();
     Recipes::Instance().Report();
     for (auto& [k, f] : d->compiling_pipelines) (void)f.get();
