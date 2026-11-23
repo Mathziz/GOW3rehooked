@@ -623,6 +623,8 @@ void Renderer::Impl::CreatePipelineCache(std::span<const u8> initial_data) {
     if (e != VK_SUCCESS) Report(std::format("vkCreatePipelineCache {}", (int)e)), pipeline_cache = VK_NULL_HANDLE;
 }
 
+constexpr u64 kPipelineCacheMax = 512ull << 20;  // the largest cache a load takes (a corrupt header's size is not allocated)
+
 void Renderer::Impl::LoadPipelineCache() {
     if (caps.path == ShaderPath::Objects) return;
     ShaderCache& sc = ShaderCache::Instance();
@@ -642,7 +644,7 @@ void Renderer::Impl::LoadPipelineCache() {
     Header hdr{};
     if (!in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr))) return CreatePipelineCache({});
     if (hdr.magic != kMagic || hdr.format != kFormat || hdr.binary_seed != binary_seed || hdr.raw_size == 0 ||
-        hdr.raw_size > (512ull << 20) || hdr.packed_size == 0 || u64(total) != sizeof(Header) + hdr.packed_size)
+        hdr.raw_size > kPipelineCacheMax || hdr.packed_size == 0 || u64(total) != sizeof(Header) + hdr.packed_size)
         return CreatePipelineCache({});
     std::vector<u8> packed(size_t(hdr.packed_size));
     if (!in.read(reinterpret_cast<char*>(packed.data()), std::streamsize(packed.size()))) return CreatePipelineCache({});
@@ -652,6 +654,7 @@ void Renderer::Impl::LoadPipelineCache() {
     if (PieceHash::Stable64(raw.data(), raw.size()) != hdr.raw_hash || !ValidateNativePipelineCacheData(raw))
         return CreatePipelineCache({});
     CreatePipelineCache(raw);
+    pipeline_cache_bytes = raw.size();
     Gow3::Log(std::format("Pipeline cache: loaded {:.1f} MB ({:.1f} MB compressed)", raw.size() / 1048576.0, packed.size() / 1048576.0));
 }
 
@@ -661,22 +664,32 @@ void Renderer::Impl::SavePipelineCache(bool force) {
     std::scoped_lock l(pipeline_cache_save_lock);
     const u32 before = pipeline_cache_dirty.load(std::memory_order_acquire);
     if ((!force && before < 8) || before == 0) return;
-    size_t size = 0;
-    if (vkGetPipelineCacheData(dev, pipeline_cache, &size, nullptr) != VK_SUCCESS || !size) return;
-    std::vector<u8> raw(size);
-    if (vkGetPipelineCacheData(dev, pipeline_cache, &size, raw.data()) != VK_SUCCESS || !size) return;
-    raw.resize(size);
-    std::vector<u8> packed(ZSTD_compressBound(raw.size()));
-    const size_t packed_size = ZSTD_compress(packed.data(), packed.size(), raw.data(), raw.size(), 3);
+    // A save serializes, hashes and compresses the whole cache while the driver holds it: once it is large, at most every
+    // five minutes outside the exit and the AOT's end.
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && pipeline_cache_bytes > (32u << 20) && now - pipeline_cache_saved < std::chrono::minutes(5)) return;
+    // One serialization when the last size is known (a guess with room), two otherwise or once it outgrew the guess.
+    size_t size = pipeline_cache_bytes ? pipeline_cache_bytes + pipeline_cache_bytes / 8 + (1u << 20) : 0;
+    std::unique_ptr<u8[]> raw;
+    VkResult r = VK_INCOMPLETE;
+    if (size) raw = std::make_unique_for_overwrite<u8[]>(size), r = vkGetPipelineCacheData(dev, pipeline_cache, &size, raw.get());
+    if (r == VK_INCOMPLETE) {
+        if (vkGetPipelineCacheData(dev, pipeline_cache, &size, nullptr) != VK_SUCCESS || !size) return;
+        raw = std::make_unique_for_overwrite<u8[]>(size);
+        r = vkGetPipelineCacheData(dev, pipeline_cache, &size, raw.get());
+    }
+    if (r != VK_SUCCESS || !size || size > kPipelineCacheMax) return;  // larger than a load takes: the file that loads stays
+    const size_t bound = ZSTD_compressBound(size);
+    const auto packed = std::make_unique_for_overwrite<u8[]>(bound);
+    const size_t packed_size = ZSTD_compress(packed.get(), bound, raw.get(), size, 3);
     if (ZSTD_isError(packed_size) || !packed_size) return;
-    packed.resize(packed_size);
     struct Header {
         u32 magic, format;
         u64 binary_seed, raw_size, packed_size, raw_hash;
     };
     static_assert(sizeof(Header) == 40);
     constexpr u32 kMagic = 0x43503347, kFormat = 1;  // "G3PC"
-    const Header hdr{kMagic, kFormat, binary_seed, u64(raw.size()), u64(packed.size()), PieceHash::Stable64(raw.data(), raw.size())};
+    const Header hdr{kMagic, kFormat, binary_seed, u64(size), u64(packed_size), PieceHash::Stable64(raw.get(), size)};
     const auto path = sc.Directory() / (PieceHash::UsesAes() ? "pipeline-cache-hash2-aes.bin" : "pipeline-cache-hash2-xxh.bin");
     auto tmp = path;
     tmp += ".tmp";
@@ -684,7 +697,7 @@ void Renderer::Impl::SavePipelineCache(bool force) {
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-        out.write(reinterpret_cast<const char*>(packed.data()), std::streamsize(packed.size()));
+        out.write(reinterpret_cast<const char*>(packed.get()), std::streamsize(packed_size));
         out.flush();
         if (!out.good()) {
             out.close();
@@ -697,11 +710,12 @@ void Renderer::Impl::SavePipelineCache(bool force) {
         std::filesystem::remove(tmp, ec);
         return;
     }
+    pipeline_cache_bytes = size, pipeline_cache_saved = now;
     const u32 prev = pipeline_cache_dirty.fetch_sub(before, std::memory_order_acq_rel);
     const u32 left = prev >= before ? prev - before : 0;
     if (prev < before) pipeline_cache_dirty.store(0, std::memory_order_release);
     sc.NotePipelineCacheDirty(left);
-    Gow3::Log(std::format("Pipeline cache: saved {:.1f} MB ({:.1f} MB compressed)", raw.size() / 1048576.0, packed.size() / 1048576.0));
+    Gow3::Log(std::format("Pipeline cache: saved {:.1f} MB ({:.1f} MB compressed)", size / 1048576.0, packed_size / 1048576.0));
 }
 
 void Renderer::Impl::DestroyShaderRef(const ShaderRef& r) {

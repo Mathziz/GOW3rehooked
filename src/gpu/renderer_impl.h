@@ -738,6 +738,8 @@ struct Renderer::Impl {
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
     std::atomic<u32> pipeline_cache_dirty{0};
     std::mutex pipeline_cache_save_lock;
+    std::chrono::steady_clock::time_point pipeline_cache_saved{};  // under pipeline_cache_save_lock
+    size_t pipeline_cache_bytes = 0;                                // the last save's (or load's) size, under the same
     std::unordered_map<u64, CompiledPipeline> pipelines;   // GraphicsPipelineKey::Hash() -> main/square VkPipeline (under prog_lock)
     // Tier 2 (Gpl): 4-part Graphics Pipeline Library caches (under prog_lock).
     VkPipeline gpl_vi[3]{};                              // Vertex Input Interface: POINT_LIST, LINE_LIST, TRIANGLE_LIST
