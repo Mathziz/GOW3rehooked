@@ -392,6 +392,7 @@ Stats& Renderer::GetStats() {
         s.vram_mb[0] = float(d->mirror_chunks.load(std::memory_order_relaxed)) * mb;
         s.vram_mb[3] = float(d->dedicated_images.load(std::memory_order_relaxed)) * mb;
         s.vram_mb[4] = float(d->device_buffers.load(std::memory_order_relaxed)) * mb;
+        s.vram_mb[7] = float(d->host_buffers.load(std::memory_order_relaxed)) * mb;
         s.vram_textures = u32(d->textures.size());
     }
     return d->stats;

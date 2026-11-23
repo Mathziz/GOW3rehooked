@@ -324,7 +324,7 @@ struct Renderer::Impl {
     bool chunk_failed = false;  // a chunk allocation failed (logged once)
     std::vector<u64> bound;  // bitmap of mirror pages with memory
     std::vector<VkSparseMemoryBind> pending_binds;
-    std::atomic<u64> mirror_chunks{0}, device_buffers{0};  // debug: device memory held (bytes)
+    std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)
     // 4 KB piece -> content hash | 1 (0: never written), to skip unchanged uploads. Guest addresses below 32 GB; the
     // table is demand-zero memory, so only the pieces the game uses cost anything.
     static constexpr u64 kPieces = 1ull << 23;

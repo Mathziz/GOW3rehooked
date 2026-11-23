@@ -100,12 +100,13 @@ VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFla
         img_free_bytes = image_free[0] + image_free[1];
     }
     const std::string msg = std::format(
-        "vkAllocateMemory {}: {} bytes, type {} of {:x}, want {:x} (held MB: mirror {}, img_blocks {} free {}, ded_img {}, dev_buf {})",
+        "vkAllocateMemory {}: {} bytes, type {} of {:x}, want {:x} (held MB: mirror {}, img_blocks {} free {}, ded_img {}, dev_buf {}, host_buf {})",
         (int)e, r.size, (int)primary, r.memoryTypeBits, (u32)want,
         mirror_chunks.load(std::memory_order_relaxed) >> 20,
         img_bytes >> 20, img_free_bytes >> 20,
         dedicated_images.load(std::memory_order_relaxed) >> 20,
-        device_buffers.load(std::memory_order_relaxed) >> 20);
+        device_buffers.load(std::memory_order_relaxed) >> 20,
+        host_buffers.load(std::memory_order_relaxed) >> 20);
     Report(msg);
     if (!alloc_failed.exchange(true, std::memory_order_relaxed)) Gow3::Log(msg);
     return VK_NULL_HANDLE;
@@ -144,6 +145,7 @@ Renderer::Impl::Buffer Renderer::Impl::MakeBuffer(u64 size, VkBufferUsageFlags u
             vkFreeMemory(dev, b.mem, nullptr);
             return {};
         }
+        host_buffers += size;
     } else {
         device_buffers += size;
     }
@@ -165,8 +167,10 @@ void Renderer::Impl::FreeBuffer(Buffer& b) {
                 break;
             }
     }
-    if (b.buf) vkDestroyBuffer(dev, b.buf, nullptr), vkFreeMemory(dev, b.mem, nullptr);
-    if (b.buf && !b.ptr) device_buffers -= b.size;
+    if (b.buf) {
+        vkDestroyBuffer(dev, b.buf, nullptr), vkFreeMemory(dev, b.mem, nullptr);
+        (b.ptr ? host_buffers : device_buffers) -= b.size;
+    }
     b = {};
 }
 
