@@ -39,20 +39,19 @@ struct Job {
 
 // The contract of the game's data (what shader_contract.cpp derives from reading the EBOOT and every WAD), kept so the next
 // launches do not read them again: each variant with where its code lies in the parser's files. Only a complete reading is
-// kept, and only while the game's files, this build and the sample count are what it was made from.
+// kept, and only while the game's files, the sample count and the versions of what it derives are what it was made from.
 struct Kept {
     Recipe recipe;
     u64 key, code_start, fetch_start;
     u32 file, paths, code_size, fetch_size;  // file: the parser's files
 };
-constexpr u32 kKeptMagic = 0x43433347, kKeptFormat = 1;  // "G3CC"; kKeptFormat: the layout below
+constexpr u32 kKeptMagic = 0x43433347, kKeptFormat = 1;  // "G3CC"; kKeptFormat: the layout below and the variant rules
 struct KeptHead { u32 magic, format; u64 stamp; u32 count, reserved; };
 struct KeptFixed { RecipeHead h; u64 key, code_start, fetch_start; u32 file, paths, code_size, fetch_size, fetch_words, reserved; };
 
-u64 KeptStamp(u64 files_stamp, bool no_storage_read_nofmt) {
-    std::error_code ec;
-    const auto module = Gow3::ExecutableDirectory() / Gow3::ExecutableName;  // a new build derives the contract differently
-    const u64 parts[]{files_stamp, Aot::sample_log2, std::filesystem::file_size(module, ec), u64(std::filesystem::last_write_time(module, ec).time_since_epoch().count()), kKeptFormat};
+// `version`: of the rules the kept list comes from (kKeptFormat, kAotPipelineVersion); its keys follow kAotCacheVersion.
+u64 KeptStamp(u64 files_stamp, bool no_storage_read_nofmt, u32 version) {
+    const u64 parts[]{files_stamp, Aot::sample_log2, kAotCacheVersion, version};
     const u64 h = PieceHash::Stable64(parts, sizeof(parts));
     return no_storage_read_nofmt ? (h ^ 0x53544F524E4F5244ull) : h;
 }
@@ -397,12 +396,12 @@ void Renderer::Impl::AotBuild() {
     const bool need_pl = caps.path != ShaderPath::Objects;
     const auto kept_path = cache.Directory() / (PieceHash::UsesAes() ? "contract-hash2-aes.cache" : "contract-hash2-xxh.cache");
     const auto kept_pl_path = cache.Directory() / (PieceHash::UsesAes() ? "pipeline-contract-hash2-aes.cache" : "pipeline-contract-hash2-xxh.cache");
-    const u64 kept_stamp = KeptStamp(index.stamp, no_srnf);
+    const u64 kept_stamp = KeptStamp(index.stamp, no_srnf, kKeptFormat), kept_pl_stamp = KeptStamp(index.stamp, no_srnf, kAotPipelineVersion);
     std::vector<Kept> kept;
     std::vector<ContractedPipeline> kept_pipelines;
     std::deque<Parser::Program> kept_code;  // where the code of the variants read from the file lies, for their jobs
     size_t wad_total = 0, embedded_pending = 0;
-    if (LoadKept(kept_path, kept_stamp, kept) && (!need_pl || LoadKeptPipelines(kept_pl_path, kept_stamp, kept_pipelines))) {
+    if (LoadKept(kept_path, kept_stamp, kept) && (!need_pl || LoadKeptPipelines(kept_pl_path, kept_pl_stamp, kept_pipelines))) {
         Say("AOT: contract of %zu variants read from the cache (%.1f s)\n", kept.size(), seconds());
         for (Kept& v : kept) {
             if (v.recipe.h.stage == u8(Gcn::Stage::Compute)) compute_keys.push_back(v.key);
@@ -478,7 +477,7 @@ void Renderer::Impl::AotBuild() {
         }
         if (complete) {
             SaveKept(kept_path, kept_stamp, kept);
-            if (need_pl) SaveKeptPipelines(kept_pl_path, kept_stamp, kept_pipelines);
+            if (need_pl) SaveKeptPipelines(kept_pl_path, kept_pl_stamp, kept_pipelines);
             Say("AOT: contract of %zu variants kept for the next launches (%.1f s)\n", kept.size(), seconds());
         }
     } catch (const std::exception& e) {
