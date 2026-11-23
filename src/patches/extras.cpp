@@ -444,7 +444,7 @@ void InstallHooks(Core::Module& eboot) {
     const auto make_jump_patch = [&](u64 rva, size_t len, u8 opcode, const u8* stub_ptr,
                                      std::vector<u8> expected, MemoryPatch& out) -> bool {
         const s64 delta = reinterpret_cast<intptr_t>(stub_ptr) -
-                          reinterpret_cast<intptr_t>(base + rva + 5);
+                          static_cast<intptr_t>(base + rva + 5);
         if (delta < INT32_MIN || delta > INT32_MAX || len < 5) return false;
         const s32 rel = static_cast<s32>(delta);
         std::vector<u8> repl(len, 0x90);
