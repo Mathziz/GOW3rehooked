@@ -1158,6 +1158,7 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
     GraphicsPipelineKey gkey{vs.key, ps ? ps.key : 0ull, (raw_state.flags & FixedPipelineState::kHasGs) ? gs.key : 0ull, raw_state};
     gkey.state.Canonicalize(caps);
     const u64 h = gkey.Hash();
+    if (temp_pipelog) TempPlUse(gkey, raw_state, h);
     auto& pm = Memos().pipelines;
     if (const auto* m = pm.Find(h)) return *m;
     {
@@ -1177,39 +1178,16 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
         if (vi && prerast && fs && foi && (!need_sq || foi_sq)) {
             const VkPipeline libs[4]{vi, prerast, fs, foi};
             CompiledPipeline pl = LinkGplPair(libs, foi_sq, true, true);
+            const PlOrigin origin = pl.main ? kPlGplLto : kPlGplLink;
             if (!pl.main) pl = LinkGplPair(libs, foi_sq, false, false);
-            if (pl.main) {
-                std::unique_lock lock(prog_lock);
-                auto [it, inserted] = pipelines.try_emplace(h, pl);
-                if (!inserted) {
-                    vkDestroyPipeline(dev, pl.main, nullptr);
-                    if (pl.square) vkDestroyPipeline(dev, pl.square, nullptr);
-                }
-                return pm[h] = it->second;
-            }
+            if (pl.main) return pm[h] = KeepPipeline(h, pl, origin);
         }
     }
-    if (!stats.trace && caps.cache_control) {
-        if (const CompiledPipeline hit = CreateMonolithicPipeline(vs, ps, gs, gkey.state, true); hit.main) {
-            std::unique_lock lock(prog_lock);
-            auto [it, inserted] = pipelines.try_emplace(h, hit);
-            if (!inserted) {
-                vkDestroyPipeline(dev, hit.main, nullptr);
-                if (hit.square) vkDestroyPipeline(dev, hit.square, nullptr);
-            }
-            return pm[h] = it->second;
-        }
-    }
+    if (!stats.trace && caps.cache_control)
+        if (const CompiledPipeline hit = CreateMonolithicPipeline(vs, ps, gs, gkey.state, true); hit.main) return pm[h] = KeepPipeline(h, hit, kPlHit);
     if (stats.trace) {
         const CompiledPipeline created = CreateMonolithicPipeline(vs, ps, gs, gkey.state, false);
-        if (!created.main) return {};
-        std::unique_lock lock(prog_lock);
-        auto [it, inserted] = pipelines.try_emplace(h, created);
-        if (!inserted) {
-            vkDestroyPipeline(dev, created.main, nullptr);
-            if (created.square) vkDestroyPipeline(dev, created.square, nullptr);
-        }
-        return pm[h] = it->second;
+        return created.main ? pm[h] = KeepPipeline(h, created, kPlTrace) : CompiledPipeline{};
     }
     if (!in_worker && !discovered) discovered = true, Discover(cpu, {walk_chain.size(), 0}, false);
     else if (in_worker && block_now && !block_discovered) block_discovered = true, Discover(cpu, block_now->to, true);
@@ -1221,12 +1199,90 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
         if (fresh) it->second = AsyncPipeline(h, vs, ps, gs, gkey.state, true);
         f = it->second;
     }
-    if (Jit::mode == Jit::Mode::Async && f.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-        return waiting = true, CompiledPipeline{};
+    const bool ready = f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    if (!ready && temp_pipelog) TempPlWait(h);
+    if (Jit::mode == Jit::Mode::Async && !ready) return waiting = true, CompiledPipeline{};
     CompiledPipeline pl{};
     Stalled(stall_waits, stall_wait_ns, [&] { pl = f.get(); });
     if (!pl.main) return {};
     return pm[h] = pl;
+}
+
+CompiledPipeline Renderer::Impl::KeepPipeline(u64 h, CompiledPipeline pl, PlOrigin origin, u32 us) {
+    std::unique_lock lock(prog_lock);
+    auto [it, inserted] = pipelines.try_emplace(h, pl);
+    if (!inserted) {
+        vkDestroyPipeline(dev, pl.main, nullptr);
+        if (pl.square) vkDestroyPipeline(dev, pl.square, nullptr);
+    } else if (temp_pipelog) {
+        TempPlOrigin(h, origin, us);
+    }
+    return it->second;
+}
+
+void Renderer::Impl::TempPlUse(const GraphicsPipelineKey& k, const FixedPipelineState& raw, u64 h) {
+    const u64 rh = GraphicsPipelineKey{k.vs_key, k.ps_key, k.gs_mask, raw}.Hash();
+    TempPlLocal& l = temp_pl_local[rh];
+    const u32 now = frame;
+    if (!l.s) {
+        const ShaderCache& sc = ShaderCache::Instance();
+        const u32 flags = u32(sc.Contains(k.vs_key)) | u32(k.ps_key && sc.Contains(k.ps_key)) << 1;
+        std::scoped_lock lock(temp_pl_lock);
+        TempPlState*& s = temp_pl_by_raw[rh];
+        if (!s) s = &temp_pl_states.emplace_back(TempPlState{k.vs_key, k.ps_key, k.gs_mask, h, raw, now, 0, ~0u, flags, 0});
+        l = {s, ~0u, 0};
+    }
+    if (l.frame == now) return void(++l.draws);
+    std::atomic_ref(l.s->draws).fetch_add(l.draws + 1, std::memory_order_relaxed);
+    if (std::atomic_ref(l.s->last_frame).exchange(now, std::memory_order_relaxed) != now) std::atomic_ref(l.s->frames).fetch_add(1, std::memory_order_relaxed);
+    l.frame = now, l.draws = 0;
+}
+
+void Renderer::Impl::TempPlOrigin(u64 h, PlOrigin origin, u32 us) {
+    std::scoped_lock lock(temp_pl_lock);
+    TempPlMade& m = temp_pl_made[h];
+    m.origin = origin, m.us = us, m.made_frame = frame;
+}
+
+void Renderer::Impl::TempPlWait(u64 h) {
+    std::scoped_lock lock(temp_pl_lock);
+    if (TempPlMade& m = temp_pl_made[h]; !m.waits++) m.wait_frame = frame;
+}
+
+// Header, the draw states, then each made pipeline as its canonical key and TempPlMade; a summary in gow3.log.
+void Renderer::Impl::TempPlWrite() {
+    if (!temp_pipelog) return;
+    std::scoped_lock lock(temp_pl_lock);
+    if (temp_pl_states.empty()) return;
+    static_assert(sizeof(TempPlState) == 168 && sizeof(TempPlMade) == 24);
+    const u32 capbits = u32(caps.depth_clip_negative_one_to_one) | u32(caps.depth_clamp_enable) << 1 | u32(caps.rasterization_samples) << 2 |
+                        u32(caps.alpha_to_coverage_enable) << 3 | u32(caps.color_blend_enable) << 4 | u32(caps.color_blend_equation) << 5 |
+                        u32(caps.color_write_mask) << 6 | u32(caps.unrestricted_topology) << 7;
+    const u32 head[6]{0x4C503347, 1, u32(caps.path), capbits, u32(temp_pl_states.size()), u32(temp_pl_made.size())};  // "G3PL"
+    std::vector<u8> out;
+    const auto append = [&](const void* p, size_t n) { out.insert(out.end(), (const u8*)p, (const u8*)p + n); };
+    append(head, sizeof(head));
+    std::unordered_map<u64, u64> draws;  // canonical key -> draws
+    u64 total = 0;
+    for (const TempPlState& s : temp_pl_states) append(&s, sizeof(s)), draws[s.canon] += s.draws, total += s.draws;
+    static constexpr const char* names[]{"unknown", "warm", "hit", "ahead-hit", "ahead", "miss", "gpl-lto", "gpl-link", "trace"};
+    u32 made[9]{}, used[9]{}, waited = 0;
+    u64 us[9]{}, waits = 0;
+    for (const auto& [h, m] : temp_pl_made) {
+        append(&h, 8), append(&m, sizeof(m));
+        const u32 o = std::min<u32>(m.origin, 8);
+        ++made[o], used[o] += draws.contains(h), us[o] += m.us, waited += m.waits != 0, waits += m.waits;
+    }
+    std::string line = std::format("TEMP pipelines: {} draw states over {} pipelines in {} draws; made (used):", temp_pl_states.size(), draws.size(), total);
+    for (u32 o = 0; o < 9; ++o)
+        if (made[o]) line += std::format(" {} {} ({}{})", names[o], made[o], used[o], us[o] ? std::format(", {:.0f} ms", us[o] / 1e3) : "");
+    std::tm tm{};
+    Gow3::LocalTime(tm, std::time(nullptr));
+    char stamp[32];
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
+    const auto path = Gow3::PortDirectory() / std::format("pipelines-{}.bin", stamp);
+    std::ofstream(path, std::ios::binary).write((const char*)out.data(), std::streamsize(out.size()));
+    Gow3::Log(line + std::format("; {} draws waited for {} pipelines; {}", waits, waited, path.filename().string()));
 }
 
 void Renderer::Impl::WarmPipelines() {
@@ -1273,13 +1329,7 @@ void Renderer::Impl::WarmPipelines() {
         } else {
             pl = CreateMonolithicPipeline(vs, ps, gs, gk.state, true);
         }
-        if (!pl.main) continue;
-        std::unique_lock lock(prog_lock);
-        auto [it, inserted] = pipelines.try_emplace(h, pl);
-        if (!inserted) {
-            vkDestroyPipeline(dev, pl.main, nullptr);
-            if (pl.square) vkDestroyPipeline(dev, pl.square, nullptr);
-        }
+        if (pl.main) KeepPipeline(h, pl, kPlWarm);
     }
 }
 

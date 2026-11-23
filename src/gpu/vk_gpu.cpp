@@ -282,7 +282,10 @@ bool Renderer::Impl::Setup(std::string& error) {
     if (ShaderCache::Instance().Enabled() && ShaderCache::Instance().Kind() == CacheKind::Aot) AotBuild();  // the game waits for the build
     if (caps.path != ShaderPath::Objects && ShaderCache::Instance().Enabled()) {
         ShaderCache::Instance().SetWarmPipelines([this] { WarmPipelines(); });
-        ShaderCache::Instance().SetPipelineCacheFlusher([this](bool force) { SavePipelineCache(force); });
+        ShaderCache::Instance().SetPipelineCacheFlusher([this](bool force) {
+            SavePipelineCache(force);
+            if (force) TempPlWrite();  // TEMP: the exit's flush
+        });
     }
     return true;
 }

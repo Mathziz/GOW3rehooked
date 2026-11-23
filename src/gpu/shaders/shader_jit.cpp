@@ -326,8 +326,11 @@ std::shared_future<CompiledPipeline> Renderer::Impl::AsyncPipeline(u64 h, Shader
                 return CompiledPipeline{};
             }
             CompiledPipeline pl{};
+            const auto t = std::chrono::steady_clock::now();
+            PlOrigin origin = kPlAheadHit;
             if (caps.cache_control && !miss) pl = CreateMonolithicPipeline(vs, ps, gs, state, true);
-            if (!pl.main) pl = CreateMonolithicPipeline(vs, ps, gs, state, false);
+            if (!pl.main) pl = CreateMonolithicPipeline(vs, ps, gs, state, false), origin = miss ? kPlMiss : kPlAhead;
+            const u32 us = u32(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count());
             CompiledPipeline ret = pl;
             {
                 std::unique_lock lock(prog_lock);
@@ -336,6 +339,8 @@ std::shared_future<CompiledPipeline> Renderer::Impl::AsyncPipeline(u64 h, Shader
                     if (pl.main) vkDestroyPipeline(dev, pl.main, nullptr);
                     if (pl.square) vkDestroyPipeline(dev, pl.square, nullptr);
                     ret = it->second;
+                } else if (temp_pipelog && pl.main) {
+                    TempPlOrigin(h, origin, us);
                 }
                 compiling_pipelines.erase(h);
             }

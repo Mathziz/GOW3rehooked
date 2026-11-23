@@ -839,6 +839,30 @@ struct Renderer::Impl {
     CompiledPipeline LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, bool lto, bool fail_on_compile);
     CompiledPipeline GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                          const FixedPipelineState& raw_state, const CpuRead& cpu);
+    // TEMP pipeline log (debug runs, GOW3_TEMP_PIPELOG=0: off): every distinct draw state (programs, raw state) with its frames
+    // and draws, and how each pipeline of this GPU came to be (origin, compile time, draws that waited for it). Written at exit
+    // to pipelines-<time>.bin, read by tools\plstat.
+    enum PlOrigin : u32 { kPlUnknown, kPlWarm, kPlHit, kPlAheadHit, kPlAhead, kPlMiss, kPlGplLto, kPlGplLink, kPlTrace };
+    struct TempPlState {
+        u64 vs, ps, gs, canon;
+        FixedPipelineState raw;
+        u32 first_frame, frames, last_frame, flags;  // flags: 1 VS, 2 PS in the shader cache at first use
+        u64 draws;                                   // a frame's first draw at once, its others at the thread's next frame with it
+    };
+    struct TempPlMade { u32 origin = kPlUnknown, us = 0, made_frame = ~0u, waits = 0, wait_frame = ~0u, pad = 0; };
+    struct TempPlLocal { TempPlState* s; u32 frame, draws; };
+    static inline const bool temp_pipelog = DebugAuto("GOW3_TEMP_PIPELOG");
+    static inline thread_local Flat<TempPlLocal> temp_pl_local;  // raw key -> its state, this frame's draws on this thread
+    std::mutex temp_pl_lock;
+    std::deque<TempPlState> temp_pl_states;
+    std::unordered_map<u64, TempPlState*> temp_pl_by_raw;
+    std::unordered_map<u64, TempPlMade> temp_pl_made;  // canonical key -> how it was made
+    void TempPlUse(const GraphicsPipelineKey& k, const FixedPipelineState& raw, u64 h);
+    void TempPlOrigin(u64 h, PlOrigin origin, u32 us);
+    void TempPlWait(u64 h);
+    void TempPlWrite();
+    // Keeps `pl` as the pipeline of `h`; one another thread kept first wins (this one is destroyed).
+    CompiledPipeline KeepPipeline(u64 h, CompiledPipeline pl, PlOrigin origin, u32 us = 0);
     void WarmPipelines();
     VkPipeline IndexProbePipeline(const FixedPipelineState& state);
 
