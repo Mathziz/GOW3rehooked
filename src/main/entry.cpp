@@ -166,7 +166,7 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
             const bool aot = config.shader_mechanism == ShaderMechanism::Aot && !Window::TakeJitOnce();
             if (config.shader_mechanism == ShaderMechanism::Jit) ResetAotCooldown();
             Gpu::ShaderCache::Instance().Configure(app / PortDir::ShaderCache, aot ? Gpu::CacheKind::Aot : Gpu::CacheKind::Jit);
-            Gpu::Recipes::Instance().Configure(app / PortDir::ShaderCache);
+            Gpu::Recipes::Instance().Configure(app / PortDir::ShaderCache, std::countr_zero(config.msaa));
             Gpu::Aot::game_directory = game;
             Gpu::Aot::lazy = config.lazy_aot;
             Gpu::Aot::sample_log2 = std::countr_zero(config.msaa);

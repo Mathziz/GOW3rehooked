@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // plstat: the graphics pipelines a run used (pipelines-*.bin, GOW3_TEMP_PIPELOG) against what the AOT derives
-// (pipeline-contract-*.cache), the player's pipeline recipes (pipeline-recipes-*.bin) and the shader contract
-// (contract-*.cache). Without a pipelines file the recipes stand for the run.
+// (pipeline-contract-*.cache), the player's pipeline recipes (in a format 2 pipelines file; earlier builds:
+// pipeline-recipes-*.bin) and the shader contract (contract-*.cache). Without a pipelines file the recipes stand for the run.
 //   plstat [--dir <shader_cache>] [--caps <hex>] [--list N] [pipelines-*.bin ...]
 #define _CRT_SECURE_NO_WARNINGS
 #include <algorithm>
@@ -221,18 +221,21 @@ int main(int argc, char** argv) {
     // The run: its draw states and made pipelines (several files add up), or the recipes standing for it.
     std::vector<UseState> states;
     std::unordered_map<u64, Made> made;  // runtime canonical hash -> how it was made
+    std::vector<PlRecipe> recipes;       // format 2 runs: the pipeline recipes as that GPU drew them
     u32 run_caps = 0xFF, path = 1;
     for (const fs::path& p : uses) {
         const auto b = ReadAll(p);
-        u32 head[6];
-        if (b.size() < sizeof(head)) { std::fprintf(stderr, "%s: unreadable\n", p.string().c_str()); return 1; }
-        std::memcpy(head, b.data(), sizeof(head));
-        if (head[0] != 0x4C503347 || head[1] != 1 || b.size() != sizeof(head) + head[4] * sizeof(UseState) + head[5] * 32ull) {
-            std::fprintf(stderr, "%s: not a pipelines file of format 1\n", p.string().c_str());
+        u32 head[8]{};
+        if (b.size() < 24) { std::fprintf(stderr, "%s: unreadable\n", p.string().c_str()); return 1; }
+        std::memcpy(head, b.data(), std::min<size_t>(b.size(), sizeof(head)));
+        const size_t head_size = head[1] == 2 ? 32 : 24, nrec = head[1] == 2 ? head[6] : 0;
+        if (head[0] != 0x4C503347 || (head[1] != 1 && head[1] != 2) ||
+            b.size() != head_size + head[4] * sizeof(UseState) + head[5] * 32ull + nrec * sizeof(PlRecipe)) {
+            std::fprintf(stderr, "%s: not a pipelines file of format 1 or 2\n", p.string().c_str());
             return 1;
         }
         path = head[2], run_caps = head[3];
-        const u8* at = b.data() + sizeof(head);
+        const u8* at = b.data() + head_size;
         for (u32 k = 0; k < head[4]; ++k, at += sizeof(UseState)) std::memcpy(&states.emplace_back(), at, sizeof(UseState));
         for (u32 k = 0; k < head[5]; ++k, at += 32) {
             u64 h;
@@ -240,11 +243,14 @@ int main(int argc, char** argv) {
             std::memcpy(&h, at, 8), std::memcpy(&m, at + 8, sizeof(m));
             if (auto [it, fresh] = made.try_emplace(h, m); !fresh) it->second.waits += m.waits;
         }
+        if (nrec) recipes.clear();  // the last run's list holds the earlier ones
+        for (size_t k = 0; k < nrec; ++k, at += sizeof(PlRecipe)) std::memcpy(&recipes.emplace_back(), at, sizeof(PlRecipe));
     }
     if (caps_arg != ~0u) run_caps = caps_arg;
-    const auto recipes_bytes = ReadAll(Pick(dir, "pipeline-recipes", ".bin"));
-    std::vector<PlRecipe> recipes;
-    for (size_t at = 8; at + sizeof(PlRecipe) <= recipes_bytes.size(); at += sizeof(PlRecipe)) std::memcpy(&recipes.emplace_back(), recipes_bytes.data() + at, sizeof(PlRecipe));
+    if (recipes.empty()) {  // earlier builds: their own file
+        const auto recipes_bytes = ReadAll(Pick(dir, "pipeline-recipes", ".bin"));
+        for (size_t at = 8; at + sizeof(PlRecipe) <= recipes_bytes.size(); at += sizeof(PlRecipe)) std::memcpy(&recipes.emplace_back(), recipes_bytes.data() + at, sizeof(PlRecipe));
+    }
     const bool from_recipes = uses.empty();
     if (from_recipes)
         for (const PlRecipe& r : recipes) states.push_back({r.vs, r.ps, r.gs, 0, r.raw, 0, 1, 0, 0, 1});

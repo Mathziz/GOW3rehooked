@@ -165,10 +165,15 @@ void Renderer::Impl::AotBuild() {
     Aot::SetPhase(Aot::Phase::Index);
     static constexpr VkShaderStageFlagBits vk_stage[]{VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
     ShaderCache& cache = ShaderCache::Instance();
-    const std::vector<Recipe> recipes = Recipes::Instance().All();
     const auto t0 = std::chrono::steady_clock::now();
     const auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
     const bool no_srnf = !caps.storage_image_read_without_format;
+    // The recipes as this GPU's runtime keys them, whichever GPU met them (the release's come from another one).
+    std::vector<Recipe> recipes = Recipes::Instance().All();
+    {
+        std::unordered_set<u64> adapted;
+        std::erase_if(recipes, [&](Recipe& r) { return r.Adapt(no_srnf), !adapted.insert(r.Key()).second; });
+    }
     const auto pending_of = [&](u64 key) {
         return !cache.Contains(key) || (caps.path == ShaderPath::Objects && !cache.ContainsBinary(BinaryKey(cache.ContentOf(key))));
     };
@@ -213,7 +218,7 @@ void Renderer::Impl::AotBuild() {
         std::vector<std::vector<ShaderCache::Hot>> hot(index.files.size());
         std::vector<u32> files;
         for (const Recipe& r : recipes) {
-            if (rect_variant(r) || ((r.h.reserved >> 16 & 1) != 0) != no_srnf) continue;
+            if (rect_variant(r)) continue;
             const u64 key = r.Key();
             files.clear();
             if (caps.path == ShaderPath::Objects) {
@@ -365,7 +370,6 @@ void Renderer::Impl::AotBuild() {
     std::vector<Job> jobs;
     std::vector<u64> compute_keys;
     for (const Recipe& r : recipes) {
-        if (((r.h.reserved >> 16 & 1) != 0) != no_srnf) continue;
         const u64 key = r.Key();
         if (r.h.stage == u8(Gcn::Stage::Compute)) compute_keys.push_back(key);
         if (!rect_variant(r) && (!(r.h.reserved & 0xFFFFu) || blend_interlock) && pending_of(key)) jobs.push_back({r, key, cache.Contains(key), nullptr, {}});
@@ -507,8 +511,7 @@ void Renderer::Impl::AotBuild() {
             pl_jobs.push_back({gk, is_wad});
             return true;
         };
-        for (const PipelineRecipe& r : PipelineRecipes::Instance().All())
-            push_pl(r.vs_key, r.ps_key, r.gs_mask, r.raw_state, false);
+        for (const GraphicsPipelineKey& r : Recipes::Instance().Pipelines(no_srnf, blend_interlock)) push_pl(r.vs_key, r.ps_key, r.gs_mask, r.state, false);
         for (const ContractedPipeline& cp : kept_pipelines)
             if (cp.file == ~0u) push_pl(cp.vs_key, cp.ps_key, cp.gs_mask, cp.state, false);
         size_t wad_pl_total = 0;

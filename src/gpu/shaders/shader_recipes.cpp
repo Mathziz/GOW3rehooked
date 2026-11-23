@@ -3,6 +3,7 @@
 #include "gpu/shaders/shader_recipes.h"
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <xxhash.h>
 #include "gpu/shaders/shader_cache.h"
 #include "gpu/shaders/shader_runtime.h"
@@ -10,12 +11,29 @@
 namespace Gpu {
 namespace {
 constexpr std::uint32_t kMagic = 0x50523347, kFormat = 1;  // "G3RP"; kFormat: the layout of the records below
-// kRecipeFetch: a recipe followed by its fetch shader words. (2 was the WAD open order: skipped if a file still has such records.)
-enum Type : std::uint32_t { kRecipe = 1, kRecipeFetch = 3 };
+// kRecipeFetch: a recipe followed by its fetch shader words; kPipeline: a PipelineRecipe (readers skip record types they
+// do not know). (2 was the WAD open order: skipped if a file still has such records.)
+enum Type : std::uint32_t { kRecipe = 1, kRecipeFetch = 3, kPipeline = 4 };
 struct Record {
     std::uint32_t type, size;
 };
 static_assert(sizeof(RecipeHead) == 200);
+// Earlier builds kept the pipeline recipes in their own file, by translation key.
+constexpr std::uint32_t kOldPlMagic = 0x52503347, kOldPlFormat = 1;  // "G3PR"
+struct OldPipeline {
+    std::uint64_t vs_key, ps_key, gs_mask;
+    FixedPipelineState raw_state;
+};
+std::uint64_t Hash(const PipelineRecipe& p) { return PieceHash::Stable64(&p, sizeof(p)); }
+std::uint64_t KeyOf(const Recipe& r, bool no_storage_read_nofmt) {
+    Gcn::Input in = r.Input();
+    in.no_storage_read_nofmt = no_storage_read_nofmt;
+    return TranslationKey(ProgramKey(Gcn::Stage(r.h.stage), r.h.code_hash, r.h.fetch_hash, r.h.rsrc2, false, false), in, r.Specs());
+}
+// The variant holds to the sample count it was met with: it reads multisampled images or blends through the interlock (by that count).
+bool HoldsSamples(const Recipe& r) {
+    return (r.h.reserved & 0xFFFFu) || std::ranges::any_of(r.spec, [](std::uint64_t w) { return Gcn::Unpack(w).dim >= Gcn::Dim::D2Ms; });
+}
 } // namespace
 
 Gcn::Input Recipe::Input() const {
@@ -36,9 +54,12 @@ std::vector<Gcn::SlotSpec> Recipe::Specs() const {
     return s;
 }
 
-std::uint64_t Recipe::Key() const {
-    const auto specs = Specs();
-    return TranslationKey(ProgramKey(Gcn::Stage(h.stage), h.code_hash, h.fetch_hash, h.rsrc2, false, false), Input(), specs);
+std::uint64_t Recipe::Key() const { return KeyOf(*this, (h.reserved >> 16 & 1) != 0); }
+
+std::uint64_t Recipe::Id() const {
+    RecipeHead head = h;
+    head.reserved &= ~(1u << 16);
+    return PieceHash::Stable64Seeded(spec.data(), spec.size() * 8, PieceHash::Stable64(&head, sizeof(head)));
 }
 
 Recipe Recipe::From(const Gcn::Input& in, std::uint64_t code_hash, std::uint64_t fetch_hash, std::span<const Gcn::SlotSpec> spec) {
@@ -60,8 +81,9 @@ Recipes& Recipes::Instance() {
     return r;
 }
 
-void Recipes::Configure(const std::filesystem::path& dir) {
+void Recipes::Configure(const std::filesystem::path& dir, unsigned scene_log2) {
     std::scoped_lock l(lock);
+    sample_log2 = scene_log2;
     std::filesystem::create_directories(dir);
     const auto path = dir / (PieceHash::UsesAes() ? "recipes-hash2-aes.bin" : "recipes-hash2-xxh.bin");
     std::uintmax_t good = 8;  // end of the last whole record
@@ -86,7 +108,11 @@ void Recipes::Configure(const std::filesystem::path& dir) {
                 rc.fetch.resize((r.size - spec_end) / 4), std::memcpy(rc.fetch.data(), body.data() + spec_end, r.size - spec_end);
                 // Without the fetch shader's words a recipe of the engine's own fetch shaders cannot be built: noted again.
                 if (r.type == kRecipe && rc.h.fetch_hash) continue;
-                if (keys.insert(rc.Key()).second) recipes.push_back(std::move(rc));
+                if (const std::uint64_t key = rc.Key(); keys.insert(key).second) ids.emplace(key, rc.Id()), recipes.push_back(std::move(rc));
+            } else if (r.type == kPipeline && r.size >= sizeof(PipelineRecipe)) {  // a longer record: a later layout's fields follow
+                PipelineRecipe p;
+                std::memcpy(&p, body.data(), sizeof(p));
+                if (pipeline_hashes.insert(Hash(p)).second) pipelines.push_back(p);
             }
         }
         std::fclose(f);
@@ -107,6 +133,21 @@ void Recipes::Configure(const std::filesystem::path& dir) {
         std::fflush(file);
     }
     enabled = true;
+    // The pipeline recipes of earlier builds join this file; theirs goes once each of them found its programs' recipes.
+    const auto old = dir / (PieceHash::UsesAes() ? "pipeline-recipes-hash2-aes.bin" : "pipeline-recipes-hash2-xxh.bin");
+    if (std::ifstream in(old, std::ios::binary); in) {
+        std::uint32_t head[2]{};
+        const bool known = in.read(reinterpret_cast<char*>(head), sizeof(head)) && head[0] == kOldPlMagic && head[1] == kOldPlFormat;
+        bool all = known;
+        for (OldPipeline o; known && in.read(reinterpret_cast<char*>(&o), sizeof(o));) {
+            all &= (o.vs_key == kClearRectVsKey || ids.contains(o.vs_key)) && (!o.ps_key || ids.contains(o.ps_key));
+            AddPipeline(o.vs_key, o.ps_key, o.gs_mask, o.raw_state);
+        }
+        in.close();
+        std::fwrite(staged.data(), 1, staged.size(), file), std::fflush(file), staged.clear();
+        std::error_code ec;
+        if (all) std::filesystem::remove(old, ec);
+    }
 }
 
 // Staged in memory: the draw that met the variant does no I/O. Flush writes them (loading screens, exit).
@@ -126,7 +167,9 @@ void Recipes::Flush() {
 
 void Recipes::Report() const {
     std::scoped_lock l(lock);
-    if (enabled) std::fprintf(stderr, "Recipes: %zu kept, %u new this run, %u of those already built by the AOT\n", recipes.size(), fresh, fresh_cached);
+    if (enabled)
+        std::fprintf(stderr, "Recipes: %zu kept, %u new this run, %u of those already built by the AOT; %zu pipelines, %u new\n", recipes.size(), fresh,
+                     fresh_cached, pipelines.size(), fresh_pipelines);
 }
 
 void Recipes::Note(std::uint64_t key, const Gcn::Input& in, std::span<const Gcn::SlotSpec> spec, bool cached) {
@@ -137,6 +180,7 @@ void Recipes::Note(std::uint64_t key, const Gcn::Input& in, std::span<const Gcn:
     Recipe r = Recipe::From(in, ::Gpu::PieceHash::ShaderCode(in.code.data(), in.code.size_bytes()), in.fetch.empty() ? 0 : ::Gpu::PieceHash::ShaderCode(in.fetch.data(), in.fetch.size_bytes()), spec);
     RecipeHead& h = r.h;
     if (r.Key() != key) std::fprintf(stderr, "Recipe %016llx does not rebuild its key (%016llx)\n", (unsigned long long)key, (unsigned long long)r.Key());
+    ids.emplace(key, r.Id());
     r.fetch.assign(in.fetch.begin(), in.fetch.end());
     std::vector<std::uint8_t> tail(r.spec.size() * 8 + r.fetch.size() * 4);
     std::memcpy(tail.data(), r.spec.data(), r.spec.size() * 8), std::memcpy(tail.data() + r.spec.size() * 8, r.fetch.data(), r.fetch.size() * 4);
@@ -150,85 +194,54 @@ std::vector<Recipe> Recipes::All() const {
     return recipes;
 }
 
-namespace {
-constexpr std::uint32_t kPlMagic = 0x52503347, kPlFormat = 1;  // "G3PR"
-} // namespace
-
-PipelineRecipes& PipelineRecipes::Instance() {
-    static PipelineRecipes r;
-    return r;
-}
-
-void PipelineRecipes::Configure(const std::filesystem::path& dir) {
-    std::scoped_lock l(lock);
-    if (enabled) return;
-    std::filesystem::create_directories(dir);
-    const auto path = dir / (PieceHash::UsesAes() ? "pipeline-recipes-hash2-aes.bin" : "pipeline-recipes-hash2-xxh.bin");
-    std::uintmax_t good = 8;
-    bool valid = false;
-#ifdef _WIN32
-    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
-#else
-    if (FILE* f = std::fopen(path.c_str(), "rb")) {
-#endif
-        std::uint32_t head[2];
-        valid = std::fread(head, 4, 2, f) == 2 && head[0] == kPlMagic && head[1] == kPlFormat;
-        for (PipelineRecipe r{}; valid && std::fread(&r, sizeof(r), 1, f) == 1; good += sizeof(r)) {
-            if (keys.insert(r.RawHash()).second) recipes.push_back(r);
-        }
-        std::fclose(f);
-    }
-    if (valid) {
-        std::error_code ec;
-        std::filesystem::resize_file(path, good, ec);
-    }
-#ifdef _WIN32
-    file = _wfopen(path.c_str(), valid ? L"ab" : L"wb");
-#else
-    file = std::fopen(path.c_str(), valid ? "ab" : "wb");
-#endif
-    if (!file) return;
-    if (!valid) {
-        const std::uint32_t head[2]{kPlMagic, kPlFormat};
-        std::fwrite(head, 4, 2, file);
-        std::fflush(file);
-    }
-    enabled = true;
-}
-
-void PipelineRecipes::Note(std::uint64_t vs_key, std::uint64_t ps_key, std::uint64_t gs_mask, const FixedPipelineState& raw_state) {
-    if (!vs_key) return;
-    PipelineRecipe r{vs_key, ps_key, (raw_state.flags & FixedPipelineState::kHasGs) ? gs_mask : 0ull, raw_state};
-    r.raw_state.pad[0] = r.raw_state.pad[1] = 0;
-    for (u32 k = r.raw_state.color_count; k < 8; ++k)
-        r.raw_state.color_formats[k] = VK_FORMAT_UNDEFINED, r.raw_state.blend[k] = {};
-    const u64 h = r.RawHash();
+void Recipes::NotePipeline(std::uint64_t vs_key, std::uint64_t ps_key, std::uint64_t gs_mask, const FixedPipelineState& raw_state) {
     {
         std::scoped_lock l(lock);
-        if (!enabled || !keys.insert(h).second) return;
-        ++fresh;
-        const auto* p = reinterpret_cast<const std::uint8_t*>(&r);
-        staged.insert(staged.end(), p, p + sizeof(r));
-        recipes.push_back(r);
+        if (!enabled || !AddPipeline(vs_key, ps_key, gs_mask, raw_state)) return;
+        ++fresh_pipelines;
     }
     ShaderCache::Instance().Dirty();
 }
 
-void PipelineRecipes::Flush() {
-    std::scoped_lock l(lock);
-    if (staged.empty() || !file) return;
-    std::fwrite(staged.data(), 1, staged.size(), file);
-    std::fflush(file);
-    staged.clear();
+bool Recipes::AddPipeline(std::uint64_t vs_key, std::uint64_t ps_key, std::uint64_t gs_mask, const FixedPipelineState& raw_state) {
+    const auto id = [&](std::uint64_t key) { const auto it = ids.find(key); return it == ids.end() ? 0ull : it->second; };
+    PipelineRecipe p{vs_key == kClearRectVsKey ? kClearRectVsKey : id(vs_key), ps_key ? id(ps_key) : 0ull,
+                     (raw_state.flags & FixedPipelineState::kHasGs) ? gs_mask : 0ull, raw_state, std::uint8_t(sample_log2)};
+    if (!p.vs || (ps_key && !p.ps)) return false;  // a program without a recipe (traced or exploded draws)
+    FixedPipelineState& s = p.raw_state;
+    s.pad[0] = s.pad[1] = 0;
+    for (u32 k = s.color_count; k < 8; ++k) s.color_formats[k] = VK_FORMAT_UNDEFINED, s.blend[k] = {};
+    if (sample_log2 && s.samples == 1u << sample_log2) s.samples = 0;
+    if (!pipeline_hashes.insert(Hash(p)).second) return false;
+    Append(kPipeline, &p, sizeof(p));
+    pipelines.push_back(p);
+    return true;
 }
 
-void PipelineRecipes::Report() const {
-    std::scoped_lock l(lock);
-    if (enabled) std::fprintf(stderr, "PipelineRecipes: %zu kept, %u new this run\n", recipes.size(), fresh);
-}
-
-std::vector<PipelineRecipe> PipelineRecipes::All() const {
-    std::scoped_lock l(lock);
-    return recipes;
+std::vector<GraphicsPipelineKey> Recipes::Pipelines(bool no_storage_read_nofmt, bool interlock) const {
+    const std::vector<Recipe> variants = All();  // the keys are made without the lock: draws note recipes meanwhile
+    std::vector<PipelineRecipe> kept;
+    {
+        std::scoped_lock l(lock);
+        kept = pipelines;
+    }
+    struct Local {
+        std::uint64_t key;
+        bool holds;  // HoldsSamples
+    };
+    std::unordered_map<std::uint64_t, Local> local{{kClearRectVsKey, {kClearRectVsKey, false}}};  // Id -> this GPU's variant
+    local.reserve(variants.size() + 1);
+    for (const Recipe& r : variants)
+        if (interlock || !(r.h.reserved & 0xFFFFu)) local.try_emplace(r.Id(), Local{KeyOf(r, no_storage_read_nofmt), HoldsSamples(r)});
+    std::vector<GraphicsPipelineKey> out;
+    out.reserve(kept.size());
+    for (const PipelineRecipe& p : kept) {
+        const auto vs = local.find(p.vs), ps = p.ps ? local.find(p.ps) : local.end();
+        if (vs == local.end() || (p.ps && ps == local.end())) continue;
+        if (p.scene_log2 != sample_log2 && (vs->second.holds || (p.ps && ps->second.holds))) continue;
+        GraphicsPipelineKey& k = out.emplace_back(GraphicsPipelineKey{vs->second.key, p.ps ? ps->second.key : 0ull, p.gs_mask, p.raw_state});
+        if (!k.state.samples) k.state.samples = std::uint8_t(1u << sample_log2);
+    }
+    return out;
 }
 } // namespace Gpu

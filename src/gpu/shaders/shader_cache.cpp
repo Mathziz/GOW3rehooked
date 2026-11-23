@@ -601,7 +601,6 @@ void ShaderCache::Flush(const char* why, bool all_threads) {
         batch.swap(pending);
     }
     Recipes::Instance().Flush();
-    PipelineRecipes::Instance().Flush();
     std::atomic<std::size_t> next = 0;
     const auto work = [&] {
         for (std::size_t k; (k = next++) < batch.size();) {

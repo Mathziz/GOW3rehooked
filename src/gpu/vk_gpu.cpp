@@ -271,8 +271,6 @@ bool Renderer::Impl::Setup(std::string& error) {
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 2, layouts, 1, &pcr};
     if (const VkResult e = vkCreatePipelineLayout(dev, &plci, nullptr, &layout); e != VK_SUCCESS) Report(std::format("vkCreatePipelineLayout {}", (int)e));
     if (caps.path != ShaderPath::Objects) {
-        if (ShaderCache::Instance().Enabled())
-            PipelineRecipes::Instance().Configure(ShaderCache::Instance().Directory());
         LoadPipelineCache();
     }
     if (caps.path == ShaderPath::Gpl) SetupGplGlobals();
@@ -311,7 +309,6 @@ Renderer::~Renderer() {
     if (d->caps.path != ShaderPath::Objects) d->SavePipelineCache(true);
     ShaderCache::Instance().Finish();
     Recipes::Instance().Report();
-    PipelineRecipes::Instance().Report();
     for (auto& [k, f] : d->compiling_pipelines) (void)f.get();
     d->compiling_pipelines.clear();
     for (auto& [k, f] : d->compiling) {

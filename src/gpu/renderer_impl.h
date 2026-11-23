@@ -864,6 +864,8 @@ struct Renderer::Impl {
     // Keeps `pl` as the pipeline of `h`; one another thread kept first wins (this one is destroyed).
     CompiledPipeline KeepPipeline(u64 h, CompiledPipeline pl, PlOrigin origin, u32 us = 0);
     void WarmPipelines();
+    std::once_flag warm_once;
+    std::vector<GraphicsPipelineKey> warm_recipes;  // the pipeline recipes for this GPU, canonical
     VkPipeline IndexProbePipeline(const FixedPipelineState& state);
 
     // ---- Barriers (hazards.cpp) ----

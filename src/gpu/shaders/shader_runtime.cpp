@@ -1163,7 +1163,7 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
     if (temp_pipelog) TempPlUse(gkey, rh);
     auto& pm = Memos().pipelines;
     if (const auto* m = pm.Find(rh)) return *m;
-    if (!stats.trace && !boom_on) PipelineRecipes::Instance().Note(gkey.vs_key, gkey.ps_key, gkey.gs_mask, raw_state);
+    if (!stats.trace && !boom_on) Recipes::Instance().NotePipeline(gkey.vs_key, gkey.ps_key, gkey.gs_mask, raw_state);
     gkey.state.Canonicalize(caps);
     const u64 h = gkey.Hash();
     {
@@ -1261,7 +1261,9 @@ void Renderer::Impl::TempPlWrite() {
     const u32 capbits = u32(caps.depth_clip_negative_one_to_one) | u32(caps.depth_clamp_enable) << 1 | u32(caps.rasterization_samples) << 2 |
                         u32(caps.alpha_to_coverage_enable) << 3 | u32(caps.color_blend_enable) << 4 | u32(caps.color_blend_equation) << 5 |
                         u32(caps.color_write_mask) << 6 | u32(caps.unrestricted_topology) << 7;
-    const u32 head[6]{0x4C503347, 1, u32(caps.path), capbits, u32(temp_pl_states.size()), u32(temp_pl_made.size())};  // "G3PL"
+    // Format 2: the pipeline recipes as this GPU draws them follow (raw keys).
+    const auto recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock);
+    const u32 head[8]{0x4C503347, 2, u32(caps.path), capbits, u32(temp_pl_states.size()), u32(temp_pl_made.size()), u32(recipes.size()), 0};  // "G3PL"
     std::vector<u8> out;
     const auto append = [&](const void* p, size_t n) { out.insert(out.end(), (const u8*)p, (const u8*)p + n); };
     append(head, sizeof(head));
@@ -1276,6 +1278,7 @@ void Renderer::Impl::TempPlWrite() {
         const u32 o = std::min<u32>(m.origin, 8);
         ++made[o], used[o] += draws.contains(h), us[o] += m.us, waited += m.waits != 0, waits += m.waits;
     }
+    if (!recipes.empty()) append(recipes.data(), recipes.size() * sizeof(recipes[0]));
     std::string line = std::format("TEMP pipelines: {} draw states over {} pipelines in {} draws; made (used):", temp_pl_states.size(), draws.size(), total);
     for (u32 o = 0; o < 9; ++o)
         if (made[o]) line += std::format(" {} {} ({}{})", names[o], made[o], used[o], us[o] ? std::format(", {:.0f} ms", us[o] / 1e3) : "");
@@ -1290,11 +1293,11 @@ void Renderer::Impl::TempPlWrite() {
 
 void Renderer::Impl::WarmPipelines() {
     if (caps.path == ShaderPath::Objects || !caps.cache_control) return;
-    const auto recipes = PipelineRecipes::Instance().All();
-    for (const PipelineRecipe& r : recipes) {
-        GraphicsPipelineKey gk{r.vs_key, (r.raw_state.flags & FixedPipelineState::kHasPs) ? r.ps_key : 0ull,
-                               (r.raw_state.flags & FixedPipelineState::kHasGs) ? r.gs_mask : 0ull, r.raw_state};
-        gk.state.Canonicalize(caps);
+    std::call_once(warm_once, [&] {  // the recipes as this GPU draws them (those this run meets are made by then)
+        warm_recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock);
+        for (GraphicsPipelineKey& k : warm_recipes) k.state.Canonicalize(caps);
+    });
+    for (const GraphicsPipelineKey& gk : warm_recipes) {
         const u64 h = gk.Hash();
         ShaderRef vs{}, ps{}, gs{};
         {
