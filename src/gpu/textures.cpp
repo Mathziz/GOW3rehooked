@@ -1719,7 +1719,7 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t, bool las
                 image_blocks.push_back({m, ai.memoryTypeIndex, {{0, image_block_size}}, lasting}), image_free[lasting] += image_block_size;
             });
         for (auto& b : image_blocks) {
-            if (b.lasting != lasting || !(r.memoryTypeBits >> b.type & 1)) continue;
+            if (b.lasting != lasting || b.draining || !(r.memoryTypeBits >> b.type & 1)) continue;
             for (auto it = b.free.begin(); it != b.free.end(); ++it) {
                 const auto [lo, n] = *it;
                 const VkDeviceSize at = (lo + r.alignment - 1) / r.alignment * r.alignment;
@@ -1748,11 +1748,11 @@ void Renderer::Impl::FreeImage(const Tex& t) {
             auto it = b.free.emplace(t.mem_offset, t.mem_size).first;
             if (auto next = std::next(it); next != b.free.end() && it->first + it->second == next->first) it->second += next->second, b.free.erase(next);
             if (auto prev = it; it != b.free.begin() && (--prev)->first + prev->second == it->first) prev->second += it->second, b.free.erase(it);
-            image_free[b.lasting] += t.mem_size;
+            if (!b.draining) image_free[b.lasting] += t.mem_size;
             // A block free as a whole goes back to the driver (a level load's peak otherwise stays allocated for good),
-            // keeping image_reserve_blocks of room for the next textures; a lasting one always goes.
-            if (b.free.size() == 1 && b.free.begin()->second == image_block_size && (b.lasting || image_free[0] - image_block_size >= image_reserve_blocks * image_block_size))
-                empty = b.mem, image_free[b.lasting] -= image_block_size, image_blocks.erase(block);
+            // keeping image_reserve_blocks of room for the next textures; a lasting or draining one always goes.
+            if (b.free.size() == 1 && b.free.begin()->second == image_block_size && (b.lasting || b.draining || image_free[0] - image_block_size >= image_reserve_blocks * image_block_size))
+                empty = b.mem, image_free[b.lasting] -= (b.draining ? 0 : image_block_size), image_blocks.erase(block);
             break;
         }
     }
@@ -1766,7 +1766,7 @@ bool Renderer::Impl::ReclaimEmptyImageBlocks() {
         for (auto it = image_blocks.begin(); it != image_blocks.end();) {
             if (it->free.size() == 1 && it->free.begin()->second == image_block_size) {
                 empty.push_back(it->mem);
-                image_free[it->lasting] -= image_block_size;
+                if (!it->draining) image_free[it->lasting] -= image_block_size;
                 it = image_blocks.erase(it);
             } else {
                 ++it;
@@ -1814,7 +1814,7 @@ u32 Renderer::Impl::Bindless(u32 binding, VkImageView view, VkSampler smp) {
 // Guest textures unused for more than `age` frames: bindless elements freed (no frame samples them), views and images
 // destroyed by Reap once the frame being recorded has retired (it and the frame in flight may still copy from them).
 void Renderer::Impl::EvictTextures(u32 age) {
-    const auto old = [&](const GuestTex& g) { return g.checked == ~0u || frame - g.checked > age; };
+    const auto old = [&](const GuestTex& g) { return g.checked == ~0u || frame - g.checked > age || std::binary_search(doomed.begin(), doomed.end(), &g); };
     std::vector<const GuestTex*> gone;
     for (auto& [h, g] : textures)
         if (old(g)) gone.push_back(&g);
@@ -1834,6 +1834,7 @@ void Renderer::Impl::EvictTextures(u32 age) {
         else if (g.t.img) graves.own.push_back(g.t);
         return true;
     });
+    doomed.clear();
     if (!gone.empty()) std::atomic_ref(epoch).fetch_add(1, std::memory_order_release), PruneSurfaceViews();
     std::erase_if(surfaces, [](auto& s) { return !s.second.users; });
     // Targets, at a frame's start only (never age 0: a frame being recorded holds its targets). A long age: a target's
@@ -1859,6 +1860,57 @@ void Renderer::Impl::EvictTextures(u32 age) {
         });
         std::atomic_ref(epoch).fetch_add(1, std::memory_order_release);
     }
+}
+
+void Renderer::Impl::CompactImageBlocks() {
+    if (!uma_single_heap && !uma_budget) return;  // integrated GPUs: its Retire costs a frame's overlap, and a discrete GPU's idle blocks take no system RAM
+    constexpr u64 kBudget = 32ull << 20;  // texture bytes moved per call
+    const auto idle = [](const ImageBlock& b) { VkDeviceSize n = 0; for (auto& [lo, s] : b.free) n += s; return n; };
+    const auto candidate = [&](const ImageBlock& b) { const VkDeviceSize used = image_block_size - idle(b); return !b.lasting && !b.draining && used > 0 && used <= image_block_size / 4; };
+    {
+        std::scoped_lock lock(image_lock);
+        if (image_free[0] < 2 * image_block_size || !std::any_of(image_blocks.begin(), image_blocks.end(), candidate)) return;
+    }
+    // Textures whose content may exist only in their image (a GPU write not in guest memory yet) stay.
+    std::unordered_set<const GuestTex*> written;
+    for (auto* list : {&gpu_writes, &last_writes, &lazy_writes, &block_writes})
+        for (auto& w : *list)
+            if (w.by) written.insert(w.by);
+    for (auto& p : prologue_lazy)
+        if (p.first.by) written.insert(p.first.by);
+    // A surface's image moves only if none of its T#s is written: they all move with it.
+    std::unordered_map<const Surface*, bool> surf_ok;
+    for (auto& [h, g] : textures)
+        if (g.surf) surf_ok.try_emplace(g.surf, !g.surf->growing).first->second &= !written.contains(&g);
+    std::unordered_map<VkDeviceMemory, u64> movable;  // bytes of the images that can move, per block memory
+    std::unordered_set<VkImage> counted;              // a surface's image counts once
+    for (auto& [h, g] : textures)
+        if (g.t.img && g.t.mem_size && (g.surf ? surf_ok[g.surf] : !written.contains(&g)) && counted.insert(g.t.img).second)
+            movable[g.t.mem] += g.t.mem_size;
+    std::vector<VkDeviceMemory> taken;
+    {
+        std::scoped_lock lock(image_lock);
+        std::vector<std::pair<VkDeviceSize, ImageBlock*>> picks;  // emptiest first
+        for (auto& b : image_blocks) {
+            const VkDeviceSize used = image_block_size - idle(b);
+            if (candidate(b) && movable[b.mem] == used) picks.push_back({used, &b});  // every byte in it can move: it really empties
+        }
+        std::sort(picks.begin(), picks.end(), [](auto& x, auto& y) { return x.first < y.first; });
+        u64 moved = 0;
+        for (auto [used, b] : picks) {
+            const VkDeviceSize vacant = idle(*b);
+            // The moved textures fit in the other blocks with half a block to spare: no new block is made for them.
+            if (moved + used > kBudget || image_free[0] - vacant < moved + used + image_block_size / 2) break;
+            moved += used, image_free[0] -= vacant, b->draining = true, taken.push_back(b->mem);
+        }
+    }
+    if (taken.empty()) return;
+    doomed.clear();
+    for (auto& [h, g] : textures)
+        if (g.t.mem_size && std::find(taken.begin(), taken.end(), g.t.mem) != taken.end()) doomed.push_back(&g);
+    std::sort(doomed.begin(), doomed.end());
+    Retire();  // the frame in flight may still sample them
+    EvictTextures(~0u);  // only doomed and never-checked textures go
 }
 
 void Renderer::Impl::Bury(const ViewKey& k, ViewEntry& v) {

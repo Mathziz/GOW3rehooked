@@ -387,6 +387,7 @@ Stats& Renderer::GetStats() {
             std::scoped_lock lock(d->image_lock);
             s.vram_mb[1] = float(d->image_blocks.size() * d->image_block_size) * mb, s.vram_mb[2] = float(d->image_free[0] + d->image_free[1]) * mb;
             s.vram_mb[5] = float(std::count_if(d->image_blocks.begin(), d->image_blocks.end(), [](auto& b) { return b.lasting; }) * d->image_block_size) * mb;
+            s.vram_mb[6] = float(std::count_if(d->image_blocks.begin(), d->image_blocks.end(), [](auto& b) { return b.draining; }) * d->image_block_size) * mb;
         }
         s.vram_mb[0] = float(d->mirror_chunks.load(std::memory_order_relaxed)) * mb;
         s.vram_mb[3] = float(d->dedicated_images.load(std::memory_order_relaxed)) * mb;
@@ -1382,6 +1383,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
                 if (r.EvictTextures(age), r.free_elements[r.evict_binding].size() >= cap / 8) break;
             if (pressed) r.EvictTextures(pressed);
         }), r.evict_soon = false;
+    if (r.frame % 16 == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
     if (r.regrow) r.Retire(), Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
     if (r.stats.trace) r.BeginTraceProbes();
     // Guest ranges the CPU wrote since the last frame, and the last frame's GPU writes: textures over them are uploaded again.

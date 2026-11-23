@@ -448,6 +448,7 @@ struct Renderer::Impl {
         u32 type;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
         bool lasting = false;  // targets, their copies and the dummies: images no guest memory reloads
+        bool draining = false;  // CompactImageBlocks empties it: no new image goes there
     };
     std::mutex image_lock;
     std::vector<ImageBlock> image_blocks;
@@ -564,6 +565,10 @@ struct Renderer::Impl {
     // Guest textures unused for more than `age` frames: bindless elements freed (no frame samples them), views and images
     // destroyed by Reap once the frame being recorded has retired (it and the frame in flight may still copy from them).
     void EvictTextures(u32 age);
+    // Texture blocks left mostly empty (a level's textures went, a few survivors hold each one): the textures of the emptiest
+    // are evicted, loaded again from guest memory on their next use into the fuller blocks, and the emptied blocks go back.
+    void CompactImageBlocks();
+    std::vector<const GuestTex*> doomed;  // CompactImageBlocks' picks for EvictTextures, sorted
     void Bury(const ViewKey& k, ViewEntry& v);  // element freed, view (then image) to Reap
     void PruneSurfaceViews();
     // Evicted textures' handles: this frame's, then older ones (`dying`), which go once their frames retired.

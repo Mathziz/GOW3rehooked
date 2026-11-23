@@ -78,8 +78,8 @@ struct Stats {
     std::uint32_t reaped = 0;  // evicted textures' objects destroyed on their thread meanwhile, and the longest of them
     float reap_max_ms = 0;
     // Debug: device memory by owner (MB) when GetStats was last called: the guest memory mirror, image blocks, their free
-    // part, dedicated images, device-local buffers; and the guest textures held.
-    float vram_mb[6] = {};
+    // part, dedicated images, device-local buffers, the lasting (target) blocks, the draining blocks; and the guest textures held.
+    float vram_mb[7] = {};
     std::uint32_t vram_textures = 0;
     // Programs compiled since the last Submit (frame recorder) and what made each a new variant, against its program's
     // last one. changed: 1 first variant, 2 code, 4 fetch shader, 8 RSRC1, 16 RSRC2, 32 rect list, 64 slot count, 128 the
