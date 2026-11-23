@@ -151,6 +151,7 @@ struct Renderer::Impl {
     // Steam Deck), so DeviceType takes the largest heap once that budget is spent.
     bool uma_budget = false;
     std::atomic<bool> spilled{false};
+    std::atomic<bool> alloc_failed{false};
     // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp
     // buffer. Mesa 26.0 RADV read zeros from it in buffer-to-image copies past 4 GB (issue #24: green video, black frame);
     // buffer copies and storage buffer descriptors reach the whole mirror.
@@ -161,15 +162,7 @@ struct Renderer::Impl {
         return ~0u;
     }
     u32 DeviceType(u32 bits, VkDeviceSize size);  // for `size` more bytes of device memory
-    VkDeviceMemory Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address) {
-        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-        const u32 type = want == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? DeviceType(r.memoryTypeBits, r.size) : Type(r.memoryTypeBits, want);
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &flags : nullptr, r.size, type};
-        VkDeviceMemory m = VK_NULL_HANDLE;
-        if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS)
-            Report(std::format("vkAllocateMemory {}: {} bytes, type {} of {:x}, want {:x}", (int)e, r.size, (int)ai.memoryTypeIndex, r.memoryTypeBits, (u32)want));
-        return m;
-    }
+    VkDeviceMemory Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address);
     // One-off command buffer, waited for.
     template <class F> void Once(F&& f) {
         std::scoped_lock res(res_lock);
@@ -400,7 +393,7 @@ struct Renderer::Impl {
     VkDescriptorSet table_sets[2]{};  // per frame slot: the VS/CS and PS draw tables over that slot's `tables`
     u64 table_align = 16;             // minUniformBufferOffsetAlignment
     u64 tables_used = 0;
-    void SetupTables();
+    bool SetupTables();
     static inline thread_local u64 table_lo = 0, table_hi = 0;
     static inline thread_local u32 table_frame = ~0u;
     u64 TableAt(u64 n, u64 align) {
@@ -430,7 +423,7 @@ struct Renderer::Impl {
     };
     std::vector<Tex> dummies;
     std::atomic<u64> dedicated_images{0};  // debug: device memory held outside image blocks (bytes)
-    void SetupTextures();
+    bool SetupTextures();
     void DestroyTextures();
     Tex MakeImage(VkImageType type, VkImageViewType vtype, VkFormat fmt, u32 w, u32 h, u32 depth, u32 layers, VkSampleCountFlagBits samples,
                   VkImageUsageFlags usage, VkImageAspectFlags aspect, u32 levels = 1, VkImageCreateFlags flags = 0);
@@ -449,6 +442,7 @@ struct Renderer::Impl {
     std::future<void> image_growing;
     void ImageMemory(const VkMemoryRequirements& r, Tex& t);
     void FreeImage(const Tex& t);
+    bool ReclaimEmptyImageBlocks();
     // `usage`: the image's, when it is a storage image too: a view in a format without storage support (SRGB) leaves it out.
     VkImageView View(VkImage img, VkImageViewType vtype, VkFormat fmt, VkImageSubresourceRange range, VkComponentMapping map, VkImageUsageFlags usage = 0);
     // Next free element of a bindless array (element 0 holds the dummy image / default sampler).

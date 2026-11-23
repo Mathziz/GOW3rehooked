@@ -1550,7 +1550,7 @@ void main() {
 
 // Detiler (tiling.comp, embedded above): descriptor layout and pipeline layout; the bindless set the programs sample
 // textures, samplers and storage images through; its sampler and the 1x1 dummy images in every slot 0.
-void Renderer::Impl::SetupTextures() {
+bool Renderer::Impl::SetupTextures() {
     // Detiler (tiling.comp, embedded in textures.cpp): bindings 0 tiled (mirror), 1 linear (scratch), 2 TilingInfo, 3 source_image, 4 dest_image; TilingRegion.
     tiling_src = TilingSource();
     const VkDescriptorSetLayoutBinding tb[]{{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
@@ -1613,6 +1613,7 @@ void Renderer::Impl::SetupTextures() {
             auto t = MakeImage(kinds[k].type, kinds[k].view, cls_fmt[c], 1, 1, 1, kinds[k].layers, kinds[k].samples,
                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
                                VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!t.img) return false;
             dummies.push_back(t);
             infos.push_back({VK_NULL_HANDLE, t.view, VK_IMAGE_LAYOUT_GENERAL});
             writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, k * 3 + c, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &infos.back()});
@@ -1633,6 +1634,7 @@ void Renderer::Impl::SetupTextures() {
             vkCmdClearColorImage(c, dummies[i].img, VK_IMAGE_LAYOUT_GENERAL, &white, 1, &r);
         }
     });
+    return true;
 }
 
 void Renderer::Impl::DestroyTextures() {
@@ -1686,8 +1688,20 @@ Renderer::Impl::Tex Renderer::Impl::MakeImage(VkImageType type, VkImageViewType 
     VkMemoryRequirements r;
     vkGetImageMemoryRequirements(dev, t.img, &r);
     ImageMemory(r, t);
-    vkBindImageMemory(dev, t.img, t.mem, t.mem_offset);
+    if (!t.mem) {
+        vkDestroyImage(dev, t.img, nullptr);
+        return Tex{};
+    }
+    if (const VkResult e = vkBindImageMemory(dev, t.img, t.mem, t.mem_offset); e != VK_SUCCESS) {
+        Report(std::format("vkBindImageMemory {}: {}x{}x{} fmt {}", (int)e, w, h, depth, (int)fmt));
+        FreeImage(t);
+        return Tex{};
+    }
     t.view = View(t.img, vtype, fmt, {aspect, 0, levels, 0, layers}, {}, usage);
+    if (!t.view) {
+        FreeImage(t);
+        return Tex{};
+    }
     return t;
 }
 
@@ -1718,7 +1732,7 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t) {
         }
     }
     t.mem = Alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
-    t.alloc_size = r.size, dedicated_images += r.size;
+    if (t.mem) t.alloc_size = r.size, dedicated_images += r.size;
 }
 
 void Renderer::Impl::FreeImage(const Tex& t) {
@@ -1742,6 +1756,24 @@ void Renderer::Impl::FreeImage(const Tex& t) {
         }
     }
     if (empty) vkFreeMemory(dev, empty, nullptr);  // a kernel call: outside the lock
+}
+
+bool Renderer::Impl::ReclaimEmptyImageBlocks() {
+    std::vector<VkDeviceMemory> empty;
+    {
+        std::scoped_lock lock(image_lock);
+        for (auto it = image_blocks.begin(); it != image_blocks.end();) {
+            if (it->free.size() == 1 && it->free.begin()->second == kImageBlock) {
+                empty.push_back(it->mem);
+                image_free -= kImageBlock;
+                it = image_blocks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (VkDeviceMemory m : empty) vkFreeMemory(dev, m, nullptr);
+    return !empty.empty();
 }
 
 // `usage`: the image's, when it is a storage image too: a view in a format without storage support (SRGB) leaves it out.
@@ -1953,6 +1985,7 @@ const Renderer::Impl::Target* Renderer::Impl::GetTarget(u64 base, u32 pitch, u32
              MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, fmt, w, h, 1, 1, VkSampleCountFlagBits(samples), usage, aspect, 1,
                        flags),
              frame, frame};
+    if (!t.t.img) return Note("render target allocation failed"), nullptr;
     // New targets start cleared, in GENERAL for their whole life (phase 3 simplicity).
     fresh.push_back({t.t.img, aspect});
     Count(stats.targets);
@@ -2034,6 +2067,7 @@ void Renderer::Impl::RegisterStencil() {
     const u32 size = ctx[0x016], w = ((size & 0x7FF) + 1) * 8, h = ((size >> 11 & 0x7FF) + 1) * 8;
     Target* target = const_cast<Target*>(GetTarget((u64)ctx[0x014] << 8, w, h, VK_FORMAT_D32_SFLOAT_S8_UINT, true, true, db_extent,
                                                    1u << (ctx[0x010] >> 2 & 3), ctx[0x010] >> 20 & 7));
+    if (!target) return;
     if (auto it = stencil_at.find(base); it == stencil_at.end() || it->second.first != target) {
         stencil_at[base] = {target, frame};
         std::atomic_ref(epoch).fetch_add(1, std::memory_order_release);
@@ -2068,6 +2102,7 @@ u32 Renderer::Impl::StencilTexture(Target& target, const u32* t, u32 binding) {
     if (!hz.fenced) Add(hz.in_r, target.t.img);
     Barrier(cmd, true);  // the stencil written, the copy sampled before
     Buffer& tmp = Temp((u64)target.w * target.h);
+    if (!tmp.buf) return Note("stencil temp buffer allocation failed"), 0;
     const VkBufferImageCopy src{0, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {}, {target.w, target.h, 1}};
     const VkBufferImageCopy dst{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {target.w, target.h, 1}};
     vkCmdCopyImageToBuffer(cmd, target.t.img, VK_IMAGE_LAYOUT_GENERAL, tmp.buf, 1, &src);
@@ -2254,10 +2289,11 @@ void Renderer::Impl::Check(GuestTex& g) {
 #ifndef GOW3_OFFLINE
     if (video_serial && video_serial != g.video_serial && Gow3::GuestMemory::Readable(g.base, g.size)) {
         Gow3::GpuThread::TraceVideoCopy(g.base, frame, false);
-        Stage(g.base, reinterpret_cast<const u8*>(g.base), g.size);
-        Gow3::GpuThread::TraceVideoCopy(g.base, frame, true);
-        g.video_serial = video_serial;
-        cpu = true;
+        if (Stage(g.base, reinterpret_cast<const u8*>(g.base), g.size)) {
+            Gow3::GpuThread::TraceVideoCopy(g.base, frame, true);
+            g.video_serial = video_serial;
+            cpu = true;
+        }
     }
 #endif
     const bool upload = g.fresh || g.reload || cpu || std::any_of(last_writes.begin(), last_writes.end(), foreign) || std::any_of(lazy_writes.begin(), lazy_writes.end(), foreign);
@@ -2612,11 +2648,24 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
             ToGeneral(c, j.g->t.img, VK_IMAGE_ASPECT_COLOR_BIT), j.g->fresh = false;
     list.clear();
     if (jobs.empty()) return;
-    if (buf.size < need) FreeBuffer(buf), buf = MakeBuffer(std::max(need, reserve), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, prologue ? "scratch" : "upload temp");
+    if (buf.size < need) {
+        FreeBuffer(buf);
+        const u64 alloc_size = std::max(need, reserve);
+        buf = MakeBuffer(alloc_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
+                         prologue ? "scratch" : "upload temp");
+        if (!buf.buf && alloc_size > need)
+            buf = MakeBuffer(need, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
+                             prologue ? "scratch" : "upload temp");
+    }
+    if (need > 0 && !buf.buf) Note("texture upload buffer allocation failed");
     bool detiled_buf = false;
     std::vector<VkBufferCopy> linear;  // linear textures into `buf`
     for (auto& j : jobs) {
         if (j.scratch == ~0ull && !j.direct) continue;
+        if (j.scratch != ~0ull && !buf.buf) {
+            j.g->reload = true;
+            continue;
+        }
         GuestTex& g = *j.g;
         if (g.tile == 8 || g.tile == 31) {
             linear.push_back({g.base, j.scratch, g.size});
@@ -2652,6 +2701,7 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
                      VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     for (auto& j : jobs) {
         if (j.direct) continue;
+        if (j.scratch != ~0ull && !buf.buf) continue;
         GuestTex& g = *j.g;
         std::vector<VkBufferImageCopy> regions;
         regions.reserve(g.img_levels);
@@ -2694,6 +2744,7 @@ bool Renderer::Impl::Store(VkCommandBuffer c, GuestTex& g, u32 m) {
         PushDescriptors(c, VK_PIPELINE_BIND_POINT_COMPUTE, tiling_layout, 0, 3, w);
     } else {
         Buffer& tmp = Temp(l.size);
+        if (!tmp.buf) return Note("store temp buffer allocation failed"), false;
         vkCmdCopyImageToBuffer(c, g.t.img, VK_IMAGE_LAYOUT_GENERAL, tmp.buf, 1, &bc);
         StageBarrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
@@ -2716,6 +2767,7 @@ void Renderer::Impl::ImageToMirror(VkCommandBuffer c, VkImage img, VkBufferImage
     std::scoped_lock res(res_lock);
     const u32 rows = bc.imageExtent.height, height = bc.bufferImageHeight;
     Buffer& tmp = Temp(((u64)(slices - 1) * height + rows - 1) * pitch + row);
+    if (!tmp.buf) return Note("image-to-mirror temp buffer allocation failed");
     vkCmdCopyImageToBuffer(c, img, VK_IMAGE_LAYOUT_GENERAL, tmp.buf, 1, &bc);
     StageBarrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     std::vector<VkBufferCopy> r;
@@ -2795,6 +2847,11 @@ std::vector<Image> Renderer::ReadTextures(bool traced) {
             Impl::Buffer buf = r.MakeBuffer((u64)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
             Impl::Tex rgba = r.MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1, VK_SAMPLE_COUNT_1_BIT,
                                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!buf.buf || !rgba.img) {
+                if (rgba.img) r.FreeImage(rgba);
+                r.FreeBuffer(buf);
+                continue;
+            }
             r.Once([&](VkCommandBuffer c) {
                 r.ToGeneral(c, rgba.img, VK_IMAGE_ASPECT_COLOR_BIT);
                 const VkImageBlit b{{VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1}, {{0, 0, 0}, {(int)sw, (int)sh, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int)w, (int)h, 1}}};
@@ -2836,10 +2893,16 @@ std::vector<Image> Renderer::ReadTargets() {
         }
         if (t.depth && t.samples > 1) continue;  // multisampled depth has no resolve copy here
         Impl::Buffer buf = r.MakeBuffer((u64)t.w * t.h * texel, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        if (!buf.buf) continue;
         Impl::Tex single{};
-        if (t.samples > 1)
+        if (t.samples > 1) {
             single = r.MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, t.fmt, t.w, t.h, 1, 1, VK_SAMPLE_COUNT_1_BIT,
                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!single.img) {
+                r.FreeBuffer(buf);
+                continue;
+            }
+        }
         r.Once([&](VkCommandBuffer c) {
             VkImage src = t.t.img;
             if (single.img) {

@@ -262,10 +262,11 @@ bool Renderer::Impl::Setup(std::string& error) {
     const VkQueryPoolCreateInfo oqi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_OCCLUSION, 2 * kQueries};
     vkCreateQueryPool(dev, &oqi, nullptr, &query_pool);
     cond = MakeBuffer(2 * kQueries * 4, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "cond");
+    if (!cond.buf) return error = "occlusion query buffer allocation failed", false;
 
     if (!SetupMirror(error)) return false;
-    SetupTables();
-    SetupTextures();
+    if (!SetupTables()) return error = "draw table buffer allocation failed", false;
+    if (!SetupTextures()) return error = "dummy texture allocation failed", false;
     VkPushConstantRange pcr{VK_SHADER_STAGE_ALL, 0, sizeof(Push)};
     const VkDescriptorSetLayout layouts[2]{set_layout, table_layout};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 2, layouts, 1, &pcr};
@@ -479,6 +480,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         if (!cb[0] || fmt == VK_FORMAT_UNDEFINED || !(col_format >> (4 * k) & 0xF) || !(target_mask >> (4 * k) & 0xF)) continue;
         const u32 pitch = ((cb[1] & 0x7FF) + 1) * 8, ph = ((cb[2] & 0x3FFFFF) + 1) * 64 / pitch;
         color[k] = GetTarget((u64)cb[0] << 8, pitch, ph, fmt, false, false, cb_extent[k], 1u << (cb[5] >> 12 & 7), cb[5] & 0x1F);  // ATTRIB NUM_SAMPLES, TILE_MODE_INDEX
+        if (!color[k]) return Count(stats.skipped), Note("render target allocation failed");
         // Written only when it changes: the target is shared by every recording thread.
         if (const bool bgra = AmdGpu::MrtSwizzle(cb[4] >> 11 & 3, AmdGpu::DataFormat(cb[4] >> 2 & 0x1F)).Map(0) == 2; color[k]->bgra != bgra)
             color[k]->bgra = bgra;
@@ -510,6 +512,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         const u32 size = ctx[0x016], w = ((size & 0x7FF) + 1) * 8, h = ((size >> 11 & 0x7FF) + 1) * 8;
         const VkFormat fmt = z_fmt == 1 ? VK_FORMAT_D16_UNORM : s_fmt ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
         depth = GetTarget((u64)ctx[0x014] << 8, w, h, fmt, true, s_fmt, db_extent, 1u << (ctx[0x010] >> 2 & 3), ctx[0x010] >> 20 & 7);  // Z_INFO NUM_SAMPLES, TILE_MODE_INDEX
+        if (!depth) return Count(stats.skipped), Note("depth target allocation failed");
         if (samples && (depth->samples != samples || (!z_effect && db_clear && (depth->w < rw || depth->h < rh)))) {
             if (depth->samples != samples && z_effect) return Count(stats.skipped), Note("color/depth sample counts differ, skipped");
             clear_apart = depth, depth = nullptr;
@@ -809,7 +812,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         if (at != ~0ull) std::memcpy(tables_host.ptr + at, t.data(), n);
         return (u32)at;
     };
-    if (stats.trace) {  // the probe programs write it in every traced draw: the last one shared past the end
+    if (stats.trace && vertex_probe.buf) {  // the probe programs write it in every traced draw: the last one shared past the end
         const u64 at = vertex_probe.addr + std::min<u64>(probes.size(), kProbes - 1) * kVertexProbe;
         vs_table.push_back((u32)at), vs_table.push_back((u32)(at >> 32));
     } else if (boom_on) {  // this draw's exploded-vertex record (the last one shared past the end)
@@ -998,7 +1001,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
             }
             stats.trace_lines.back() += std::format(" | I {:x} x{} first {} base {} cpu {}{}", addr, index_size, first_index, (int)base,
                                                     lo <= hi ? std::format("[{}, {}] head", lo, hi) : "unreadable", head);
-            if (index_probes.size() < kProbes) {
+            if (index_probe.buf && index_probes.size() < kProbes) {
                 if (caps.path == ShaderPath::Objects) {
                     if (index_probe_vs) {
                         const VkShaderStageFlagBits stages[]{VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -1888,9 +1891,10 @@ void main() {
             if (!index_probe_mod) Report("Index probe: no vertex shader module " + err.substr(0, 300));
         }
     }
-    for (u32* p = (u32*)index_probe.ptr, *end = p + kProbes * kIndexProbe / 4; p < end; p += 3) p[0] = 0, p[1] = ~0u, p[2] = 0;
+    if (index_probe.ptr)
+        for (u32* p = (u32*)index_probe.ptr, *end = p + kProbes * kIndexProbe / 4; p < end; p += 3) p[0] = 0, p[1] = ~0u, p[2] = 0;
     index_probes.clear(), traced_tex.clear();
-    std::memset(vertex_probe.ptr, 0, kProbes * kVertexProbe);
+    if (vertex_probe.ptr) std::memset(vertex_probe.ptr, 0, kProbes * kVertexProbe);
     vkResetQueryPool(dev, q_stat, 0, kProbes), vkResetQueryPool(dev, q_occ, 0, kProbes);
 }
 
@@ -1899,7 +1903,7 @@ void main() {
 void Renderer::Impl::ProbeColor(const Target* t, const VkRect2D& sc) {
     const u64 at_buf = probes.size() * kProbeBytes;
     probes.push_back({stats.trace_lines.size() - 1, t && sc.extent.width && sc.extent.height ? std::min(16u, TexelBytes(t->fmt)) : 0});
-    if (!probes.back().bytes) return;
+    if (!probes.back().bytes || !probe_buf.buf) return;
     EndRendering();
     static const float* xy = [] {
         static float f[2];
@@ -1920,6 +1924,7 @@ void Renderer::Impl::ProbeColor(const Target* t, const VkRect2D& sc) {
         if (!one.img) {
             one = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, t->fmt, 16, 16, 1, 1, VK_SAMPLE_COUNT_1_BIT,
                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!one.img) return;
             ToGeneral(cmd, one.img, VK_IMAGE_ASPECT_COLOR_BIT);
         }
         const VkImageResolve rs{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, at, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, ext};
@@ -1943,10 +1948,13 @@ void Renderer::Impl::CollectTraceProbes() {
             const u64* s = &st[(size_t)i * 5];
             std::string& l = stats.trace_lines[probes[i].line];
             l += std::format(" || prims {} vs {} clip {}/{} fs {} px {}", s[0], s[1], s[2], s[3], s[4], probes[i].px ? std::to_string(occ[i]) : "-");
-            const u8* texels = probe_buf.ptr + (size_t)i * kProbeBytes;
-            if (probes[i].bytes) l += " c ";
-            for (u32 k = probes[i].bytes; k--;) l += std::format("{:02x}", texels[k]);
-            if (probes[i].rect) l += std::format(" h {:08x}", (u32)::Gpu::PieceHash::DebugHash(texels, probes[i].rect));
+            if (probe_buf.ptr) {
+                const u8* texels = probe_buf.ptr + (size_t)i * kProbeBytes;
+                if (probes[i].bytes) l += " c ";
+                for (u32 k = probes[i].bytes; k--;) l += std::format("{:02x}", texels[k]);
+                if (probes[i].rect) l += std::format(" h {:08x}", (u32)::Gpu::PieceHash::DebugHash(texels, probes[i].rect));
+            }
+            if (!vertex_probe.ptr) continue;
             const float* vp = (const float*)(vertex_probe.ptr + (size_t)i * kVertexProbe);
             const u32* vu = (const u32*)vp;
             if (!vu[4]) continue;
@@ -1958,6 +1966,10 @@ void Renderer::Impl::CollectTraceProbes() {
         probes.clear();  // read once: the dump takes the lines after this Submit
     }
     if (!index_probes.empty()) {  // TEMP index probe: per way {invocations, lowest, highest}; a way that differs from the CPU's range is marked
+        if (!index_probe.ptr) {
+            index_probes.clear();
+            return;
+        }
         static constexpr const char* kWay[]{"window", "exact", "sized"};
         u32 readable = 0, match[3]{}, none[3]{};
         for (size_t i = 0; i < index_probes.size(); ++i) {

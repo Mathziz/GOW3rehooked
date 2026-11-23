@@ -41,6 +41,56 @@ u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size) {
     return best;
 }
 
+VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address) {
+    const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    const u32 primary = want == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? DeviceType(r.memoryTypeBits, r.size) : Type(r.memoryTypeBits, want);
+    auto try_alloc = [&](u32 type, VkResult& err) -> VkDeviceMemory {
+        if (type == ~0u) return err = VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_NULL_HANDLE;
+        const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &flags : nullptr, r.size, type};
+        VkDeviceMemory m = VK_NULL_HANDLE;
+        err = vkAllocateMemory(dev, &ai, nullptr, &m);
+        return err == VK_SUCCESS ? m : VK_NULL_HANDLE;
+    };
+    VkResult e = VK_SUCCESS;
+    if (VkDeviceMemory m = try_alloc(primary, e)) return m;
+    if (ReclaimEmptyImageBlocks()) {
+        if (VkDeviceMemory m = try_alloc(primary, e)) return m;
+    }
+    constexpr VkMemoryPropertyFlags kAvoid = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT |
+                                             VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+    const bool host = (want & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    const u32 primary_heap = primary != ~0u ? mem.memoryTypes[primary].heapIndex : ~0u;
+    for (u32 i = 0; i < mem.memoryTypeCount; ++i) {
+        if (i == primary || !(r.memoryTypeBits >> i & 1)) continue;
+        const auto& t = mem.memoryTypes[i];
+        if (t.propertyFlags & kAvoid) continue;
+        if (host) {
+            constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            if ((t.propertyFlags & kHost) != kHost) continue;
+        } else if (t.heapIndex == primary_heap) {
+            continue;
+        }
+        VkResult fb_err = VK_SUCCESS;
+        if (VkDeviceMemory m = try_alloc(i, fb_err)) return m;
+    }
+    u64 img_bytes = 0, img_free_bytes = 0;
+    {
+        std::scoped_lock lock(image_lock);
+        img_bytes = u64(image_blocks.size()) * kImageBlock;
+        img_free_bytes = image_free;
+    }
+    const std::string msg = std::format(
+        "vkAllocateMemory {}: {} bytes, type {} of {:x}, want {:x} (held MB: mirror {}, img_blocks {} free {}, ded_img {}, dev_buf {})",
+        (int)e, r.size, (int)primary, r.memoryTypeBits, (u32)want,
+        mirror_chunks.load(std::memory_order_relaxed) >> 20,
+        img_bytes >> 20, img_free_bytes >> 20,
+        dedicated_images.load(std::memory_order_relaxed) >> 20,
+        device_buffers.load(std::memory_order_relaxed) >> 20);
+    Report(msg);
+    if (!alloc_failed.exchange(true, std::memory_order_relaxed)) Gow3::Log(msg);
+    return VK_NULL_HANDLE;
+}
+
 // `shared`: used on the copy engine too (no ownership transfers).
 Renderer::Impl::Buffer Renderer::Impl::MakeBuffer(u64 size, VkBufferUsageFlags usage, bool host, const char* temp_tag, bool shared) {
     Buffer b;
@@ -49,7 +99,7 @@ Renderer::Impl::Buffer Renderer::Impl::MakeBuffer(u64 size, VkBufferUsageFlags u
     const u32 both[]{family, copy_family};
     if (shared && copy_family != ~0u) ci.sharingMode = VK_SHARING_MODE_CONCURRENT, ci.queueFamilyIndexCount = 2, ci.pQueueFamilyIndices = both;
     if (const VkResult e = vkCreateBuffer(dev, &ci, nullptr, &b.buf); e != VK_SUCCESS)
-        Report(std::format("vkCreateBuffer {}: {} bytes, usage {:x}, {}", (int)e, size, (u32)ci.usage, temp_tag));
+        return Report(std::format("vkCreateBuffer {}: {} bytes, usage {:x}, {}", (int)e, size, (u32)ci.usage, temp_tag)), Buffer{};
     VkMemoryRequirements r;
     vkGetBufferMemoryRequirements(dev, b.buf, &r);
     VkMemoryPropertyFlags want = host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -57,9 +107,26 @@ Renderer::Impl::Buffer Renderer::Impl::MakeBuffer(u64 size, VkBufferUsageFlags u
     if (host && !(usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && Type(r.memoryTypeBits, want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != ~0u)
         want |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     b.mem = Alloc(r, want, true);
-    vkBindBufferMemory(dev, b.buf, b.mem, 0);
-    if (host) vkMapMemory(dev, b.mem, 0, size, 0, (void**)&b.ptr);
-    else device_buffers += size;
+    if (!b.mem) {
+        vkDestroyBuffer(dev, b.buf, nullptr);
+        return {};
+    }
+    if (const VkResult e = vkBindBufferMemory(dev, b.buf, b.mem, 0); e != VK_SUCCESS) {
+        Report(std::format("vkBindBufferMemory {}: {} bytes, usage {:x}, {}", (int)e, size, (u32)ci.usage, temp_tag));
+        vkDestroyBuffer(dev, b.buf, nullptr);
+        vkFreeMemory(dev, b.mem, nullptr);
+        return {};
+    }
+    if (host) {
+        if (const VkResult e = vkMapMemory(dev, b.mem, 0, size, 0, (void**)&b.ptr); e != VK_SUCCESS || !b.ptr) {
+            Report(std::format("vkMapMemory {}: {} bytes, usage {:x}, {}", (int)e, size, (u32)ci.usage, temp_tag));
+            vkDestroyBuffer(dev, b.buf, nullptr);
+            vkFreeMemory(dev, b.mem, nullptr);
+            return {};
+        }
+    } else {
+        device_buffers += size;
+    }
     VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, b.buf};
     b.addr = vkGetBufferDeviceAddress(dev, &ai);
     if (temp_get_fault) {  // fault diagnostics
@@ -120,13 +187,15 @@ void Renderer::Impl::DestroyMirror() {
 }
 
 // Per-frame draw tables: the host staging buffer, its VRAM twin, and the dynamic uniform buffer sets over them.
-void Renderer::Impl::SetupTables() {
+bool Renderer::Impl::SetupTables() {
     tables_host = MakeBuffer(kTableBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
     flight.tables_host = MakeBuffer(kTableBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
-    if (boom_on) boom_buf = MakeBuffer(2ull * kBoomDraws * kBoomRec, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true), std::memset(boom_buf.ptr, 0, boom_buf.size);
+    if (boom_on) boom_buf = MakeBuffer(2ull * kBoomDraws * kBoomRec, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
     for (Buffer* t : {&tables, &flight.tables})  // a table window starting at the last offset stays inside
         *t = MakeBuffer(kTableBytes + kTableRange, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
                         "?", true);
+    if (!tables_host.buf || !flight.tables_host.buf || !tables.buf || !flight.tables.buf || (boom_on && !boom_buf.buf)) return false;
+    if (boom_on) std::memset(boom_buf.ptr, 0, boom_buf.size);
     // Draw tables (set 1): the VS's or CS's and the PS's, dynamic uniform buffers over the frame slot's `tables`, so the
     // programs read them from the constant bank; each draw binds its offsets.
     const VkDescriptorSetLayoutBinding tbl[]{{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL},
@@ -149,6 +218,7 @@ void Renderer::Impl::SetupTables() {
     VkPhysicalDeviceProperties pp;
     vkGetPhysicalDeviceProperties(pd, &pp);
     table_align = std::max<u64>(16, pp.limits.minUniformBufferOffsetAlignment);
+    return true;
 }
 
 // Gives memory to every mirror page in [lo, hi) that has none.
@@ -187,9 +257,18 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
 Renderer::Impl::Pending Renderer::Impl::AllocateStage(u64 n) {
     constexpr u64 kStageChunk = 64ull << 20;
     while (stage_at < stage.size() && stage_used + n > stage[stage_at].size) ++stage_at, stage_used = 0;
-    if (stage_at == stage.size())
-        stage.push_back(MakeBuffer(std::max(kStageChunk, n), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "stage", true)),
-            stage_dev.push_back(MakeBuffer(std::max(kStageChunk, n), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "stage dev", true));
+    if (stage_at == stage.size()) {
+        auto make_pair = [&](u64 sz) -> bool {
+            Buffer host = MakeBuffer(sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "stage", true);
+            if (!host.buf) return false;
+            Buffer dev_buf = MakeBuffer(sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "stage dev", true);
+            if (!dev_buf.buf) return FreeBuffer(host), false;
+            stage.push_back(host), stage_dev.push_back(dev_buf);
+            return true;
+        };
+        const u64 want = std::max(kStageChunk, n);
+        if (!make_pair(want) && (want <= n || !make_pair(n))) return {0, 0, 0, ~0u};
+    }
     const Pending p{0, n, stage_used, stage_at};
     stage_used += n;
     return p;
@@ -205,8 +284,12 @@ void Renderer::Impl::QueueStage(Pending p) {
 
 const u8* Renderer::Impl::Stage(u64 addr, const u8* src, u64 n, u64* hash) {
     std::scoped_lock lock(stage_lock);
-    InvalidateBlocks(addr, n);
     auto p = AllocateStage(n);
+    if (p.chunk == ~0u) {
+        Note("staging buffer allocation failed");
+        return nullptr;
+    }
+    InvalidateBlocks(addr, n);
     u8* const copy = stage[p.chunk].ptr + p.src;
     if (hash) *hash = Gpu::PieceHash::Copy(copy, src, n);
     else std::memcpy(copy, src, n);
@@ -322,7 +405,13 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     if (capture_size) {
         std::scoped_lock lock(d->stage_lock);
         capture = d->AllocateStage(capture_size);
-        captured = d->stage[capture.chunk].ptr + capture.src;
+        if (capture.chunk != ~0u) {
+            captured = d->stage[capture.chunk].ptr + capture.src;
+        } else {
+            d->Note("staging capture allocation failed");
+            capture_size = 0;
+            for (Piece& q : pieces) q.capture = ~0ull, q.blocks = nullptr;
+        }
     }
     // The hashes (0: the frame in flight writes there) on every recording thread, unless this one is recording.
     const auto& inflight = d->flight.back;
@@ -400,6 +489,7 @@ void Renderer::Write(std::span<WriteRange> ranges) {
                 } else d->QueueStage({q.a, q.n, capture.src + q.capture, capture.chunk});
                 *w = q.h, copy = captured + q.capture;
             } else copy = d->Stage(q.a, q.p, q.n, w);
+            if (!copy) continue;
             if (!q.blocks && *w != q.h) RenderProbe::Piece(q.a, q.n, RenderProbe::Changed, true);
             if (Impl::boom_on) {
                 const u64 step = q.blocks && copy == captured + q.capture ? Gpu::PieceHash::kMemoryBlock : q.n;
@@ -440,9 +530,21 @@ u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
             }
     if (!back.empty()) {
         const u64 size = std::max<u64>(rb_total, 16ull << 20);
-        if (rb.size < rb_total) FreeBuffer(rb), rb = MakeBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, "rb", true);
-        if (rbq && rb_dev.size < rb_total)
-            FreeBuffer(rb_dev), rb_dev = MakeBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "rb dev", true);
+        if (rb.size < rb_total) {
+            FreeBuffer(rb);
+            rb = MakeBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, "rb", true);
+            if (!rb.buf && size > rb_total) rb = MakeBuffer(rb_total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, "rb", true);
+        }
+        if (rbq && rb_dev.size < rb_total) {
+            FreeBuffer(rb_dev);
+            rb_dev = MakeBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "rb dev", true);
+            if (!rb_dev.buf && size > rb_total) rb_dev = MakeBuffer(rb_total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "rb dev", true);
+        }
+        if (!rb.buf || (rbq && !rb_dev.buf)) {
+            Note("readback buffer allocation failed");
+            back.clear();
+            return 0;
+        }
         TempLabel(primary, "readback");  // TEMP perf
         vkCmdCopyBuffer(primary, mirror, (rbq ? rb_dev : rb).buf, (u32)back.size(), back.data());
         TempLabelEnd(primary);  // TEMP perf
