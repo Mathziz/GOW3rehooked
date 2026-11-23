@@ -799,7 +799,9 @@ struct Renderer::Impl {
     void StopCompilers();
     void AotBuild();
     // shader_contract.cpp: the draw configurations the catalog implies, as recipes (translation keys the runtime would compute).
-    void Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out = nullptr);
+    // met_ps: code hashes of the PS programs the recipes hold (pipelines of runtime-chosen permutations need them).
+    void Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out,
+                   const std::unordered_set<u64>& met_ps);
     static inline thread_local bool waiting = false;  // the shader a draw asked for is still compiling (Jit::Mode::Async)
     std::mutex compiled_lock;
     std::vector<Stats::Compile> compiled;

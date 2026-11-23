@@ -132,7 +132,8 @@ Job Base(const Mapping& f, const CatShader& shader, u32 source, std::span<const 
 }
 } // namespace
 
-void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out) {
+void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted>& out, std::vector<ContractedPipeline>* pipelines_out,
+                               const std::unordered_set<u64>& met_ps) {
     const auto begin = std::chrono::steady_clock::now();
     const u32 sample_log2 = data.sample_log2;
     CatImage fallback = Catalog::ApiFormat(0xfac00a);
@@ -147,6 +148,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
     struct PairMeta {
         u32 file = ~0u;
         std::vector<MaterialClass> classes;  // empty: not a material's technique
+        bool derive = true, met = false;     // pipelines derived; the recipes met its PS program (or it has none)
     };
     std::vector<PairMeta> pair_metas;
     const auto add = [&](const Job& job) {
@@ -294,8 +296,21 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 for (const auto& layer : material.layers)
                     if (auto& list = classes[layer.shader_key]; std::ranges::find(list, c) == list.end()) list.push_back(c);
             }
+            // A material draw picks its technique's permutation from selector 0x23 (bit 1: the part receives a dynamic shadow,
+            // set by s_shadowJobList) and 0x49 (bit 2: a flag of the render job); bit 0 is never set, and a permutation the
+            // family lacks falls back to its base recipe (~0). Shadow receivers and those fallbacks follow the scene at run
+            // time: they are derived for the PS programs the recipes met.
+            std::unordered_set<u32> plain;  // families with permutation 0
+            for (const auto& r : recipes) if (r.permutation == 0) plain.insert(r.shader_key);
             pair_metas.reserve(pair_base + recipes.size());
-            for (const auto& r : recipes) pair_metas.push_back({index_file, classes[r.shader_key]});
+            for (const auto& r : recipes) {
+                PairMeta& m = pair_metas.emplace_back(PairMeta{index_file, classes[r.shader_key]});
+                if (m.classes.empty()) continue;
+                m.met = !r.ps || (r.ps->code <= r.ps->footer && r.ps->footer <= f.size &&
+                                  met_ps.contains(::Gpu::PieceHash::ShaderCode(f.data + r.ps->code, r.ps->footer - r.ps->code)));
+                const u64 p = r.permutation;
+                m.derive = p == ~u64{} ? !plain.contains(r.shader_key) || m.met : !(p & 1) && (!(p & 2) || m.met);
+            }
         }
         // Model meshes: the mesh streams bind for every layer recipe of the material.
         std::set<size_t> reached;
@@ -648,6 +663,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         enum Draws : u8 { kAll, kMeshes, kScreenSrgb };
         for (size_t pid = 0; pid < pair_metas.size(); ++pid) {
             const PairMeta& meta = pair_metas[pid];
+            if (!meta.derive) continue;
             const Bucket& b = buckets[pid];
             // A WAD technique no material draws with is drawn by pass code: depth and translucent passes over the model meshes
             // (every stream set), screen passes with the recipe's own declaration. The run's 25 such pipelines took these states.
@@ -704,7 +720,10 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 if (draws == kScreenSrgb) {
                     put(count, scene_srgb, scene_srgb, false, 1);
                 } else if (!meta.classes.empty()) {
-                    for (const MaterialClass& c : meta.classes) put(count, c[0] ? kUnorm : scene_srgb, kUnorm, true, c[0] ? 1 : scene_samples, &c);
+                    // Several targets are single-sampled UNORM ones; opaque materials were never seen there: only PS the recipes met.
+                    for (const MaterialClass& c : meta.classes)
+                        if (count < 2 && !c[0]) put(count, scene_srgb, kUnorm, true, scene_samples, &c);
+                        else if (c[0] || meta.met) put(count, kUnorm, kUnorm, true, 1, &c);
                 } else if (count == 0) {
                     depth_only();
                 } else if (pass) {

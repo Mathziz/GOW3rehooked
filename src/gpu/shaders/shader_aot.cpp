@@ -421,7 +421,9 @@ void Renderer::Impl::AotBuild() {
         for (const auto& file : catalog->files)
             if (!file.fatal.empty()) Say("AOT:   unreadable: %s\n", file.fatal.c_str());
         std::vector<Contracted> contracts;
-        Contracts(*catalog, contracts, need_pl ? &kept_pipelines : nullptr);
+        std::unordered_set<u64> met_ps;
+        for (const Recipe& r : recipes) if (r.h.stage == u8(Gcn::Stage::Pixel)) met_ps.insert(r.h.code_hash);
+        Contracts(*catalog, contracts, need_pl ? &kept_pipelines : nullptr, met_ps);
         {   // TEMP: how many of the player's recipes the contract predicted (all / with the engine's own fetch shader), and per path
             std::unordered_map<u64, u32> have;  // key -> paths
             u32 made[kContractPaths]{}, hits[kContractPaths]{}, alone[kContractPaths]{};
