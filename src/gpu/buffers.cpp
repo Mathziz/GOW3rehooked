@@ -188,13 +188,19 @@ void Renderer::Impl::DestroyMirror() {
 
 // Per-frame draw tables: the host staging buffer, its VRAM twin, and the dynamic uniform buffer sets over them.
 bool Renderer::Impl::SetupTables() {
-    tables_host = MakeBuffer(kTableBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
-    flight.tables_host = MakeBuffer(kTableBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
+    if (!direct_tables) {
+        tables_host = MakeBuffer(kTableBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
+        flight.tables_host = MakeBuffer(kTableBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
+    }
     if (boom_on) boom_buf = MakeBuffer(2ull * kBoomDraws * kBoomRec, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    // TRANSFER_SRC on direct_tables keeps MakeBuffer on write-combined memory (avoids GPU snooping of host cache).
+    const VkBufferUsageFlags table_usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+        (direct_tables ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     for (Buffer* t : {&tables, &flight.tables})  // a table window starting at the last offset stays inside
-        *t = MakeBuffer(kTableBytes + kTableRange, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
-                        "?", true);
-    if (!tables_host.buf || !flight.tables_host.buf || !tables.buf || !flight.tables.buf || (boom_on && !boom_buf.buf)) return false;
+        *t = MakeBuffer(kTableBytes + kTableRange, table_usage, direct_tables, "?", true);
+    if ((!direct_tables && (!tables_host.buf || !flight.tables_host.buf)) || !tables.buf || !flight.tables.buf || (boom_on && !boom_buf.buf))
+        return false;
     if (boom_on) std::memset(boom_buf.ptr, 0, boom_buf.size);
     // Draw tables (set 1): the VS's or CS's and the PS's, dynamic uniform buffers over the frame slot's `tables`, so the
     // programs read them from the constant bank; each draw binds its offsets.

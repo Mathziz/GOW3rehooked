@@ -2626,7 +2626,7 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
                 Note("draw tables full (tiling info)");
                 continue;
             }
-            std::memcpy(tables_host.ptr + at, &ti, sizeof(ti));
+            std::memcpy(TablePtr() + at, &ti, sizeof(ti));
             j.info = at;
             j.direct = !g->block && !g->volume && (g->t.usage & VK_IMAGE_USAGE_STORAGE_BIT) && UintFormat(g->bits) && Detiler(g->tile, g->bits, 2);
             if (j.direct) {
@@ -2733,7 +2733,7 @@ bool Renderer::Impl::Store(VkCommandBuffer c, GuestTex& g, u32 m) {
     ti.image_width = g.w, ti.image_height = g.h, ti.range_end = ~0u, ti.block_scale = 1;
     const u64 at = TableAt(sizeof(ti), 256);
     if (at == ~0ull) return Note("draw tables full (tiling info)"), false;
-    std::memcpy(tables_host.ptr + at, &ti, sizeof(ti));
+    std::memcpy(TablePtr() + at, &ti, sizeof(ti));
     if (view) {
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, p);
         const VkDescriptorBufferInfo out{mirror, g.base + l.offset, l.size}, info{tables.buf, at, sizeof(ti)};

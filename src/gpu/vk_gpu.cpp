@@ -810,7 +810,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     begin();
     auto put = [&](const std::vector<u32>& t) {
         const u64 n = t.size() * 4, at = TableAt(n, table_align);
-        if (at != ~0ull) std::memcpy(tables_host.ptr + at, t.data(), n);
+        if (at != ~0ull) std::memcpy(TablePtr() + at, t.data(), n);
         return (u32)at;
     };
     if (stats.trace && vertex_probe.buf) {  // the probe programs write it in every traced draw: the last one shared past the end
@@ -1131,7 +1131,7 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     if (!cs) return stores.clear(), Count(stats.skipped), Note("dispatch without CS skipped");
     const u64 n = table.size() * 4, at = TableAt(n, table_align);
     if (at == ~0ull) return stores.clear(), Count(stats.skipped), Note("draw tables full");
-    if (n) std::memcpy(tables_host.ptr + at, table.data(), n);
+    if (n) std::memcpy(TablePtr() + at, table.data(), n);
     if (std::any_of(draw_rts.begin(), draw_rts.end(), [&](auto& u) { return In(hz.w, u.first) || (u.second && In(hz.r, u.first)); })) FlushStores();
     EndRendering();
     // Buffers the program stores to (format stores): their memory is mapped for the GPU and counts as a GPU write (images over it
@@ -1634,14 +1634,18 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     temp_ts(r.primary, 5), r.TempCheck(r.primary, 7, 0);
     vkEndCommandBuffer(r.primary);
     // What recording staged (the deferred spans, newly tracked pages) goes to VRAM on the copy engine too, before the tables.
-    vkResetCommandBuffer(r.xfer_cmd, 0);
-    vkBeginCommandBuffer(r.xfer_cmd, &bi);
-    temp_ts(r.xfer_cmd, 0), r.TempLabel(r.xfer_cmd, "table copy"), r.TempCheck(r.xfer_cmd, 6, 0);
-    r.RecordSend(r.xfer_cmd);
+    const bool need_xfer = r.use_stage_dev || !r.direct_tables;
+    if (need_xfer) {
+        vkResetCommandBuffer(r.xfer_cmd, 0);
+        vkBeginCommandBuffer(r.xfer_cmd, &bi);
+        temp_ts(r.xfer_cmd, 0), r.TempLabel(r.xfer_cmd, "table copy"), r.TempCheck(r.xfer_cmd, 6, 0);
+        r.RecordSend(r.xfer_cmd);
+    }
     // The mirror upload once the frame in flight is done with the mirror (the game rewrites its arenas while that frame
     // still reads them), then the texture uploads, which read it (their tiling info goes with the tables, on the second queue).
     vkResetCommandBuffer(r.copy_cmd, 0);
     vkBeginCommandBuffer(r.copy_cmd, &bi);
+    if (!need_xfer) temp_ts(r.copy_cmd, 0), temp_ts(r.copy_cmd, 1);
     temp_ts(r.copy_cmd, 2), r.TempLabel(r.copy_cmd, "texture uploads");
     GOW3_DIAG r.stats.temp_ms[13] = (double)r.uploads.size();
     r.TempCheck(r.copy_cmd, 4, r.uploads.size());
@@ -1679,14 +1683,16 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     if (r.prof) vkCmdWriteTimestamp2(r.copy_cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.prof_pool, r.prof_base + 1);
     r.TempLabelEnd(r.copy_cmd), temp_ts(r.copy_cmd, 3);
     vkEndCommandBuffer(r.copy_cmd);
-    if (r.tables_used) {
-        const VkBufferCopy tc{0, 0, std::min(r.tables_used, kTableBytes)};  // TableAt counts the pieces it refused too
-        vkCmdCopyBuffer(r.xfer_cmd, r.tables_host.buf, r.tables.buf, 1, &tc);
+    if (need_xfer) {
+        if (!r.direct_tables && r.tables_used) {
+            const VkBufferCopy tc{0, 0, std::min(r.tables_used, kTableBytes)};  // TableAt counts the pieces it refused too
+            vkCmdCopyBuffer(r.xfer_cmd, r.tables_host.buf, r.tables.buf, 1, &tc);
+        }
+        r.TempLabelEnd(r.xfer_cmd), temp_ts(r.xfer_cmd, 1);
+        vkEndCommandBuffer(r.xfer_cmd);
     }
-    r.TempLabelEnd(r.xfer_cmd), temp_ts(r.xfer_cmd, 1);
-    vkEndCommandBuffer(r.xfer_cmd);
     const auto temp_tail = DiagNow();
-    {
+    if (need_xfer) {
         const VkSubmitInfo xi{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &r.xfer_cmd, 1, &r.copied};
         std::scoped_lock lock(*r.xfer_lock);
         temp_call = "xfer submit", r.TempLost("xfer submit", vkQueueSubmit(r.xfer, 1, &xi, VK_NULL_HANDLE)), temp_call = nullptr;
@@ -1697,12 +1703,20 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     r.temp_fence_ms = 0;
     const auto temp_r0 = DiagNow();
     const VkCommandBuffer both[]{r.copy_cmd, r.primary};
-    const VkPipelineStageFlags wait_stages[]{
-        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
-    const VkSemaphore waits[]{r.copied, r.bound_sem};
     const bool has_binds = !r.pending_binds.empty();
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, has_binds ? 2u : 1u, waits, wait_stages, 2, both, rb_async ? 1u : 0u, &r.rendered};
+    VkPipelineStageFlags wait_stages[2]{};
+    VkSemaphore waits[2]{};
+    u32 wait_count = 0;
+    if (need_xfer) {
+        waits[wait_count] = r.copied;
+        wait_stages[wait_count++] =
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    }
+    if (has_binds) {
+        waits[wait_count] = r.bound_sem;
+        wait_stages[wait_count++] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, wait_count, waits, wait_stages, 2, both, rb_async ? 1u : 0u, &r.rendered};
     {
         std::scoped_lock lock(*r.queue_lock);
         if (has_binds) {

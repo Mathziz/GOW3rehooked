@@ -152,6 +152,7 @@ struct Renderer::Impl {
     bool uma_budget = false;
     bool uma_single_heap = false;  // integrated GPU with one DEVICE_LOCAL+HOST_VISIBLE heap
     bool use_stage_dev = true;     // false on single-heap UMA without a copy engine: stage -> mirror directly
+    bool direct_tables = false;    // single-heap UMA: write draw tables directly into host-visible device memory
     std::atomic<bool> spilled{false};
     std::atomic<bool> alloc_failed{false};
     // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp
@@ -396,6 +397,7 @@ struct Renderer::Impl {
     u64 table_align = 16;             // minUniformBufferOffsetAlignment
     u64 tables_used = 0;
     bool SetupTables();
+    u8* TablePtr() const { return (direct_tables ? tables : tables_host).ptr; }
     static inline thread_local u64 table_lo = 0, table_hi = 0;
     static inline thread_local u32 table_frame = ~0u;
     u64 TableAt(u64 n, u64 align) {
