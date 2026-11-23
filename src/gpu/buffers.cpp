@@ -41,6 +41,24 @@ u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size) {
     return best;
 }
 
+// Frames a texture may go unused before an early eviction (0: no memory pressure): 4 after an allocation failed, 16 while
+// every heap of an integrated GPU is within an eighth of its budget (DeviceType's margin; looked up every 16 frames).
+u32 Renderer::Impl::PressureAge() {
+    u32 age = alloc_pressure.exchange(false, std::memory_order_relaxed) ? 4 : 0;
+    if (!age && uma_budget && frame % 16 == 0) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+        vkGetPhysicalDeviceMemoryProperties2(pd, &query);
+        age = 16;
+        for (u32 h = 0; h < mem.memoryHeapCount; ++h)
+            if (budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]) age = 0;  // DeviceType spills there
+    }
+    static bool logged = false;  // the Submit thread's alone
+    if (age && !logged)
+        logged = true, Gow3::Log(std::format("Renderer: memory pressure ({}): textures unused for {} frames are evicted early", age == 4 ? "an allocation failed" : "heap budget", age));
+    return age;
+}
+
 VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address) {
     const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     const u32 primary = want == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? DeviceType(r.memoryTypeBits, r.size) : Type(r.memoryTypeBits, want);
@@ -73,6 +91,7 @@ VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFla
         VkResult fb_err = VK_SUCCESS;
         if (VkDeviceMemory m = try_alloc(i, fb_err)) return m;
     }
+    alloc_pressure.store(true, std::memory_order_relaxed);
     u64 img_bytes = 0, img_free_bytes = 0;
     {
         std::scoped_lock lock(image_lock);
@@ -241,6 +260,7 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
             VkDeviceMemory m = VK_NULL_HANDLE;
             if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS) {
                 word &= ~bit;  // the rest stays without memory (reads zero); the next write there tries again
+                alloc_pressure.store(true, std::memory_order_relaxed);
                 if (!chunk_failed)
                     chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror (type {}, {} MB held)", (int)e,
                                                                (int)ai.memoryTypeIndex, mirror_chunks.load() >> 20));

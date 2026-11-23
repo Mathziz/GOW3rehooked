@@ -1123,7 +1123,7 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     const u64 addr = (u64)(sh[0x20C] | (u64)sh[0x20D] << 32) << 8;
     if (stats.trace) stats.trace_lines.push_back(std::format("dispatch {} {} {} threads {} {} {} cs {:x}", b[0], b[1], b[2], sh[0x207], sh[0x208], sh[0x209], addr));
     if (draw_seq++ > stats.stop) return;
-    draw_rts.clear(), reads.clear();
+    draw_rts.clear(), reads.clear(), twins.clear();
     std::vector<u32> table;
     u64 unused = 0;
     dispatching = true;
@@ -1149,6 +1149,20 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
             (in_worker ? own_writes : gpu_writes).push_back({lo, hi, std::atomic_ref(write_seq).fetch_add(1) + 1, nullptr});
         }
     }
+    // Targets stored to through their twin (TargetTexture): the twin holds the target while the program runs (it may load
+    // what it does not store), then the target takes it back.
+    std::sort(twins.begin(), twins.end()), twins.erase(std::unique(twins.begin(), twins.end()), twins.end());
+    auto twin_copies = [&](bool back) {
+        if (!back || !stored) Barrier(cmd);
+        for (const Target* t : twins) {
+            const VkImageCopy ic{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {t->w, t->h, 1}};
+            vkCmdCopyImage(cmd, back ? t->storage_copy.img : t->t.img, VK_IMAGE_LAYOUT_GENERAL, back ? t->t.img : t->storage_copy.img,
+                           VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+            if (back) Add(hz.w, t->t.img);
+        }
+        if (!back) Barrier(cmd);
+    };
+    if (!twins.empty()) twin_copies(false);
     for (auto [img, store] : draw_rts) Add(store ? hz.w : hz.r, img);
     Push push{mirror_addr};
     std::copy_n(&sh[0x240], 16, push.user[0]);
@@ -1165,6 +1179,7 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     }
     vkCmdDispatch(cmd, b[0], b[1], b[2]);
     if (stored) Barrier(cmd);
+    if (!twins.empty()) twin_copies(true);
     pend_stores.insert(pend_stores.end(), stores.begin(), stores.end()), stores.clear();
     pend_reads.insert(pend_reads.end(), reads.begin(), reads.end());
     disp_pending = true;
@@ -1356,13 +1371,15 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     auto temp_ts = [&](VkCommandBuffer c, u32 k) { if (r.temp_qp) vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.temp_qp, r.slot * 6 + k); };
     // After an overflow, the longest age that frees an eighth of the full array (age 1 keeps only what the frame that
     // overflowed used: Rage of Sparta's grab passes overflowed the storage array every ~50 frames, and age 1 re-uploaded
-    // the ~240 textures used every few frames at once). Their images go later (Reap).
-    if (r.frame % 64 == 0 || r.evict_soon)
+    // the ~240 textures used every few frames at once). Their images go later (Reap). Under memory pressure, textures unused
+    // for a few frames go now: a failed allocation skips its texture, upload or copy (stale or garbage images).
+    if (const u32 pressed = r.PressureAge(); r.frame % 64 == 0 || r.evict_soon || pressed)
         Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] {
-            if (!r.evict_soon) return r.EvictTextures(64);
+            if (!r.evict_soon) return r.EvictTextures(pressed ? pressed : 64);
             const u32 cap = r.evict_binding >= kStorageBinding ? kStorage : kTextures;
             for (u32 age : {16u, 4u, 1u})
                 if (r.EvictTextures(age), r.free_elements[r.evict_binding].size() >= cap / 8) break;
+            if (pressed) r.EvictTextures(pressed);
         }), r.evict_soon = false;
     if (r.regrow) r.Retire(), Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
     if (r.stats.trace) r.BeginTraceProbes();

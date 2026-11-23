@@ -156,6 +156,8 @@ struct Renderer::Impl {
     bool compact_memory = false;   // integrated GPU with <= 6 GiB total Vulkan heap: smaller fixed chunks/reserves
     std::atomic<bool> spilled{false};
     std::atomic<bool> alloc_failed{false};
+    std::atomic<bool> alloc_pressure{false};  // an allocation failed since the last Submit start (PressureAge)
+    u32 PressureAge();  // frames a texture may go unused under memory pressure, 0 without any
     // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp
     // buffer. Mesa 26.0 RADV read zeros from it in buffer-to-image copies past 4 GB (issue #24: green video, black frame);
     // buffer copies and storage buffer descriptors reach the whole mirror.
@@ -469,6 +471,7 @@ struct Renderer::Impl {
         mutable std::map<VkFormat, VkImageView> attach;  // attachment views by CB format (same memory written as UNORM and SRGB)
         mutable bool bgra = false;                       // last written with a B, G, R, A export swizzle (diagnostic dumps only)
         Tex stencil_copy{};
+        Tex storage_copy{};  // a dispatch's storage image when the driver gives the target's format none (Intel SRGB): copied in and back
         std::vector<VkImageView> owned_views;            // image views created for `views`
     };
     std::mutex targets_lock;  // `targets` insertions vs FindTarget from other threads
@@ -1082,6 +1085,7 @@ struct Renderer::Impl {
     static inline thread_local bool rendering = false;
     static inline thread_local std::vector<VkImage> pass_w;  // targets the open pass writes
     static inline thread_local std::vector<std::pair<VkImage, bool>> draw_rts;  // targets the current draw samples (false) or stores to
+    static inline thread_local std::vector<const Target*> twins;  // targets the current dispatch stores to through their storage_copy
     static bool In(const std::vector<VkImage>& v, VkImage x) { return std::find(v.begin(), v.end(), x) != v.end(); }
     static void Add(std::vector<VkImage>& v, VkImage x) {
         if (!In(v, x)) v.push_back(x);

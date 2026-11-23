@@ -1645,6 +1645,7 @@ void Renderer::Impl::DestroyTextures() {
             if (v != t.t.view) vkDestroyImageView(dev, v, nullptr);
         free_tex(t.t);
         if (t.stencil_copy.img) free_tex(t.stencil_copy);
+        if (t.storage_copy.img) free_tex(t.storage_copy);
     }
     for (auto& t : dummies) free_tex(t);
     for (auto& [f, t] : probe_img) free_tex(t);
@@ -1713,7 +1714,7 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t) {
             image_growing = std::async(std::launch::async, [this, bits = r.memoryTypeBits] {
                 const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, image_block_size, DeviceType(bits, image_block_size)};
                 VkDeviceMemory m = VK_NULL_HANDLE;
-                if (vkAllocateMemory(dev, &ai, nullptr, &m) != VK_SUCCESS) return;
+                if (vkAllocateMemory(dev, &ai, nullptr, &m) != VK_SUCCESS) return alloc_pressure.store(true, std::memory_order_relaxed);
                 std::scoped_lock lock(image_lock);
                 image_blocks.push_back({m, ai.memoryTypeIndex, {{0, image_block_size}}}), image_free += image_block_size;
             });
@@ -1848,6 +1849,7 @@ void Renderer::Impl::EvictTextures(u32 age) {
                 if (el) free_elements[key >> 44 & 0xFF].push_back(el);
             if (t.t.img) graves.own.push_back(t.t);
             if (t.stencil_copy.img) graves.own.push_back(t.stencil_copy);
+            if (t.storage_copy.img) graves.own.push_back(t.storage_copy);
             return true;
         })) {
         std::erase_if(target_at, [&](u64 base) {
@@ -2035,27 +2037,45 @@ u32 Renderer::Impl::TargetTexture(Target& rt, const u32* t, int kind, u32 bindin
     VkFormat f = SurfaceFormat(u32(AmdGpu::RemapDataFormat(raw)), u32(AmdGpu::RemapNumberFormat(AmdGpu::NumberFormat(t[1] >> 26 & 0xF), raw)));
     if (rt.depth || !f || TexelBytes(f) != TexelBytes(rt.fmt)) f = rt.fmt;
     // A storage slot writes the surface in place (a smaller T#, its top-left rectangle): identity swizzle, a view format
-    // with storage support.
+    // with storage support. A target the driver gave no storage usage (Intel's SRGB, even through EXTENDED_USAGE: GOW3's
+    // grab copies into the scene target) is a dispatch's through a twin image in the view format, copied in and back.
+    bool twin = false;
     if (storage) {
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(pd, f, &fp);
-        if (!(rt.t.usage & VK_IMAGE_USAGE_STORAGE_BIT) || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+        twin = !(rt.t.usage & VK_IMAGE_USAGE_STORAGE_BIT) && dispatching && !rt.depth && rt.samples == 1;
+        if ((!(rt.t.usage & VK_IMAGE_USAGE_STORAGE_BIT) && !twin) || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
             return Note(std::format("render target {:#x} (format {}, depth {}, usage {:#x}, {} samples, view format {}, features {:#x}) bound as storage image",
                                     rt.base, int(rt.fmt), rt.depth, rt.t.usage, rt.samples, int(f), fp.optimalTilingFeatures)), 0;
+        if (twin && !rt.storage_copy.img) {
+            rt.storage_copy = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, f, rt.w, rt.h, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+                                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                        VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+            if (!rt.storage_copy.img) return Note("storage twin of a render target not creatable"), 0;
+            fresh.push_back({rt.storage_copy.img, VK_IMAGE_ASPECT_COLOR_BIT});
+        }
         if ((t[3] >> 20 & 0x1F) == 8) Note("linear render target written as storage image: not written back");
     }
+    const Tex& img = twin ? rt.storage_copy : rt.t;
     const u64 key = (u64)binding << 44 | (u64)(rt.depth || storage ? 0 : t[3] & 0xFFF) << 32 | (u32)f;  // binding, DST_SEL, view format
     // A T# smaller than the surface's image is its top-left rectangle (sub-rectangle passes such as the luminance
     // reduction): the shader scales its coordinates into the image and bounds its texel accesses to the T#.
     const u32 tw = std::min((t[2] & 0x3FFF) + 1, rt.w), th = std::min((t[2] >> 14 & 0x3FFF) + 1, rt.h);
     if ((kind == 0 || kind == 1) && rt.samples == 1 && (tw < rt.w || th < rt.h)) sub = tw | th << 16 | (u64)rt.w << 32 | (u64)rt.h << 48;
-    if (auto v = rt.views.find(key); v != rt.views.end()) return v->second;
-    // Kinds 0/1 sample single-sampled surfaces, 4/5 multisampled ones (the T# says which the shader expects).
-    if ((kind != 0 && kind != 1 && kind != 4 && kind != 5) || (kind >= 4) != (rt.samples > 1))
-        return Note(std::format("render target ({} samples) sampled as view kind {}", rt.samples, kind)), 0;
-    return TargetView(rt, key, binding, rt.t.img, kind == 1 || kind == 5 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, f,
-                      VkImageAspectFlags(rt.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
-                      rt.depth || storage ? VkComponentMapping{} : DstSelect(t), rt.t.usage, "render target image view creation failed");
+    const u32 e = [&]() -> u32 {
+        if (auto v = rt.views.find(key); v != rt.views.end()) return v->second;
+        // Kinds 0/1 sample single-sampled surfaces, 4/5 multisampled ones (the T# says which the shader expects).
+        if ((kind != 0 && kind != 1 && kind != 4 && kind != 5) || (kind >= 4) != (rt.samples > 1))
+            return Note(std::format("render target ({} samples) sampled as view kind {}", rt.samples, kind)), 0;
+        return TargetView(rt, key, binding, img.img, kind == 1 || kind == 5 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, f,
+                          VkImageAspectFlags(rt.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
+                          rt.depth || storage ? VkComponentMapping{} : DstSelect(t), img.usage, "render target image view creation failed");
+    }();
+    if (twin && e) {
+        twins.push_back(&rt);
+        if (stats.trace && !stats.trace_lines.empty()) stats.trace_lines.back() += " twin";
+    }
+    return e;
 }
 
 // The guest stores depth and stencil at separate addresses; Vulkan keeps both aspects in one image.
@@ -2374,6 +2394,10 @@ u32 Renderer::Impl::Reuse(const MemoTex& m, const u32* t, bool storage) {
     if (!g) {
         if (m.target && std::atomic_ref(m.target->used).load(std::memory_order_relaxed) != frame)
             std::atomic_ref(m.target->used).store(frame, std::memory_order_relaxed);
+        if (storage && m.target && m.target->storage_copy.img) {  // the twin of TargetTexture: only a dispatch copies it back
+            if (!dispatching) return 0;
+            twins.push_back(m.target);
+        }
         return m.rt ? (draw_rts.push_back({m.rt, storage}), m.e) : m.e;
     }
     AgainstPending(*g, storage);
