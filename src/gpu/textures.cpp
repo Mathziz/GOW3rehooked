@@ -2173,10 +2173,10 @@ u32 Renderer::Impl::StencilTexture(Target& target, const u32* t, u32 binding) {
     Add(hz.r, target.t.img);
     if (!hz.fenced) Add(hz.in_r, target.t.img);
     Barrier(cmd, true);  // the stencil written, the copy sampled before
-    Buffer& tmp = Temp((u64)target.w * target.h);
+    const TempSlice tmp = Temp((u64)target.w * target.h);
     if (!tmp.buf) return Note("stencil temp buffer allocation failed"), 0;
-    const VkBufferImageCopy src{0, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {}, {target.w, target.h, 1}};
-    const VkBufferImageCopy dst{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {target.w, target.h, 1}};
+    const VkBufferImageCopy src{tmp.offset, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {}, {target.w, target.h, 1}};
+    const VkBufferImageCopy dst{tmp.offset, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {target.w, target.h, 1}};
     vkCmdCopyImageToBuffer(cmd, target.t.img, VK_IMAGE_LAYOUT_GENERAL, tmp.buf, 1, &src);
     StageBarrier(cmd, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     vkCmdCopyBufferToImage(cmd, tmp.buf, target.stencil_copy.img, VK_IMAGE_LAYOUT_GENERAL, 1, &dst);
@@ -2432,7 +2432,7 @@ void Renderer::Impl::Resync(GuestTex& g) {
                     Materialize(cmd, x, learn(x));
                 }
             std::vector<GuestTex*> one{&g};
-            Upload(cmd, one, Temp(0), 0, table_ps);
+            Upload(cmd, one, nullptr, 0, table_ps);
             synced = write_seq;
             return;
         }
@@ -2677,9 +2677,9 @@ void Renderer::Impl::DispatchDetile(VkCommandBuffer c, u32 mip, u32 bytes, u32 b
 
 // Texture uploads: tiled non-block 2D/array textures are detiled directly into their image via `DETILE_TO_IMAGE`;
 // block-compressed and volume tiled textures detile into `buf` (grown to at least `reserve`) and then copy into the image.
-// Linear ones copy from the mirror, through `buf` when `image_copy_via_temp`.
+// Linear ones copy from the mirror, through `buf` (or a Temp slice when null) when `image_copy_via_temp`.
 // `frag`: no vertex shader samples them before the next full barrier.
-void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buffer& buf, u64 reserve, bool frag) {
+void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buffer* buf, u64 reserve, bool frag) {
     struct Job {
         GuestTex* g;
         u64 scratch;   // offset of the detiled copy, or ~0 for a linear or direct-to-image texture
@@ -2712,9 +2712,9 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
                         break;
                     }
             }
-            if (!j.direct) j.scratch = need, need = (need + g->size + 255) & ~255ull;
+            if (!j.direct) j.scratch = need, need = (need + g->size + temp_align - 1) & ~(temp_align - 1);
         } else if (image_copy_via_temp) {
-            j.scratch = need, need = (need + g->size + 255) & ~255ull;
+            j.scratch = need, need = (need + g->size + temp_align - 1) & ~(temp_align - 1);
         }
         jobs.push_back(j);
     }
@@ -2724,27 +2724,38 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
             ToGeneral(c, j.g->t.img, VK_IMAGE_ASPECT_COLOR_BIT), j.g->fresh = false;
     list.clear();
     if (jobs.empty()) return;
-    if (buf.size < need) {
-        FreeBuffer(buf);
-        const u64 alloc_size = std::max(need, reserve);
-        buf = MakeBuffer(alloc_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
-                         prologue ? "scratch" : "upload temp");
-        if (!buf.buf && alloc_size > need)
-            buf = MakeBuffer(need, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
-                             prologue ? "scratch" : "upload temp");
+    if (prologue) scratch_used = need;
+    VkBuffer dst_buf = VK_NULL_HANDLE;
+    u64 dst_base = 0;
+    if (need > 0) {
+        if (buf) {
+            if (buf->size < need) {
+                FreeBuffer(*buf);
+                const u64 alloc_size = std::max(need, reserve);
+                *buf = MakeBuffer(alloc_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
+                                  prologue ? "scratch" : "upload temp");
+                if (!buf->buf && alloc_size > need)
+                    *buf = MakeBuffer(need, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
+                                      prologue ? "scratch" : "upload temp");
+            }
+            dst_buf = buf->buf;
+        } else {
+            const TempSlice s = Temp(need);
+            dst_buf = s.buf, dst_base = s.offset;
+        }
+        if (!dst_buf) Note("texture upload buffer allocation failed");
     }
-    if (need > 0 && !buf.buf) Note("texture upload buffer allocation failed");
     bool detiled_buf = false;
-    std::vector<VkBufferCopy> linear;  // linear textures into `buf`
+    std::vector<VkBufferCopy> linear;  // linear textures into `dst_buf`
     for (auto& j : jobs) {
         if (j.scratch == ~0ull && !j.direct) continue;
-        if (j.scratch != ~0ull && !buf.buf) {
+        if (j.scratch != ~0ull && !dst_buf) {
             j.g->reload = true;
             continue;
         }
         GuestTex& g = *j.g;
         if (g.tile == 8 || g.tile == 31) {
-            linear.push_back({g.base, j.scratch, g.size});
+            linear.push_back({g.base, dst_base + j.scratch, g.size});
             continue;
         }
         const VkPipeline p = Detiler(g.tile, g.bits, j.direct ? 2 : 0);
@@ -2763,30 +2774,30 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
             continue;
         }
         detiled_buf = true;
-        const VkDescriptorBufferInfo in{mirror, g.base, g.size}, out{buf.buf, j.scratch, g.size}, info{tables.buf, j.info, sizeof(TilingInfo)};
+        const VkDescriptorBufferInfo in{mirror, g.base, g.size}, out{dst_buf, dst_base + j.scratch, g.size}, info{tables.buf, j.info, sizeof(TilingInfo)};
         const VkWriteDescriptorSet w[]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &in},
                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &out},
                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &info}};
         PushDescriptors(c, VK_PIPELINE_BIND_POINT_COMPUTE, tiling_layout, 0, 3, w);
         for (u32 m = 0; m < g.levels; ++m) DispatchDetile(c, m, g.mips[m].size, g.bits);
     }
-    if (!linear.empty()) vkCmdCopyBuffer(c, mirror, buf.buf, (u32)linear.size(), linear.data());
-    if (detiled_buf || !linear.empty())  // one barrier for both ways into `buf`
+    if (!linear.empty()) vkCmdCopyBuffer(c, mirror, dst_buf, (u32)linear.size(), linear.data());
+    if (detiled_buf || !linear.empty())  // one barrier for both ways into `dst_buf`
         StageBarrier(c, (detiled_buf ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : 0) | (linear.empty() ? 0 : VK_PIPELINE_STAGE_2_COPY_BIT),
                      (detiled_buf ? VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT : 0) | (linear.empty() ? 0 : VK_ACCESS_2_TRANSFER_WRITE_BIT),
                      VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     for (auto& j : jobs) {
         if (j.direct) continue;
-        if (j.scratch != ~0ull && !buf.buf) continue;
+        if (j.scratch != ~0ull && !dst_buf) continue;
         GuestTex& g = *j.g;
         std::vector<VkBufferImageCopy> regions;
         regions.reserve(g.img_levels);
         for (u32 m = 0; m < g.img_levels; ++m)
-            regions.push_back({(j.scratch == ~0ull ? g.base : j.scratch) + g.mips[m].offset, g.mips[m].pitch, g.mips[m].height,
+            regions.push_back({(j.scratch == ~0ull ? g.base : dst_base + j.scratch) + g.mips[m].offset, g.mips[m].pitch, g.mips[m].height,
                                {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, g.layers},
                                {},
                                {std::max(g.w >> m, 1u), std::max(g.h >> m, 1u), std::max(g.d >> m, 1u)}});
-        vkCmdCopyBufferToImage(c, j.scratch == ~0ull ? mirror : buf.buf, g.t.img, VK_IMAGE_LAYOUT_GENERAL, (u32)regions.size(), regions.data());
+        vkCmdCopyBufferToImage(c, j.scratch == ~0ull ? mirror : dst_buf, g.t.img, VK_IMAGE_LAYOUT_GENERAL, (u32)regions.size(), regions.data());
     }
     Barrier(c, frag);
 }
@@ -2819,13 +2830,14 @@ bool Renderer::Impl::Store(VkCommandBuffer c, GuestTex& g, u32 m) {
                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &src}};
         PushDescriptors(c, VK_PIPELINE_BIND_POINT_COMPUTE, tiling_layout, 0, 3, w);
     } else {
-        Buffer& tmp = Temp(l.size);
+        const TempSlice tmp = Temp(l.size);
         if (!tmp.buf) return Note("store temp buffer allocation failed"), false;
+        bc.bufferOffset = tmp.offset;
         vkCmdCopyImageToBuffer(c, g.t.img, VK_IMAGE_LAYOUT_GENERAL, tmp.buf, 1, &bc);
         StageBarrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, p);
-        const VkDescriptorBufferInfo out{mirror, g.base + l.offset, l.size}, in{tmp.buf, 0, l.size}, info{tables.buf, at, sizeof(ti)};
+        const VkDescriptorBufferInfo out{mirror, g.base + l.offset, l.size}, in{tmp.buf, tmp.offset, l.size}, info{tables.buf, at, sizeof(ti)};
         const VkWriteDescriptorSet w[]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &out},
                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &in},
                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &info}};
@@ -2842,16 +2854,17 @@ void Renderer::Impl::ImageToMirror(VkCommandBuffer c, VkImage img, VkBufferImage
     if (!image_copy_via_temp) return bc.bufferOffset = to, vkCmdCopyImageToBuffer(c, img, VK_IMAGE_LAYOUT_GENERAL, mirror, 1, &bc);
     std::scoped_lock res(res_lock);
     const u32 rows = bc.imageExtent.height, height = bc.bufferImageHeight;
-    Buffer& tmp = Temp(((u64)(slices - 1) * height + rows - 1) * pitch + row);
+    const TempSlice tmp = Temp(((u64)(slices - 1) * height + rows - 1) * pitch + row);
     if (!tmp.buf) return Note("image-to-mirror temp buffer allocation failed");
+    bc.bufferOffset = tmp.offset;
     vkCmdCopyImageToBuffer(c, img, VK_IMAGE_LAYOUT_GENERAL, tmp.buf, 1, &bc);
     StageBarrier(c, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     std::vector<VkBufferCopy> r;
     for (u32 s = 0; s < slices; ++s) {
         const u64 at = (u64)s * height * pitch;
-        if (row == pitch) r.push_back({at, to + at, (rows - 1) * pitch + row});
+        if (row == pitch) r.push_back({tmp.offset + at, to + at, (rows - 1) * pitch + row});
         else
-            for (u32 y = 0; y < rows; ++y) r.push_back({at + y * pitch, to + at + y * pitch, row});
+            for (u32 y = 0; y < rows; ++y) r.push_back({tmp.offset + at + y * pitch, to + at + y * pitch, row});
     }
     vkCmdCopyBuffer(c, tmp.buf, mirror, (u32)r.size(), r.data());
 }

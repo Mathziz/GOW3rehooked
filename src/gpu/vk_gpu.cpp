@@ -1576,7 +1576,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
                 Impl::Barrier(r.primary, true);    // the blocks before may still sample them
                 for (auto& [w, learn] : b.lazy)
                     if (materialized.insert(w.seq).second) r.Materialize(r.primary, w, learn);
-                r.Upload(r.primary, up, r.Temp(0), 0, std::none_of(up.begin(), up.end(), [&](auto* g) { return vs_up.contains(g); }));
+                r.Upload(r.primary, up, nullptr, 0, std::none_of(up.begin(), up.end(), [&](auto* g) { return vs_up.contains(g); }));
                 r.TempLabelEnd(r.primary);
             }
             if (!b.cb) continue;
@@ -1695,7 +1695,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) vkCmdClearDepthStencilImage(r.copy_cmd, img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
         else vkCmdClearColorImage(r.copy_cmd, img, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &range);
     }
-    r.Upload(r.copy_cmd, r.uploads, r.scratch, r.scratch_reserve);
+    r.Upload(r.copy_cmd, r.uploads, &r.scratch, r.scratch_reserve);
     if (!r.fresh.empty())  // Upload may record nothing (tables full): its closing barrier is no fence for the clears
         Impl::StageBarrier(r.copy_cmd, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                            VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
@@ -1795,9 +1795,11 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         std::scoped_lock lock(r.compiled_lock);
         r.stats.compiled.clear(), r.stats.compiled.swap(r.compiled);
     }
+    r.NoteFrameBuffers();
     r.SwapFrame();
     r.flight.busy = true, r.flight.queries = (u32)r.query_blocks.size(), r.flight.frame = r.frame;
     r.stage_at = 0, r.stage_used = 0;  // the retired frame's staging chunks
+    r.TrimFrameBuffers();
     GOW3_DIAG r.stats.record_ms = ms(t_begin, t_recorded), r.stats.gpu_ms = retire_ms;
     if (r.stats.trace) r.Retire();  // probes below, and the dump reads the targets
     // This frame's query blocks get the last retired frame's counts, in order: the CPU reads them two frames later, past

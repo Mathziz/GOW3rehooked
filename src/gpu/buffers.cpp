@@ -45,14 +45,15 @@ u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size) {
 // every heap of an integrated GPU is within an eighth of its budget (DeviceType's margin; looked up every 16 frames).
 u32 Renderer::Impl::PressureAge() {
     u32 age = alloc_pressure.exchange(false, std::memory_order_relaxed) ? 4 : 0;
-    if (!age && uma_budget && frame % 16 == 0) {
+    if (uma_budget && frame % 16 == 0) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
         vkGetPhysicalDeviceMemoryProperties2(pd, &query);
-        age = 16;
+        budget_pressure = true;
         for (u32 h = 0; h < mem.memoryHeapCount; ++h)
-            if (budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]) age = 0;  // DeviceType spills there
+            if (budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]) budget_pressure = false;  // DeviceType spills there
     }
+    if (!age && budget_pressure && frame % 16 == 0) age = 16;
     static bool logged = false;  // the Submit thread's alone
     if (age && !logged)
         logged = true, Gow3::Log(std::format("Renderer: memory pressure ({}): textures unused for {} frames are evicted early", age == 4 ? "an allocation failed" : "heap budget", age));
@@ -243,6 +244,7 @@ bool Renderer::Impl::SetupTables() {
     VkPhysicalDeviceProperties pp;
     vkGetPhysicalDeviceProperties(pd, &pp);
     table_align = std::max<u64>(16, pp.limits.minUniformBufferOffsetAlignment);
+    temp_align = std::max<u64>(256, pp.limits.minStorageBufferOffsetAlignment);
     return true;
 }
 
@@ -558,8 +560,9 @@ u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
 #endif
                 back.push_back({w.lo, rb_total, w.hi - w.lo}), rb_total += w.hi - w.lo;
             }
+    rb_used = rb_total;
     if (!back.empty()) {
-        const u64 size = std::max<u64>(rb_total, 16ull << 20);
+        const u64 size = std::max<u64>(rb_total, kRbReserve);
         if (rb.size < rb_total) {
             FreeBuffer(rb);
             rb = MakeBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, "rb", true);
@@ -589,6 +592,52 @@ u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
         vkEndCommandBuffer(rb_cmd);
     }
     return rb_total;
+}
+
+// Suballocates a slice from the frame slot's transient device chunks (`res_lock` held, or serial prologue).
+Renderer::Impl::TempSlice Renderer::Impl::Temp(u64 size) {
+    if (!size) return {};
+    const u64 n = (size + temp_align - 1) & ~(temp_align - 1);
+    u32 at = temp_at;
+    u64 used = temp_used;
+    while (at < frame_temp.size() && used + n > frame_temp[at].size) ++at, used = 0;
+    if (at == frame_temp.size()) {
+        const u64 want = std::max(temp_chunk_size, n);
+        constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        Buffer b = MakeBuffer(want, usage, false, "temp");
+        if (!b.buf && want > n) b = MakeBuffer(n, usage, false, "temp");
+        if (!b.buf) return {};
+        frame_temp.push_back(b);
+    }
+    temp_at = at, temp_used = used + n;
+    return {frame_temp[at].buf, used};
+}
+
+void Renderer::Impl::NoteFrameBuffers() {
+    auto note = [](bool over, bool needed, u32& quiet) { quiet = over ? (needed ? 0u : quiet + 1) : 0u; };
+    note(frame_temp.size() > 1 || (frame_temp.size() == 1 && frame_temp[0].size > temp_chunk_size), temp_at > 0 || temp_used > temp_chunk_size, temp_quiet);
+    note(scratch.size > scratch_reserve, scratch_used > scratch_reserve, scratch_quiet);
+    note(stage.size() > 1 || (stage.size() == 1 && stage[0].size > stage_chunk_size), stage_at > 0 || stage_used > stage_chunk_size, stage_quiet);
+    note(rb.size > kRbReserve || rb_dev.size > kRbReserve, rb_used > kRbReserve, rb_quiet);
+}
+
+void Renderer::Impl::TrimFrameBuffers() {
+    const u32 limit = alloc_pressure.load(std::memory_order_relaxed) ? 0u : budget_pressure ? 4u : 32u;
+    if ((frame_temp.size() > 1 || (frame_temp.size() == 1 && frame_temp[0].size > temp_chunk_size)) && temp_quiet >= limit) {
+        const size_t keep = !frame_temp.empty() && frame_temp[0].size <= temp_chunk_size ? 1 : 0;
+        while (frame_temp.size() > keep) FreeBuffer(frame_temp.back()), frame_temp.pop_back();
+        temp_quiet = 0;
+    }
+    if (scratch.size > scratch_reserve && scratch_quiet >= limit) FreeBuffer(scratch), scratch_quiet = 0;
+    if ((stage.size() > 1 || (stage.size() == 1 && stage[0].size > stage_chunk_size)) && stage_quiet >= limit) {
+        const size_t keep = !stage.empty() && stage[0].size <= stage_chunk_size ? 1 : 0;
+        while (stage.size() > keep) {
+            FreeBuffer(stage.back()), stage.pop_back();
+            if (use_stage_dev) FreeBuffer(stage_dev.back()), stage_dev.pop_back();
+        }
+        stage_quiet = 0;
+    }
+    if ((rb.size > kRbReserve || rb_dev.size > kRbReserve) && rb_quiet >= limit) FreeBuffer(rb), FreeBuffer(rb_dev), rb_quiet = 0;
 }
 } // namespace Gpu
 

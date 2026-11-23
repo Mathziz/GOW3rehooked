@@ -157,6 +157,7 @@ struct Renderer::Impl {
     std::atomic<bool> spilled{false};
     std::atomic<bool> alloc_failed{false};
     std::atomic<bool> alloc_pressure{false};  // an allocation failed since the last Submit start (PressureAge)
+    bool budget_pressure = false;             // PressureAge saw every heap within an eighth of its budget
     u32 PressureAge();  // frames a texture may go unused under memory pressure, 0 without any
     // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp
     // buffer. Mesa 26.0 RADV read zeros from it in buffer-to-image copies past 4 GB (issue #24: green video, black frame);
@@ -393,6 +394,8 @@ struct Renderer::Impl {
     Buffer MakeBuffer(u64 size, VkBufferUsageFlags usage, bool host, const char* temp_tag = "?", bool shared = false);
     void FreeBuffer(Buffer& b);
     Buffer tables_host, tables, rb, rb_dev;  // rb: readback of the frame's GPU writes (rb_dev: their VRAM copy, copy engine)
+    static constexpr u64 kRbReserve = 16ull << 20;
+    u64 rb_used = 0;
     std::vector<Buffer> stage, stage_dev;    // staging chunks of `pending`, and their VRAM twins
     u64 stage_chunk_size = 64ull << 20;
     // Draw tables: per frame slot dynamic uniform buffers over `tables`. Each thread takes 64 KB pieces and fills them alone.
@@ -597,7 +600,7 @@ struct Renderer::Impl {
     std::unordered_map<u32, VkPipeline> detilers;
     PFN_vkCmdPushDescriptorSetKHR PushDescriptors = nullptr;
     Buffer scratch;  // detiled texels of the frame's prologue uploads, per frame slot: grown while the frame in flight writes the other
-    u64 scratch_reserve = 128ull << 20;
+    u64 scratch_reserve = 128ull << 20, scratch_used = 0;
     // Storage images a dispatch or draw writes go back to the mirror; any other image over that memory is uploaded again
     // before its next use (mid-frame here, at the next frame's start through `dirty`).
     struct GpuWrite {
@@ -626,17 +629,18 @@ struct Renderer::Impl {
     static inline thread_local std::vector<std::pair<GuestTex*, u32>> pend_stores;
     static inline thread_local std::vector<const GuestTex*> pend_reads, reads;
     static inline thread_local bool dispatching = false;
-    // Device scratch of mid-frame uploads and write-backs, in order: reused (grown when short) when this frame's slot comes
-    // back, so steady frames allocate nothing.
+    // Chunked device arena of mid-frame uploads and write-backs: slices from reusable chunks, trimmed once quiet after a spike.
+    struct TempSlice {
+        VkBuffer buf = VK_NULL_HANDLE;
+        u64 offset = 0;
+    };
     std::vector<Buffer> frame_temp;
-    size_t temp_used = 0;
-    Buffer& Temp(u64 size) {
-        if (temp_used == frame_temp.size()) frame_temp.emplace_back();
-        Buffer& b = frame_temp[temp_used++];
-        if (b.size < size)
-            FreeBuffer(b), b = MakeBuffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "temp");
-        return b;
-    }
+    u32 temp_at = 0;
+    u64 temp_used = 0, temp_chunk_size = 32ull << 20, temp_align = 256;
+    u32 temp_quiet = 0, scratch_quiet = 0, stage_quiet = 0, rb_quiet = 0;
+    TempSlice Temp(u64 size);
+    void NoteFrameBuffers();  // before SwapFrame: updates the submitted slot's quiet counters
+    void TrimFrameBuffers();  // after SwapFrame: frees the retired slot's oversized or extra transient buffers
     static inline thread_local bool disp_pending = false;
     void FlushStores() {
         if (!disp_pending) return;
@@ -660,7 +664,7 @@ struct Renderer::Impl {
     void Check(GuestTex& g);
     VkPipeline Detiler(u32 tile, u32 bits, u32 mode = 0);
     void DispatchDetile(VkCommandBuffer c, u32 mip, u32 bytes, u32 bits);
-    void Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buffer& buf, u64 reserve, bool frag = false);
+    void Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buffer* buf, u64 reserve, bool frag = false);
     bool Store(VkCommandBuffer c, GuestTex& g, u32 m);
     void ImageToMirror(VkCommandBuffer c, VkImage img, VkBufferImageCopy bc, u64 to, u64 row, u64 pitch, u32 slices);
     void Materialize(VkCommandBuffer c, const GpuWrite& w, bool learn);
@@ -934,6 +938,7 @@ struct Renderer::Impl {
         VkFence fence = VK_NULL_HANDLE;
         Buffer tables_host, tables, rb, rb_dev, scratch;
         std::vector<Buffer> stage, stage_dev, temp;
+        u32 temp_quiet = 0, scratch_quiet = 0, stage_quiet = 0, rb_quiet = 0;
         std::vector<VkBufferCopy> back;
         bool busy = false;
         u64 frame = 0;              // its number (Submit's count)
@@ -946,7 +951,8 @@ struct Renderer::Impl {
         std::swap(rb_cmd, flight.rb_cmd), std::swap(rendered, flight.rendered), std::swap(bound_sem, flight.bound_sem), std::swap(rb_dev, flight.rb_dev), std::swap(send_cmd, flight.send_cmd);
         std::swap(fence, flight.fence), std::swap(tables_host, flight.tables_host), std::swap(tables, flight.tables), std::swap(stage_dev, flight.stage_dev);
         std::swap(rb, flight.rb), std::swap(scratch, flight.scratch), std::swap(stage, flight.stage), std::swap(frame_temp, flight.temp), std::swap(back, flight.back), std::swap(slot, flight.slot);
-        temp_used = 0;  // the slot taken back belongs to a retired frame
+        std::swap(temp_quiet, flight.temp_quiet), std::swap(scratch_quiet, flight.scratch_quiet), std::swap(stage_quiet, flight.stage_quiet), std::swap(rb_quiet, flight.rb_quiet);
+        temp_at = 0, temp_used = 0, scratch_used = 0, rb_used = 0;  // the slot taken back belongs to a retired frame
         std::swap(prof_base, flight.prof_base), std::swap(prof_n, flight.prof_n), std::swap(prof_label, flight.prof_label);
         prof_n = 0, prof_label.clear();
     }
