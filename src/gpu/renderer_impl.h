@@ -150,6 +150,8 @@ struct Renderer::Impl {
     // Integrated GPU with VK_EXT_memory_budget: its device-local heap is a carve-out of the same RAM (1 GiB by default on the
     // Steam Deck), so DeviceType takes the largest heap once that budget is spent.
     bool uma_budget = false;
+    bool uma_single_heap = false;  // integrated GPU with one DEVICE_LOCAL+HOST_VISIBLE heap
+    bool use_stage_dev = true;     // false on single-heap UMA without a copy engine: stage -> mirror directly
     std::atomic<bool> spilled{false};
     std::atomic<bool> alloc_failed{false};
     // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp

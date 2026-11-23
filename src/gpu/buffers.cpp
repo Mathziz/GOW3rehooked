@@ -261,6 +261,10 @@ Renderer::Impl::Pending Renderer::Impl::AllocateStage(u64 n) {
         auto make_pair = [&](u64 sz) -> bool {
             Buffer host = MakeBuffer(sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "stage", true);
             if (!host.buf) return false;
+            if (!use_stage_dev) {
+                stage.push_back(host);
+                return true;
+            }
             Buffer dev_buf = MakeBuffer(sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "stage dev", true);
             if (!dev_buf.buf) return FreeBuffer(host), false;
             stage.push_back(host), stage_dev.push_back(dev_buf);
@@ -300,6 +304,7 @@ const u8* Renderer::Impl::Stage(u64 addr, const u8* src, u64 n, u64* hash) {
 // The bytes staged before the frame records (BeginFrame's) go to VRAM on the copy engine now, under the frame in flight's
 // render, so only a VRAM copy stays in front of this frame's draws. The later `copied` signal on that queue covers it.
 void Renderer::Impl::RecordSend(VkCommandBuffer c) {
+    if (!use_stage_dev) return;
     std::vector<VkBufferCopy> copies;
     for (size_t i = sent, j; i < pending.size(); i = j) {
         for (j = i; j < pending.size() && pending[j].chunk == pending[i].chunk;) ++j;
@@ -315,7 +320,7 @@ void Renderer::Impl::RecordSend(VkCommandBuffer c) {
 }
 
 void Renderer::Impl::Send() {
-    if (sent == pending.size()) return;
+    if (!use_stage_dev || sent == pending.size()) return;
     const VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkResetCommandBuffer(send_cmd, 0), vkBeginCommandBuffer(send_cmd, &bi);
     TempLabel(send_cmd, "mirror send");  // TEMP perf

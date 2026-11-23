@@ -555,7 +555,10 @@ void Renderer::Impl::LoadDeviceFunctions() {
     VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
     vkGetPhysicalDeviceProperties2(pd, &props);
-    uma_budget = props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && HasExtension(available, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    const bool integrated = props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    uma_budget = integrated && HasExtension(available, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    uma_single_heap = integrated && mem.memoryHeapCount == 1 &&
+                      Type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != ~0u;
     image_copy_via_temp = p13.maxBufferSize < kMirrorMax;  // before SetupMirror: against the largest mirror
 #define LOAD(var, name) var = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
     if (caps.path == ShaderPath::Objects) {
@@ -662,9 +665,9 @@ void Renderer::Impl::TempDeviceReport(std::span<const VkQueueFamilyProperties> f
     Report(std::format("Subgroup: size {} (from {} to {}) stages {:x} sized stages {:x} operations {:x} quad in all stages {}", p11.subgroupSize, p13.minSubgroupSize,
                        p13.maxSubgroupSize, (u32)p11.subgroupSupportedStages, (u32)p13.requiredSubgroupSizeStages, (u32)p11.subgroupSupportedOperations,
                        p11.subgroupQuadOperationsInAllStages));
-    Report(std::format("Sparse: binding {} residency buffer {} aliased {} non-resident strict {}; mirror page {:x} memory types {:x}, integrated with budget {}, image copies through a temp buffer {}",
+    Report(std::format("Sparse: binding {} residency buffer {} aliased {} non-resident strict {}; mirror page {:x} memory types {:x}, integrated with budget {}, single_heap {}, stage_dev {}, image copies through a temp buffer {}",
                        f.sparseBinding, f.sparseResidencyBuffer, f.sparseResidencyAliased, p.sparseProperties.residencyNonResidentStrict, page, mirror_bits, uma_budget,
-                       image_copy_via_temp));
+                       uma_single_heap, use_stage_dev, image_copy_via_temp));
     std::string s;
     for (u32 i = 0; i < fp.size(); ++i)
         s += std::format(" [{}: flags {:x} x{} timestamp bits {} granularity {}x{}x{}]", i, (u32)fp[i].queueFlags, fp[i].queueCount, fp[i].timestampValidBits,
