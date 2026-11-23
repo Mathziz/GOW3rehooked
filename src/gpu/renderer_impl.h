@@ -208,8 +208,9 @@ struct Renderer::Impl {
     PFN_vkCmdEndConditionalRenderingEXT EndConditional = nullptr;
     PFN_vkDestroyShaderEXT DestroyShader = nullptr;
     // The mirror as index buffer, bound once per 4 GB window with the window's size (VK_KHR_maintenance5; null without it: bound to
-    // the buffer's end). A driver that keeps the index count of a binding in 32 bits (AMD: its maxBufferSize is 2 GB, the mirror
-    // 16 or 32 GB) finds none after a window at an even multiple of 4 GB, and every index reads as 0.
+    // the buffer's end). A driver that keeps the index count of a binding in 32 bits (AMD: its maxBufferSize is 2 GB; Intel's: 4 GB;
+    // the mirror 16 or 32 GB) finds none from a multiple of 4 GB, and every index reads as 0: the windows start four bytes past
+    // one (Draw).
     PFN_vkCmdBindIndexBuffer2KHR BindIndex2 = nullptr;
     static constexpr u64 kIndexWindow = 1ull << 32;
     // Diagnostic (debug runs, GOW3_TEMP_LABELS=0 off): pass, block and copy labels for Nsight GPU Trace; the entry points stay

@@ -658,10 +658,17 @@ void main() { color = vec4(filtered(uv).rgb, 1.0); }
         .pMultisampleState = &multisample, .pColorBlendState = &blend, .pDynamicState = &dynamic, .layout = pipeline_layout};
     Check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline), "Create presentation pipeline");
     if (!config.skip_intro) {
+        // The probe writes its attachment, blended to what is there (source x 0 + destination x 1): a fragment shader that
+        // writes nothing, with no depth attachment, may not run at all (Intel's Windows driver), and none of its fragments
+        // is discarded or counted.
         const std::string probe_fragment = R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D game;
 layout(location = 0) in vec2 uv;
-void main() { if (all(equal(texture(game, uv).rgb, vec3(0.0)))) discard; }
+layout(location = 0) out vec4 color;
+void main() {
+    if (all(equal(texture(game, uv).rgb, vec3(0.0)))) discard;
+    color = vec4(0.0);
+}
 )";
         const auto spirv = compiler.Spirv(probe_fragment, shaderc_fragment_shader, error);
         if (spirv.empty()) throw std::runtime_error("Splash frame probe shader: " + error);
@@ -670,9 +677,11 @@ void main() { if (all(equal(texture(game, uv).rgb, vec3(0.0)))) discard; }
         Check(vkCreateShaderModule(device, &module_info, nullptr, &fragment_module), "Create splash frame probe shader");
         VkPipelineShaderStageCreateInfo probe_stages[]{stages[0], stages[1]};
         probe_stages[1].module = fragment_module;
-        VkPipelineColorBlendAttachmentState no_color{};
+        const VkPipelineColorBlendAttachmentState unchanged{.blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+            .dstColorBlendFactor = VK_BLEND_FACTOR_ONE, .colorBlendOp = VK_BLEND_OP_ADD, .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0xF};
         VkPipelineColorBlendStateCreateInfo probe_blend = blend;
-        probe_blend.pAttachments = &no_color;
+        probe_blend.pAttachments = &unchanged;
         VkGraphicsPipelineCreateInfo probe_info = info;
         probe_info.pStages = probe_stages;
         probe_info.pColorBlendState = &probe_blend;
