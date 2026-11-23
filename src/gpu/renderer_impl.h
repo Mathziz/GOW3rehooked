@@ -153,6 +153,7 @@ struct Renderer::Impl {
     bool uma_single_heap = false;  // integrated GPU with one DEVICE_LOCAL+HOST_VISIBLE heap
     bool use_stage_dev = true;     // false on single-heap UMA without a copy engine: stage -> mirror directly
     bool direct_tables = false;    // single-heap UMA: write draw tables directly into host-visible device memory
+    bool compact_memory = false;   // integrated GPU with <= 6 GiB total Vulkan heap: smaller fixed chunks/reserves
     std::atomic<bool> spilled{false};
     std::atomic<bool> alloc_failed{false};
     // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp
@@ -315,6 +316,7 @@ struct Renderer::Impl {
     u64 page = 0;
     u32 mirror_bits = 0;  // memory types its chunks may have (DeviceType picks one per chunk)
     std::vector<VkDeviceMemory> chunks;
+    u64 chunk_size = kChunk;
     u64 chunk_used = kChunk;
     bool chunk_failed = false;  // a chunk allocation failed (logged once)
     std::vector<u64> bound;  // bitmap of mirror pages with memory
@@ -390,11 +392,13 @@ struct Renderer::Impl {
     void FreeBuffer(Buffer& b);
     Buffer tables_host, tables, rb, rb_dev;  // rb: readback of the frame's GPU writes (rb_dev: their VRAM copy, copy engine)
     std::vector<Buffer> stage, stage_dev;    // staging chunks of `pending`, and their VRAM twins
+    u64 stage_chunk_size = 64ull << 20;
     // Draw tables: per frame slot dynamic uniform buffers over `tables`. Each thread takes 64 KB pieces and fills them alone.
     VkDescriptorSetLayout table_layout = VK_NULL_HANDLE;
     VkDescriptorPool table_pool = VK_NULL_HANDLE;
     VkDescriptorSet table_sets[2]{};  // per frame slot: the VS/CS and PS draw tables over that slot's `tables`
     u64 table_align = 16;             // minUniformBufferOffsetAlignment
+    u64 table_bytes = kTableBytes;
     u64 tables_used = 0;
     bool SetupTables();
     u8* TablePtr() const { return (direct_tables ? tables : tables_host).ptr; }
@@ -405,7 +409,7 @@ struct Renderer::Impl {
         if (u64 at = (table_lo + align - 1) & ~(align - 1); at + n <= table_hi) return table_lo = at + n, at;
         const u64 piece = std::max<u64>(n + align, 64 << 10);
         const u64 lo = std::atomic_ref(tables_used).fetch_add(piece, std::memory_order_relaxed);
-        if (lo + piece > kTableBytes) return ~0ull;
+        if (lo + piece > table_bytes) return ~0ull;
         table_lo = lo, table_hi = lo + piece;
         const u64 at = (table_lo + align - 1) & ~(align - 1);
         return table_lo = at + n, at;
@@ -435,6 +439,8 @@ struct Renderer::Impl {
     // call that zeroes the pages, which held the recording for up to milliseconds per new texture. The next block is made
     // on another thread when less than half a block is free; meanwhile, and above 32 MB, an image gets its own allocation.
     static constexpr VkDeviceSize kImageBlock = 128ull << 20;
+    VkDeviceSize image_block_size = kImageBlock;
+    u32 image_reserve_blocks = 2;
     struct ImageBlock {
         VkDeviceMemory mem;
         u32 type;
@@ -582,6 +588,7 @@ struct Renderer::Impl {
     std::unordered_map<u32, VkPipeline> detilers;
     PFN_vkCmdPushDescriptorSetKHR PushDescriptors = nullptr;
     Buffer scratch;  // detiled texels of the frame's prologue uploads, per frame slot: grown while the frame in flight writes the other
+    u64 scratch_reserve = 128ull << 20;
     // Storage images a dispatch or draw writes go back to the mirror; any other image over that memory is uploaded again
     // before its next use (mid-frame here, at the next frame's start through `dirty`).
     struct GpuWrite {

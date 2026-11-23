@@ -1707,15 +1707,15 @@ Renderer::Impl::Tex Renderer::Impl::MakeImage(VkImageType type, VkImageViewType 
 
 void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t) {
     const u32 type = Type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (r.size <= kImageBlock / 4 && type != ~0u) {
+    if (r.size <= image_block_size / 4 && type != ~0u) {
         std::scoped_lock lock(image_lock);
-        if (image_free < kImageBlock / 2 && (!image_growing.valid() || image_growing.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
+        if (image_free < image_block_size / 2 && (!image_growing.valid() || image_growing.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
             image_growing = std::async(std::launch::async, [this, bits = r.memoryTypeBits] {
-                const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, kImageBlock, DeviceType(bits, kImageBlock)};
+                const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, image_block_size, DeviceType(bits, image_block_size)};
                 VkDeviceMemory m = VK_NULL_HANDLE;
                 if (vkAllocateMemory(dev, &ai, nullptr, &m) != VK_SUCCESS) return;
                 std::scoped_lock lock(image_lock);
-                image_blocks.push_back({m, ai.memoryTypeIndex, {{0, kImageBlock}}}), image_free += kImageBlock;
+                image_blocks.push_back({m, ai.memoryTypeIndex, {{0, image_block_size}}}), image_free += image_block_size;
             });
         for (auto& b : image_blocks) {
             if (!(r.memoryTypeBits >> b.type & 1)) continue;
@@ -1749,9 +1749,9 @@ void Renderer::Impl::FreeImage(const Tex& t) {
             if (auto prev = it; it != b.free.begin() && (--prev)->first + prev->second == it->first) prev->second += it->second, b.free.erase(it);
             image_free += t.mem_size;
             // A block free as a whole goes back to the driver (a level load's peak otherwise stays allocated for good),
-            // keeping two blocks of room for the next textures.
-            if (b.free.size() == 1 && b.free.begin()->second == kImageBlock && image_free - kImageBlock >= 2 * kImageBlock)
-                empty = b.mem, image_free -= kImageBlock, image_blocks.erase(block);
+            // keeping image_reserve_blocks of room for the next textures.
+            if (b.free.size() == 1 && b.free.begin()->second == image_block_size && image_free - image_block_size >= image_reserve_blocks * image_block_size)
+                empty = b.mem, image_free -= image_block_size, image_blocks.erase(block);
             break;
         }
     }
@@ -1763,9 +1763,9 @@ bool Renderer::Impl::ReclaimEmptyImageBlocks() {
     {
         std::scoped_lock lock(image_lock);
         for (auto it = image_blocks.begin(); it != image_blocks.end();) {
-            if (it->free.size() == 1 && it->free.begin()->second == kImageBlock) {
+            if (it->free.size() == 1 && it->free.begin()->second == image_block_size) {
                 empty.push_back(it->mem);
-                image_free -= kImageBlock;
+                image_free -= image_block_size;
                 it = image_blocks.erase(it);
             } else {
                 ++it;

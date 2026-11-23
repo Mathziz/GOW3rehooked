@@ -76,7 +76,7 @@ VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFla
     u64 img_bytes = 0, img_free_bytes = 0;
     {
         std::scoped_lock lock(image_lock);
-        img_bytes = u64(image_blocks.size()) * kImageBlock;
+        img_bytes = u64(image_blocks.size()) * image_block_size;
         img_free_bytes = image_free;
     }
     const std::string msg = std::format(
@@ -189,8 +189,8 @@ void Renderer::Impl::DestroyMirror() {
 // Per-frame draw tables: the host staging buffer, its VRAM twin, and the dynamic uniform buffer sets over them.
 bool Renderer::Impl::SetupTables() {
     if (!direct_tables) {
-        tables_host = MakeBuffer(kTableBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
-        flight.tables_host = MakeBuffer(kTableBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
+        tables_host = MakeBuffer(table_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
+        flight.tables_host = MakeBuffer(table_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, "?", true);
     }
     if (boom_on) boom_buf = MakeBuffer(2ull * kBoomDraws * kBoomRec, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
     // TRANSFER_SRC on direct_tables keeps MakeBuffer on write-combined memory (avoids GPU snooping of host cache).
@@ -198,7 +198,7 @@ bool Renderer::Impl::SetupTables() {
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
         (direct_tables ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     for (Buffer* t : {&tables, &flight.tables})  // a table window starting at the last offset stays inside
-        *t = MakeBuffer(kTableBytes + kTableRange, table_usage, direct_tables, "?", true);
+        *t = MakeBuffer(table_bytes + kTableRange, table_usage, direct_tables, "?", true);
     if ((!direct_tables && (!tables_host.buf || !flight.tables_host.buf)) || !tables.buf || !flight.tables.buf || (boom_on && !boom_buf.buf))
         return false;
     if (boom_on) std::memset(boom_buf.ptr, 0, boom_buf.size);
@@ -235,9 +235,9 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
         const u64 bit = 1ull << (p / page % 64);
         if (word & bit) continue;
         word |= bit;
-        if (chunk_used + page > kChunk) {
+        if (chunk_used + page > chunk_size) {
             VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, kChunk, DeviceType(mirror_bits, kChunk)};
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, chunk_size, DeviceType(mirror_bits, chunk_size)};
             VkDeviceMemory m = VK_NULL_HANDLE;
             if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS) {
                 word &= ~bit;  // the rest stays without memory (reads zero); the next write there tries again
@@ -246,7 +246,7 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
                                                                (int)ai.memoryTypeIndex, mirror_chunks.load() >> 20));
                 break;
             }
-            chunks.push_back(m), chunk_used = 0, mirror_chunks += kChunk;
+            chunks.push_back(m), chunk_used = 0, mirror_chunks += chunk_size;
         }
         if (!pending_binds.empty() && pending_binds.back().resourceOffset + pending_binds.back().size == p &&
             pending_binds.back().memory == chunks.back() &&
@@ -261,7 +261,6 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
 // ---- Staging chunks and guest-to-mirror uploads ----
 
 Renderer::Impl::Pending Renderer::Impl::AllocateStage(u64 n) {
-    constexpr u64 kStageChunk = 64ull << 20;
     while (stage_at < stage.size() && stage_used + n > stage[stage_at].size) ++stage_at, stage_used = 0;
     if (stage_at == stage.size()) {
         auto make_pair = [&](u64 sz) -> bool {
@@ -276,7 +275,7 @@ Renderer::Impl::Pending Renderer::Impl::AllocateStage(u64 n) {
             stage.push_back(host), stage_dev.push_back(dev_buf);
             return true;
         };
-        const u64 want = std::max(kStageChunk, n);
+        const u64 want = std::max(stage_chunk_size, n);
         if (!make_pair(want) && (want <= n || !make_pair(n))) return {0, 0, 0, ~0u};
     }
     const Pending p{0, n, stage_used, stage_at};

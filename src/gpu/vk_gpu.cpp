@@ -384,7 +384,7 @@ Stats& Renderer::GetStats() {
         auto& s = d->stats;
         {
             std::scoped_lock lock(d->image_lock);
-            s.vram_mb[1] = float(d->image_blocks.size() * Impl::kImageBlock) * mb, s.vram_mb[2] = float(d->image_free) * mb;
+            s.vram_mb[1] = float(d->image_blocks.size() * d->image_block_size) * mb, s.vram_mb[2] = float(d->image_free) * mb;
         }
         s.vram_mb[0] = float(d->mirror_chunks.load(std::memory_order_relaxed)) * mb;
         s.vram_mb[3] = float(d->dedicated_images.load(std::memory_order_relaxed)) * mb;
@@ -1674,7 +1674,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) vkCmdClearDepthStencilImage(r.copy_cmd, img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
         else vkCmdClearColorImage(r.copy_cmd, img, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &range);
     }
-    r.Upload(r.copy_cmd, r.uploads, r.scratch, 128ull << 20);
+    r.Upload(r.copy_cmd, r.uploads, r.scratch, r.scratch_reserve);
     if (!r.fresh.empty())  // Upload may record nothing (tables full): its closing barrier is no fence for the clears
         Impl::StageBarrier(r.copy_cmd, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                            VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
@@ -1685,7 +1685,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     vkEndCommandBuffer(r.copy_cmd);
     if (need_xfer) {
         if (!r.direct_tables && r.tables_used) {
-            const VkBufferCopy tc{0, 0, std::min(r.tables_used, kTableBytes)};  // TableAt counts the pieces it refused too
+            const VkBufferCopy tc{0, 0, std::min(r.tables_used, r.table_bytes)};  // TableAt counts the pieces it refused too
             vkCmdCopyBuffer(r.xfer_cmd, r.tables_host.buf, r.tables.buf, 1, &tc);
         }
         r.TempLabelEnd(r.xfer_cmd), temp_ts(r.xfer_cmd, 1);
