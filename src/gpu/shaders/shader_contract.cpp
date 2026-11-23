@@ -600,9 +600,11 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
             u64 key;
             u32 col_format;
         };
+        // VS variants: mesh, procedural or embedded (primary), a mesh stream set of a procedural recipe (layout), a TextFX
+        // glyph declaration; PS variants: primary, or with sRGB views of generic slots only.
         struct Bucket {
-            std::vector<u64> primary_vs, fallback_vs;
-            std::vector<PsCand> primary_ps, fallback_ps;
+            std::vector<u64> primary_vs, layout_vs, glyph_vs;
+            std::vector<PsCand> primary_ps, srgb_ps;
         };
         std::vector<Bucket> buckets(pair_metas.size());
         for (const Mine& m : mine) {
@@ -610,12 +612,11 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 if (e.pair_id >= buckets.size()) continue;
                 Bucket& b = buckets[e.pair_id];
                 if (e.stage == u8(Gcn::Stage::Vertex) && !e.rect) {
-                    const bool prim = (e.paths & ((1u << kVsMesh) | (1u << kVsProcedural) | (1u << kVsEmbedded))) != 0;
-                    auto& dst = prim ? b.primary_vs : b.fallback_vs;
+                    auto& dst = e.paths & ((1u << kVsMesh) | (1u << kVsProcedural) | (1u << kVsEmbedded)) ? b.primary_vs : e.paths & (1u << kVsGlyph) ? b.glyph_vs : b.layout_vs;
                     if (std::find(dst.begin(), dst.end(), e.key) == dst.end()) dst.push_back(e.key);
                 } else if (e.stage == u8(Gcn::Stage::Pixel)) {
                     const bool prim = (e.paths & ((1u << kPsMaterial) | (1u << kPsPass) | (1u << kPsEmbedded))) != 0;
-                    auto& dst = prim ? b.primary_ps : b.fallback_ps;
+                    auto& dst = prim ? b.primary_ps : b.srgb_ps;
                     if (std::none_of(dst.begin(), dst.end(), [&](const PsCand& c) { return c.key == e.key && c.col_format == e.col_format; }))
                         dst.push_back({e.key, e.col_format});
                 }
@@ -642,11 +643,20 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         auto emit = [&](u64 vs_key, u64 ps_key, u32 file, const FixedPipelineState& st) {
             derived.push_back({vs_key, ps_key, 0ull, file, 0u, st});
         };
+        constexpr VkFormat kUnorm = VK_FORMAT_R8G8B8A8_UNORM;
+        // What a pair draws: every target its recipe implies; pass code's model meshes; a screen pass sampling the scene through sRGB views.
+        enum Draws : u8 { kAll, kMeshes, kScreenSrgb };
         for (size_t pid = 0; pid < pair_metas.size(); ++pid) {
             const PairMeta& meta = pair_metas[pid];
             const Bucket& b = buckets[pid];
-            const auto& vs_list = !b.primary_vs.empty() ? b.primary_vs : b.fallback_vs;
-            const auto& ps_list = !b.primary_ps.empty() ? b.primary_ps : b.fallback_ps;
+            // A WAD technique no material draws with is drawn by pass code: depth and translucent passes over the model meshes
+            // (every stream set), screen passes with the recipe's own declaration. The run's 25 such pipelines took these states.
+            const bool pass = meta.classes.empty() && meta.file != ~0u;
+            std::vector<u64> vs_list = b.primary_vs;
+            if (!meta.classes.empty()) vs_list.insert(vs_list.end(), b.glyph_vs.begin(), b.glyph_vs.end());  // TextFX materials
+            const bool fallback = vs_list.empty();
+            if (fallback) vs_list.insert(vs_list.end(), b.layout_vs.begin(), b.layout_vs.end()), vs_list.insert(vs_list.end(), b.glyph_vs.begin(), b.glyph_vs.end());
+            const auto& ps_list = !b.primary_ps.empty() ? b.primary_ps : b.srgb_ps;
             if (vs_list.empty()) continue;
             if (ps_list.empty()) {
                 const size_t lim = std::min<size_t>(vs_list.size(), 8);
@@ -669,56 +679,46 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 continue;
             }
             u32 pair_count = 0;
-            for (u64 vs_key : vs_list) {
-                for (const PsCand& pc : ps_list) {
-                    if (pair_count >= 32) break;
-                    ++pair_count;
-                    u32 color_count = 0;
-                    for (u32 k = 0; k < 8; ++k)
-                        if (pc.col_format >> (4 * k) & 0xF) color_count = k + 1;
+            const auto pair = [&](u64 vs_key, const PsCand& pc, Draws draws) {
+                if (pair_count++ >= 32) return;
+                u32 count = 0;
+                for (u32 k = 0; k < 8; ++k)
+                    if (pc.col_format >> (4 * k) & 0xF) count = k + 1;
+                // The pair on `n` color targets (MRT0 `first`, the others `rest`), with the D32S8 depth when `depth`.
+                const auto put = [&](u32 n, VkFormat first, VkFormat rest, bool depth, u8 samples, const MaterialClass* c = nullptr) {
                     FixedPipelineState s{};
-                    s.color_count = u8(color_count);
-                    for (u32 k = 0; k < color_count; ++k) {
-                        if (pc.col_format >> (4 * k) & 0xF)
-                            s.color_formats[k] = (k == 0) ? scene_fmt : VK_FORMAT_R8G8B8A8_UNORM;
-                        s.blend[k] = {0, 0xF};
+                    s.color_count = u8(n);
+                    for (u32 k = 0; k < n; ++k) {
+                        if (pc.col_format >> (4 * k) & 0xF) s.color_formats[k] = k ? rest : first;
+                        s.blend[k] = c ? blend_of(*c) : FixedAttachmentBlend{0, 0xF};
                     }
-                    s.topology_class = 2;
-                    s.flags = FixedPipelineState::kHasPs | kClip;
-                    if (!meta.classes.empty()) {
-                        s.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-                        s.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-                        for (const MaterialClass& c : meta.classes) {
-                            FixedPipelineState m = s;
-                            m.samples = c[0] ? 1 : scene_samples;
-                            for (u32 k = 0; k < color_count; ++k) {
-                                if (m.color_formats[k]) m.color_formats[k] = k == 0 && !c[0] ? scene_srgb : VK_FORMAT_R8G8B8A8_UNORM;
-                                m.blend[k] = blend_of(c);
-                            }
-                            emit(vs_key, pc.key, meta.file, m);
-                        }
-                    } else if (color_count == 0) {
-                        s.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-                        s.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-                        s.samples = u8(1u << sample_log2);
-                        emit(vs_key, pc.key, meta.file, s);
-                        if (sample_log2 > 0) {
-                            s.samples = 1;
-                            emit(vs_key, pc.key, meta.file, s);
-                        }
-                    } else {
-                        FixedPipelineState pass1x = s;
-                        pass1x.samples = 1;
-                        emit(vs_key, pc.key, meta.file, pass1x);
-                        if (pass1x.color_formats[0]) pass1x.color_formats[0] = scene_srgb, emit(vs_key, pc.key, meta.file, pass1x);
-                        FixedPipelineState msaa = s;
-                        msaa.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-                        msaa.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-                        msaa.samples = u8(1u << sample_log2);
-                        emit(vs_key, pc.key, meta.file, msaa);
-                    }
+                    if (depth) s.depth_format = s.stencil_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                    s.samples = samples, s.topology_class = 2, s.flags = FixedPipelineState::kHasPs | kClip;
+                    emit(vs_key, pc.key, meta.file, s);
+                };
+                // Depth only (a pass binds no color target whatever the PS exports): the scene's depth and the single-sampled one.
+                const auto depth_only = [&] {
+                    put(0, {}, {}, true, scene_samples);
+                    if (scene_samples > 1) put(0, {}, {}, true, 1);
+                };
+                if (draws == kScreenSrgb) {
+                    put(count, scene_srgb, scene_srgb, false, 1);
+                } else if (!meta.classes.empty()) {
+                    for (const MaterialClass& c : meta.classes) put(count, c[0] ? kUnorm : scene_srgb, kUnorm, true, c[0] ? 1 : scene_samples, &c);
+                } else if (count == 0) {
+                    depth_only();
+                } else if (pass) {
+                    depth_only(), put(count, scene_fmt, kUnorm, true, 1);  // the translucent pass
+                    if (draws == kAll) put(count, scene_fmt, kUnorm, false, 1), put(count, scene_srgb, scene_srgb, false, 1);
+                } else {
+                    put(count, scene_fmt, kUnorm, false, 1), put(count, scene_srgb, scene_srgb, false, 1);
+                    put(count, scene_fmt, kUnorm, true, scene_samples);
                 }
-                if (pair_count >= 32) break;
+            };
+            for (u64 vs_key : vs_list) for (const PsCand& pc : ps_list) pair(vs_key, pc, kAll);
+            if (pass && !fallback) {
+                for (u64 vs_key : b.layout_vs) for (const PsCand& pc : ps_list) pair(vs_key, pc, kMeshes);
+                if (!b.primary_ps.empty()) for (u64 vs_key : vs_list) for (const PsCand& pc : b.srgb_ps) pair(vs_key, pc, kScreenSrgb);
             }
         }
         auto raw_hash = [](const ContractedPipeline& p) {
