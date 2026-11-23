@@ -810,6 +810,7 @@ constexpr u32 kQuitTarget = 0xffffff00, kBackTarget = 0xfffffe00, kPageNextTarge
               kMoveTarget = 0xfffd0000, kFirstItemTarget = 0xfffffb00, kBeforeNewGameTarget = 0xfffffa00, kContinueTarget = 0xfffff900,
               kRefreshContinueTarget = 0xfffff800;
 constexpr u32 kMainShellSize = 0xc1e0, kRows = 10, kRowSize = 128;
+constexpr u32 kResidentSize = 0x132fe, kBrightnessState = 0x193c;
 constexpr u32 kTurnOnState = 0xe4, kMainState = 0xf8, kNewGameState = 0x114, kLoadState = 0x148, kTreasuresState = 0x1c8;
 // Load: X requests the load; 0x14b comes with 1 when it starts and 0 when it ends (the body, from the jz on, runs only for 0);
 // 0x149 when the loaded game starts.
@@ -832,6 +833,7 @@ using GotoFn = void(PS4_SYSV_ABI*)(u8*, u32);
 InitFn original_init;
 GotoFn original_goto;
 std::vector<u8> patched;
+std::vector<u8> patched_options;
 u32 main_labels_at{}, main_clips_at{}, main_initial_target{};
 bool continue_available{};
 
@@ -959,8 +961,15 @@ void Configure(const Config& config) {
     return std::byteswap(value);
 #endif
 }
-u32 Be32(const u8* p) { return SwapBytes(*reinterpret_cast<const u32*>(p)); }
-void PutBe32(u8* p, u32 v) { *reinterpret_cast<u32*>(p) = SwapBytes(v); }
+u32 Be32(const u8* p) {
+    u32 v;
+    std::memcpy(&v, p, sizeof(v));
+    return SwapBytes(v);
+}
+void PutBe32(u8* p, u32 v) {
+    v = SwapBytes(v);
+    std::memcpy(p, &v, sizeof(v));
+}
 
 void WriteMainRows(bool available) {
     continue_available = available;
@@ -994,6 +1003,10 @@ struct Code {
     Code& Pop() { return Raw({0x43}); }
     Code& End() { return Raw({0x49}); }
     Code& Goto(u32 state) { return Raw({0x47, u8(state >> 24), u8(state >> 16), u8(state >> 8), u8(state)}); }
+    Code& Call(u32 at, u32 target) {
+        const u32 relative = target - (at + 5);
+        return Raw({0x4a, u8(relative >> 24), u8(relative >> 16), u8(relative >> 8), u8(relative)});
+    }
 };
 
 // The script blob (big-endian records after a little-endian header) plus the new states; empty when the script is not the one
@@ -1040,10 +1053,6 @@ std::vector<u8> Build(const u8* blob) {
         out.insert(out.end(), c.bytes.begin(), c.bytes.end());
         return at;
     };
-    const auto call = [&](u32 at, u32 target) { // `call` of the sub at `target`, placed at code offset `at`
-        const s32 relative = s32(target) - s32(at + 5);
-        return Code().Raw({0x4a, u8(relative >> 24), u8(relative >> 16), u8(relative >> 8), u8(relative)});
-    };
     const auto here = [&] { return u32(out.size()) - code_base; };
     // Row `i` of the list group: Enable shows it unfocused (red), Select plays the focus clip forward (mode 8) or backward (mode 9).
     const auto clip = [](Code& c, u32 mode, u32 name, float speed) {
@@ -1068,15 +1077,12 @@ std::vector<u8> Build(const u8* blob) {
         on_leave = block(leave.End());
     };
     // Handlers: a sound sub (nav 0x1bb, select 0x1ab, back 0x1b3) then a goto.
-    const auto go = [&](u32 sound, u32 target) { Code c = call(here(), sound); c.Goto(target).End(); return block(c); };
+    const auto go = [&](u32 sound, u32 target) { return block(Code().Call(here(), sound).Goto(target).End()); };
     // As the native Load handlers: nothing while the load they requested is pending (this[0x140]).
     const auto idle_go = [&](u32 sound, u32 target) {
         Code c;
         c.Raw({0x04, 0xe1, 0x40, 0x2f, 0x17, 0x00, u8(sound ? 10 : 5)});
-        if (sound) {
-            const Code sub = call(here() + 7, sound);
-            c.bytes.insert(c.bytes.end(), sub.bytes.begin(), sub.bytes.end());
-        }
+        if (sound) c.Call(here() + 7, sound);
         c.Goto(target).End();
         return block(c);
     };
@@ -1160,7 +1166,7 @@ std::vector<u8> Build(const u8* blob) {
     };
     const auto use_list_group = [&](u32 at) { return replace(at, {0x16, u8(kMainGroup >> 8), u8(kMainGroup)}, Code().Str(kVideosGroup)); };
     // Show, hide and focus the title rows through the reusable list, preserving the native animation calls.
-    if (!replace(0xd6e, {0x47, 0, 0, 1, 0x14}, call(0xd6e, show_sub)) ||
+    if (!replace(0xd6e, {0x47, 0, 0, 1, 0x14}, Code().Call(0xd6e, show_sub)) ||
         !use_list_group(0xd55) || !use_list_group(0xd96))
         return {};
     constexpr std::tuple<MainRow, u32, u32, u32> native_focus[]{
@@ -1175,10 +1181,78 @@ std::vector<u8> Build(const u8* blob) {
     return out;
 }
 
+bool IsResident(const u8* blob) {
+    return blob && *reinterpret_cast<const u32*>(blob + 8) == kResidentSize &&
+           std::memcmp(blob + 0xe94d, "BrightnessSetting", sizeof("BrightnessSetting")) == 0;
+}
+
+// R_UI.WAD's SMI_R_UI. Both the title and the in-game pause enter PauseOptions.
+std::vector<u8> BuildPauseOptions(const u8* blob) {
+    constexpr u32 code_base = 0x1de4, symbols = 0x11028;
+    constexpr u32 options = 0x1424, controls = 0x1448, display = 0x14e4;
+    constexpr u32 blank_line = 0xa2ff, controls_up = 0xa428, display_down = 0xa526;
+    constexpr u32 pause_text = 0xd52f, select_clip = 0xeeb6, select_sound = 0xd688, nav_sound = 0x2a;
+    constexpr u8 blank[]{0x16, 0xc9, 0x59, 0x09, 0xe0, 0x05, 0x43};
+    const u8* const code = blob + code_base;
+    if (*reinterpret_cast<const u32*>(blob + 0xc) != code_base - 4 ||
+        *reinterpret_cast<const u32*>(blob + 0x10) != symbols || blob[symbols] != 0 ||
+        Be32(blob + options + 4) != 0x040000f4 || Be32(blob + display + 8) != options ||
+        Be32(blob + controls + 0x18) != 0x0300a423 || Be32(blob + display + 0x24) != 0x0300a521 ||
+        std::memcmp(code + blank_line, blank, sizeof(blank)) != 0 ||
+        code[controls_up] != 0x47 || Be32(code + controls_up + 1) != display ||
+        code[display_down] != 0x47 || Be32(code + display_down + 1) != controls ||
+        std::memcmp(code + pause_text, "PauseText", sizeof("PauseText")) != 0 ||
+        std::memcmp(code + select_clip, "menuItem4Select", sizeof("menuItem4Select")) != 0 ||
+        std::memcmp(code + select_sound, "SND_MM_SELECT", sizeof("SND_MM_SELECT")) != 0)
+        return {};
+
+    // Literals have 16-bit offsets. Insert before the symbols, keeping the last original literal's NUL.
+    constexpr char label[] = "\0Controls and Extras";
+    constexpr u32 label_ref = symbols + 1 - code_base;
+    constexpr u32 label_bytes = (sizeof(label) + 3) & ~3u;
+    static_assert(label_ref <= 0xffff);
+    std::vector<u8> out(blob, blob + symbols);
+    out.insert(out.end(), label, label + sizeof(label));
+    out.resize(symbols + label_bytes);
+    out.insert(out.end(), blob + symbols, blob + 4 + kResidentSize);
+    out.resize((out.size() + 3) & ~3u);
+    const u32 row = u32(out.size()) - 4;
+    out.resize(out.size() + 0x34);
+
+    const auto block = [&](const Code& c) {
+        const u32 at = u32(out.size()) - code_base;
+        out.insert(out.end(), c.bytes.begin(), c.bytes.end());
+        return at;
+    };
+    const auto focus = [&](bool entering) {
+        Code c;
+        if (entering) c.Native(0x6b).Pop();
+        return block(c.Str(pause_text).Int(entering ? 8 : 9).Str(select_clip).Int(3).Native(0x5a).Pop().End());
+    };
+    const auto navigate = [&](u32 target) {
+        return block(Code().Call(u32(out.size()) - code_base, nav_sound).Goto(target).End());
+    };
+    // Only the parent reference is needed for a Goto to enter the appended row, as in mainShell.
+    const u32 record[]{0x04000034, options, Be32(blob + display + 0xc),
+                       0x01000000 | focus(true), 0x02000000 | focus(false),
+                       0x03000000 | navigate(display), 0x800000e0, 0xec,
+                       0x03000000 | navigate(controls), 0x800000e4, 0xf0,
+                       0x03000000 | block(Code().Str(select_sound).Native(0x5c).Pop().Goto(kHelpTarget).End()), 0xe9};
+    for (u32 i = 0; i < std::size(record); ++i) PutBe32(out.data() + row + 4 + i * 4, record[i]);
+    out[code_base + blank_line + 1] = u8(label_ref >> 8);
+    out[code_base + blank_line + 2] = u8(label_ref);
+    PutBe32(out.data() + code_base + controls_up + 1, row);
+    PutBe32(out.data() + code_base + display_down + 1, row);
+    *reinterpret_cast<u32*>(out.data() + 8) = u32(out.size()) - 4;
+    *reinterpret_cast<u32*>(out.data() + 0x10) = symbols + label_bytes;
+    return out;
+}
+
 // 01154C40(script): first-time init copies the template's blob pointer (template + 0x38 -> +8) into script + 0x50.
 void PS4_SYSV_ABI Init(u8* script) {
     u8** const slot = reinterpret_cast<u8**>(*reinterpret_cast<u8**>(script + 0x38) + 8);
     u8* const original = *slot;
+    u8* replacement = nullptr;
     if (!*reinterpret_cast<u8**>(script + 0x50) && original && *reinterpret_cast<const u32*>(original + 8) == kMainShellSize) {
         if (patched.empty()) {
             patched = Build(original);
@@ -1189,17 +1263,27 @@ void PS4_SYSV_ABI Init(u8* script) {
         }
         if (!patched.empty()) {
             WriteMainRows(Libraries::SaveData::Dialog::HasContinueSave());
-            *slot = patched.data();
-            original_init(script);
-            *slot = original; // the template keeps owning its own blob
-            return;
+            replacement = patched.data();
         }
+    } else if (!*reinterpret_cast<u8**>(script + 0x50) && IsResident(original)) {
+        // All resident instances must use the same blob pointer: the VM keys shared variables by it.
+        static const bool ready = [original] {
+            patched_options = BuildPauseOptions(original);
+            if (DebugEnabled()) Log(patched_options.empty() ? "Options menu: script not recognized" : "Options menu: Controls and Extras added");
+            return !patched_options.empty();
+        }();
+        if (ready) replacement = patched_options.data();
     }
+    if (replacement) *slot = replacement;
     original_init(script);
+    if (replacement) *slot = original; // the template keeps owning its own blob
 }
 // 01154970(script, state): goes to a state; the reserved targets of the handlers above are host actions instead.
 void PS4_SYSV_ABI Goto(u8* script, u32 state) {
-    if (!patched.empty() && *reinterpret_cast<const u8* const*>(script + 0x50) == patched.data()) {
+    const auto* blob = *reinterpret_cast<const u8* const*>(script + 0x50);
+    const bool title_script = blob && blob == patched.data();
+    const bool options_script = blob && blob == patched_options.data();
+    if (title_script) {
         if (state == kMainState || state == kLoadState)
             Libraries::SaveData::Dialog::RequestContinue(false);
         if (state == kMainState) {
@@ -1210,14 +1294,10 @@ void PS4_SYSV_ABI Goto(u8* script, u32 state) {
             if (RefreshContinue(script, in_main_menu)) return;
         }
     }
-    if (state == 0x193c) {
-        const auto* blob = *reinterpret_cast<const u8* const*>(script + 0x50);
-        if (blob && *reinterpret_cast<const u32*>(blob + 8) == 0x132fe &&
-            std::memcmp(blob + 0xe94d, "BrightnessSetting", sizeof("BrightnessSetting")) == 0) {
-            original_goto(script, state);
-            Splash::Reveal();
-            return;
-        }
+    if (state == kBrightnessState && (options_script || IsResident(blob))) {
+        original_goto(script, state);
+        Splash::Reveal();
+        return;
     }
     if (state == kBackTarget) {
         bool changed = false;
@@ -1232,7 +1312,7 @@ void PS4_SYSV_ABI Goto(u8* script, u32 state) {
         }
         return;
     }
-    if (state == kHelpTarget) {
+    if (state == kHelpTarget && (title_script || options_script)) {
         ControlsUi::Open();
         return;
     }
