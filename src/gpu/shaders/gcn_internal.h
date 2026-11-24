@@ -19,6 +19,7 @@ struct Inst {
     std::uint32_t lit = 0, w0 = 0, w1 = 0;
     std::uint8_t abs = 0, neg = 0, clamp = 0, omod = 0, imm = 0;
     std::int16_t tex = -1, smp = -1;  // MIMG slots; MUBUF format load: tex indexes Analysis::formats
+    std::int16_t spill = -1;  // v_writelane / v_readlane of an SGPR spilled to a constant lane: vgpr << 6 | lane
 };
 
 struct Program {

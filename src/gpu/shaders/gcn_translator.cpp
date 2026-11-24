@@ -372,13 +372,15 @@ Analysis Analyze(const Input& in) {
         }
         case VALU:
             if (i.op < 256 || (i.op >= 293 && i.op <= 298)) kill(i.sdst, 2);
+            // A read of a lane every path last set by v_writelane is that SGPR's value: the emitter keeps it per invocation
+            // (Inst::spill), so the lane need not exist in the subgroup (fewer invocations, or a subgroup narrower than the lane).
             if (const bool lane = i.src[1] >= 128 && i.src[1] < 192; i.op == 258) {
-                if (lane && i.src[0] < 104 && sv[i.src[0]].known) lanes[i.dst << 6 | (i.src[1] - 128)] = sv[i.src[0]];
-                else if (lane) lanes.erase(i.dst << 6 | (i.src[1] - 128));
+                if (lane) i.spill = s16(i.dst << 6 | (i.src[1] - 128)), lanes[i.spill] = i.src[0] < 104 ? sv[i.src[0]] : Val{};
                 else forget(i.dst);
             } else if (i.op == 257) {
                 const auto it = lane && i.src[0] >= 256 ? lanes.find((i.src[0] - 256) << 6 | (i.src[1] - 128)) : lanes.end();
-                if (it != lanes.end() && i.dst < 104) sv[i.dst] = it->second;
+                if (it != lanes.end()) i.spill = s16(it->first);
+                if (it != lanes.end() && it->second.known && i.dst < 104) sv[i.dst] = it->second;
                 else kill(i.dst, 1);
             } else if (i.op == 386) {
                 kill(i.dst, 1);

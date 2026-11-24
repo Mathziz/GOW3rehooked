@@ -36,7 +36,7 @@ struct Gen : Ops {
 
 
     // Registers: variables of main, created on first use.
-    std::map<u32, Id> sreg, vreg;
+    std::map<u32, Id> sreg, vreg, spill;  // spill: SGPRs spilled to VGPR lanes (Inst::spill), one copy per invocation
     // Per-lane compare results still held by their SGPR pair (VCC 106 included): this lane's bit of the mask, without the
     // ballot round trip. Valid within one block and one EXEC, until the pair is written again.
     std::map<u32, Id> lane_masks;
@@ -51,6 +51,11 @@ struct Gen : Ops {
     }
     Id Vr(u32 n) {
         auto [it, fresh] = vreg.try_emplace(n, 0);
+        if (fresh) it->second = Var(pFnU, CU(0));
+        return it->second;
+    }
+    Id Spill(u32 key) {
+        auto [it, fresh] = spill.try_emplace(key, 0);
         if (fresh) it->second = Var(pFnU, CU(0));
         return it->second;
     }
@@ -1054,8 +1059,9 @@ void Gen::Valu(const Inst& i) {
         const Id x = u(0), y = u(1);
         return Uw(SelU(LaneMask(i.src[2], i.lit), y, x));
     }
-    case 257: return St(D(i.dst), ShuffleU(u(0), u(1)));
+    case 257: return St(D(i.dst), i.spill >= 0 ? LdU(Spill(i.spill)) : ShuffleU(u(0), u(1)));
     case 258: {
+        if (i.spill >= 0) St(Spill(i.spill), u(0));
         const Id n = Vr(i.dst);
         return St(n, SelU(Bool(spv::OpIEqual, SubId(), R(spv::OpUMod, tU32, u(1), SubSize())), u(0), LdU(n)));
     }

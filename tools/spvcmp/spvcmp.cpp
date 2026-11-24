@@ -2,6 +2,7 @@
 //   spvcmp list                               one line per recipe (index, stage, program hash, slots)
 //   spvcmp fail                               the recipes the emitter cannot translate, and why
 //   spvcmp one <recipe>                       the emitter on one recipe
+//   spvcmp spill [recipe]                     every recipe emitted and validated (threads); the ones reading spilled SGPR lanes
 //   spvcmp words <recipe> <first pc> <count>  raw dwords of a recipe's program
 //   spvcmp eboot [dfmt nfmt]                  the EBOOT's embedded compute programs: words, emission with made-up float V# formats, validation
 #include <spirv-tools/libspirv.h>
@@ -210,6 +211,40 @@ int main(int argc, char** argv) {
         }
         std::printf("MSAA recipes: tested=%zu matched=%zu changed=%zu missing=%zu errors=%zu\n", tested, matched, changed, missing, bad);
         return bad ? 1 : 0;
+    }
+    if (mode == "spill") {  // spill [recipe]: every recipe emitted and validated; those reading SGPRs spilled to VGPR lanes
+        struct Job { size_t k; Gcn::Input in; std::vector<u32> code, fetch; };
+        std::vector<Job> jobs;
+        for (size_t k = 0; k < recipes.size(); ++k)
+            if (Job j{k, recipes[k].Input()}; game.Code(recipes[k], j.code, j.fetch)) jobs.push_back(std::move(j));
+        std::atomic<size_t> next{0}, invalid{0}, spilled{0};
+        std::mutex out;
+        const size_t want = argc > 2 ? std::stoull(argv[2]) : ~size_t(0);
+        std::vector<std::thread> pool;
+        for (u32 t = 0; t < std::max(1u, std::thread::hardware_concurrency()); ++t)
+            pool.emplace_back([&] {
+                for (size_t n; (n = next++) < jobs.size();) {
+                    Job& j = jobs[n];
+                    j.in.code = j.code, j.in.fetch = j.fetch;
+                    const Gcn::Analysis an = Gcn::Analyze(j.in);
+                    std::vector<u32> words;
+                    std::uint64_t mask;
+                    std::string err, msg;
+                    const bool ok = an.program && Gcn::EmitSpirv(an, j.in, recipes[j.k].Specs(), words, mask, err) && Validate(words, msg);
+                    u32 reads = 0, writes = 0, lane = 0;
+                    if (an.program)
+                        for (const auto& i : an.program->insts)
+                            if (i.spill >= 0) (i.op == 257 ? reads : writes)++, lane = std::max<u32>(lane, i.spill & 63);
+                    invalid += !ok, spilled += reads > 0;
+                    std::lock_guard l(out);
+                    if (!ok) std::printf("%zu: INVALID %s%s\n", j.k, err.c_str(), msg.c_str());
+                    if (reads) std::printf("%zu: stage %u code %016llx spill reads %u writes %u top lane %u\n", j.k, recipes[j.k].h.stage, (unsigned long long)recipes[j.k].h.code_hash, reads, writes, lane);
+                    if (j.k == want && ok) std::ofstream("spill-" + std::to_string(j.k) + ".spvasm") << Disassemble(words);
+                }
+            });
+        for (auto& t : pool) t.join();
+        std::printf("%zu emitted, %zu invalid, %zu read spilled lanes\n", jobs.size(), invalid.load(), spilled.load());
+        return invalid ? 1 : 0;
     }
     if (mode == "fail") {  // the direct emitter alone (fast): the recipes it cannot translate
         for (size_t k = 0; k < recipes.size(); ++k) {
