@@ -623,7 +623,7 @@ void Renderer::Impl::CreatePipelineCache(std::span<const u8> initial_data) {
     if (e != VK_SUCCESS) Report(std::format("vkCreatePipelineCache {}", (int)e)), pipeline_cache = VK_NULL_HANDLE;
 }
 
-constexpr u64 kPipelineCacheMax = 512ull << 20;  // the largest cache a load takes (a corrupt header's size is not allocated)
+constexpr u64 kPipelineCacheMax = 1024ull << 20;  // the largest cache a load takes (a corrupt header's size is not allocated)
 
 void Renderer::Impl::LoadPipelineCache() {
     if (caps.path == ShaderPath::Objects) return;
@@ -676,7 +676,9 @@ void Renderer::Impl::SavePipelineCache() {
         raw = std::make_unique_for_overwrite<u8[]>(size);
         r = vkGetPipelineCacheData(dev, pipeline_cache, &size, raw.get());
     }
-    if (r != VK_SUCCESS || !size || size > kPipelineCacheMax) return;  // larger than a load takes: the file that loads stays
+    if (r != VK_SUCCESS || !size) return;
+    if (size > kPipelineCacheMax)  // larger than a load takes: the file that loads stays
+        return Gow3::Log(std::format("Pipeline cache: {:.1f} MB is past the {} MB limit, not saved", size / 1048576.0, kPipelineCacheMax >> 20));
     const size_t bound = ZSTD_compressBound(size);
     const auto packed = std::make_unique_for_overwrite<u8[]>(bound);
     const size_t packed_size = ZSTD_compress(packed.get(), bound, raw.get(), size, 3);
