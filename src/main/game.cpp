@@ -6,7 +6,9 @@
 #include <cstdlib>
 #ifdef _WIN32
 #include "exe_icon.h"
+#ifndef GOW3_NO_UPDATER
 #include "main/update.h"
+#endif
 #include <shellapi.h>
 #ifdef GOW3_RELEASE_TAG
 #include "present/window.h"
@@ -91,7 +93,9 @@ int main(int count, char** args) {
             if (result != WAIT_OBJECT_0 + 1) throw std::runtime_error(Gow3::HostError("Wait for previous game"));
         }
         if (!parent && !inspect && !validate_runtime) {
+#ifndef GOW3_NO_UPDATER
             Gow3::Update::RemoveRetiredUpdater(app);
+#endif
 #ifdef GOW3_RELEASE_TAG
             if (Gow3::Update::OfferAndInstall(app, game, GOW3_RELEASE_TAG)) return 0;
 #elif !defined(GOW3_RUNTIME_DLL)

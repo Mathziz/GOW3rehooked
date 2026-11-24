@@ -7,26 +7,37 @@ on:
         description: Build for Ivy Bridge CPUs such as the Core i5-3470
         type: boolean
         default: false
+      no_updater:
+        description: Build without the autoupdater (requires GOW3_ENABLE_NO_UPDATER=true)
+        type: boolean
+        default: false
   push:
     tags: ['v*']
 
 permissions:
   contents: read
 
+env:
+  ENABLE_NO_UPDATER: ${{ vars.GOW3_ENABLE_NO_UPDATER == 'true' && 'true' || 'false' }}
+
 concurrency:
-  group: build-${{ github.ref }}${{ inputs.ivy_bridge && '-ivybridge' || '' }}
+  group: build-${{ github.ref }}${{ github.ref_type != 'tag' && inputs.ivy_bridge && '-ivybridge' || '' }}${{ github.ref_type != 'tag' && inputs.no_updater && '-no-updater' || '' }}
   cancel-in-progress: true
 
 jobs:
   windows:
-    name: Windows x86_64${{ startsWith(github.ref, 'refs/tags/v') && ' and AVX1' || inputs.ivy_bridge && ' AVX1' || '' }} (O3)
+    name: Windows x86_64${{ startsWith(github.ref, 'refs/tags/v') && ' and AVX1' || inputs.ivy_bridge && ' AVX1' || '' }} (O3)${{ matrix.no_updater && ' without updater' || '' }}
+    if: startsWith(github.ref, 'refs/tags/v') || !inputs.no_updater || vars.GOW3_ENABLE_NO_UPDATER == 'true'
     runs-on: windows-2025
     timeout-minutes: 60
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        no_updater: ${{ fromJSON(vars.GOW3_ENABLE_NO_UPDATER == 'true' && (startsWith(github.ref, 'refs/tags/v') && '[false,true]' || inputs.no_updater && '[true]') || '[false]') }}
     env:
       BUILD_VARIANTS: ${{ startsWith(github.ref, 'refs/tags/v') && 'standard,ivybridge' || inputs.ivy_bridge && 'ivybridge' || 'standard' }}
-      CACHE_SUFFIX: ${{ inputs.ivy_bridge && '-ivybridge' || '' }}
+      PACKAGE_SUFFIX: ${{ matrix.no_updater && '-NoUpdater' || '' }}
+      CACHE_SUFFIX: ${{ inputs.ivy_bridge && '-ivybridge' || '' }}${{ matrix.no_updater && '-no-updater' || '' }}
       VCPKG_ROOT: ${{ github.workspace }}\build-fast\Windows\vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\build-fast\Windows\.cache\vcpkg-binaries
       SCCACHE_DIR: ${{ github.workspace }}\build-fast\Windows\.cache\sccache
@@ -104,11 +115,13 @@ jobs:
           Set-Content -LiteralPath CMakeLists.txt -Value $cmake
           foreach ($variant in ($env:BUILD_VARIANTS -split ',')) {
             $ivyBridge = $variant -eq 'ivybridge'
+            $noUpdater = $env:PACKAGE_SUFFIX -eq '-NoUpdater'
             $releaseArgs = @{}
             if ($env:GITHUB_REF_TYPE -eq 'tag') { $releaseArgs.ReleaseTag = $env:GITHUB_REF_NAME }
-            ./build-fast.ps1 @releaseArgs -Release -NoDeploy -IvyBridge:$ivyBridge
+            ./build-fast.ps1 @releaseArgs -Release -NoDeploy -IvyBridge:$ivyBridge -NoUpdater:$noUpdater
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $buildDir = if ($ivyBridge) { 'build-fast/Release-ivybridge' } else { 'build-fast/Release' }
+            if ($noUpdater) { $buildDir += '-no-updater' }
             $commands = Get-Content -LiteralPath "$buildDir/compile_commands.json" -Raw
             $buildRules = Get-Content -LiteralPath "$buildDir/build.ninja" -Raw
             if ($commands.Contains('-flto=thin') -or -not $commands.Contains('-flto=full') -or
@@ -163,21 +176,23 @@ jobs:
           # The shader variants of a full playthrough: the first AOT preparation starts with them.
           Copy-Item assets/shader_cache/recipes-hash2-aes.bin "$package/_rehooked_/shader_cache"
           Set-Content -LiteralPath "$package/licenses/THIRD-PARTY-NOTICES.txt" -Value $notices -Encoding utf8
+          $standIn = $env:GITHUB_REF_TYPE -eq 'tag' -and $env:PACKAGE_SUFFIX -ne '-NoUpdater'
           foreach ($variant in ($env:BUILD_VARIANTS -split ',')) {
             $binaries = if ($variant -eq 'ivybridge') { 'build/ivybridge' } else { 'build' }
             $suffix = if ($variant -eq 'ivybridge') { '-AVX1' } else { '' }
+            if ($env:PACKAGE_SUFFIX -eq '-NoUpdater') { $binaries += '/no-updater' }
             Copy-Item "$binaries/gow3.exe", "$binaries/gow3_debug.exe", "$binaries/gow3.dll" $package -Force
             # The stand-in for the updaters of v0.1.5 and v0.1.6, which refuse a release without gow3_update.exe.
-            if ($env:GITHUB_REF_TYPE -eq 'tag') { Copy-Item "$binaries/gow3_update.exe" $package -Force }
-            $zip = "build/GOW3rehooked-Windows-x86_64$suffix.zip"
+            if ($standIn) { Copy-Item "$binaries/gow3_update.exe" $package -Force }
+            $zip = "build/GOW3rehooked-Windows-x86_64$suffix$env:PACKAGE_SUFFIX.zip"
             Compress-Archive -Path "$package/*" -DestinationPath $zip -CompressionLevel Optimal
-            ./tools/release/check-windows-zip.ps1 -Zip $zip -Release:($env:GITHUB_REF_TYPE -eq 'tag')
+            ./tools/release/check-windows-zip.ps1 -Zip $zip -Release:$standIn
           }
       - name: Upload standard Windows ZIP
         if: contains(env.BUILD_VARIANTS, 'standard')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          path: build/GOW3rehooked-Windows-x86_64.zip
+          path: build/GOW3rehooked-Windows-x86_64${{ env.PACKAGE_SUFFIX }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 14
@@ -185,37 +200,10 @@ jobs:
         if: contains(env.BUILD_VARIANTS, 'ivybridge')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          path: build/GOW3rehooked-Windows-x86_64-AVX1.zip
+          path: build/GOW3rehooked-Windows-x86_64-AVX1${{ env.PACKAGE_SUFFIX }}.zip
           archive: false
           if-no-files-found: error
           retention-days: 14
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          $zips = @('build/GOW3rehooked-Windows-x86_64.zip', 'build/GOW3rehooked-Windows-x86_64-AVX1.zip')
-          $release = gh release view $env:RELEASE_TAG --json isDraft,assets 2>$null | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $env:RELEASE_TAG --verify-tag --draft --title "GOW3rehooked $env:RELEASE_TAG" --notes 'Windows x86_64 build. Extract the ZIP next to eboot.bin and run gow3.exe. Use gow3_debug.exe to enable diagnostics.'
-            if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
-            $release = [pscustomobject]@{ isDraft = $true; assets = @() }
-          }
-          if ($release.isDraft) {
-            gh release upload $env:RELEASE_TAG @zips --clobber
-            if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
-            gh release edit $env:RELEASE_TAG --draft=false
-            if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
-          } else {
-            $missing = @($zips | Where-Object { $release.assets.name -notcontains [IO.Path]::GetFileName($_) })
-            if ($missing.Count) {
-              gh release upload $env:RELEASE_TAG @missing
-              if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
-            }
-          }
       - name: Save compiler and dependency caches
         if: always() && steps.dependencies.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -227,6 +215,7 @@ jobs:
 
   linux:
     name: Linux x86_64 (${{ matrix.variant }})
+    if: startsWith(github.ref, 'refs/tags/v') || !inputs.no_updater || vars.GOW3_ENABLE_NO_UPDATER == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
@@ -240,6 +229,7 @@ jobs:
       CC: clang-18
       CXX: clang++-18
       VARIANT: ${{ matrix.variant }}
+      NO_UPDATER: ${{ inputs.no_updater && 'true' || 'false' }}
       SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -285,21 +275,35 @@ jobs:
           build=build-fast/Linux/Release
           zip=build/GOW3rehooked-Linux-x86_64
           if [[ "$VARIANT" == ivybridge ]]; then build+=-ivybridge; zip+=-AVX1; fi
-          zip+=.zip
           mkdir -p build
           tag=
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then tag=$GITHUB_REF_NAME; fi
-          bash ./tools/appimage/package.sh "$build/bin" "$zip" "$SOURCE_URL" "$tag"
-          printf 'file=%s\n' "$zip" >> "$GITHUB_OUTPUT"
+          if [[ -n "$tag" || "$NO_UPDATER" != true ]]; then
+            bash ./tools/appimage/package.sh "$build/bin" "$zip.zip" "$SOURCE_URL" "$tag"
+            printf 'file=%s.zip\n' "$zip" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$ENABLE_NO_UPDATER" == true && ( -n "$tag" || "$NO_UPDATER" == true ) ]]; then
+            # Omitting the tag keeps linuxdeploy's original AppRun.
+            bash ./tools/appimage/package.sh "$build/bin" "$zip-NoUpdater.zip" "$SOURCE_URL"
+            printf 'no_updater=%s-NoUpdater.zip\n' "$zip" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.package.outputs.file != ''
         with:
           path: ${{ steps.package.outputs.file }}
           archive: false
           if-no-files-found: error
           retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.package.outputs.no_updater != ''
+        with:
+          path: ${{ steps.package.outputs.no_updater }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
 
-  publish-linux:
-    name: Upload Linux ZIPs to the release
+  publish:
+    name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [windows, linux]
     runs-on: ubuntu-24.04
@@ -308,25 +312,43 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          pattern: GOW3rehooked-Linux-*.zip
+          pattern: GOW3rehooked-*.zip
           path: build
           merge-multiple: true
           skip-decompress: true
-      - name: Upload Linux release assets
+      - name: Upload release assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $zips = @('build/GOW3rehooked-Linux-x86_64.zip', 'build/GOW3rehooked-Linux-x86_64-AVX1.zip')
+          $zips = foreach ($platform in 'Windows', 'Linux') {
+            foreach ($cpu in '', '-AVX1') {
+              "build/GOW3rehooked-$platform-x86_64$cpu.zip"
+              if ($env:ENABLE_NO_UPDATER -eq 'true') { "build/GOW3rehooked-$platform-x86_64$cpu-NoUpdater.zip" }
+            }
+          }
           foreach ($zip in $zips) {
             if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) { throw "Missing release ZIP: $zip" }
           }
-          $release = gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed' }
-          $missing = @($zips | Where-Object { $release.assets.name -notcontains [IO.Path]::GetFileName($_) })
-          if ($missing.Count) {
-            gh release upload $env:RELEASE_TAG @missing
-            if ($LASTEXITCODE -ne 0) { throw 'Linux release ZIP upload failed' }
+          $release = gh release view $env:RELEASE_TAG --json isDraft,assets 2>$null | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            $notes = 'Windows and Linux x86_64 builds. Extract the ZIP next to eboot.bin.'
+            if ($env:ENABLE_NO_UPDATER -eq 'true') { $notes += ' Choose a NoUpdater ZIP for manual updates.' }
+            gh release create $env:RELEASE_TAG --verify-tag --draft --title "GOW3rehooked $env:RELEASE_TAG" --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
+            $release = [pscustomobject]@{ isDraft = $true; assets = @() }
+          }
+          if ($release.isDraft) {
+            gh release upload $env:RELEASE_TAG @zips --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
+            gh release edit $env:RELEASE_TAG --draft=false
+            if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
+          } else {
+            $missing = @($zips | Where-Object { $release.assets.name -notcontains [IO.Path]::GetFileName($_) })
+            if ($missing.Count) {
+              gh release upload $env:RELEASE_TAG @missing
+              if ($LASTEXITCODE -ne 0) { throw 'Release ZIP upload failed' }
+            }
           }

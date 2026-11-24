@@ -7,6 +7,7 @@ param(
     [switch]$ConfigureOnly,
     [switch]$NoDeploy,
     [switch]$IvyBridge,
+    [switch]$NoUpdater,
     [ValidatePattern('^v[0-9][0-9A-Za-z.-]*$')][string]$ReleaseTag
 )
 Set-StrictMode -Version Latest
@@ -14,6 +15,7 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $BuildType = if ($Release) { 'Release' } else { 'RelWithDebInfo' }
 $BuildSuffix = if ($IvyBridge) { '-ivybridge' } else { '' }
+if ($NoUpdater) { $BuildSuffix += '-no-updater' }
 $BuildDirectory = Join-Path $Root "build-fast\$BuildType$BuildSuffix"
 $GameDirectory = $env:GOW3_GAME_DIR  # the binaries are also copied there when set
 $SdkDirectory = $env:GOW3_SDK_DIR    # EWDK, VulkanSDK, vcpkg and sccache-cache, when set
@@ -26,7 +28,7 @@ if ($Release -or $ReleaseTag) {
 # Release ZIPs carry a stand-in gow3_update.exe for the updaters of v0.1.5 and v0.1.6. The game folder gets none: the
 # runtime would delete it on its next start.
 $StandIn = 'gow3_update.exe'
-if ($ReleaseTag) {
+if ($ReleaseTag -and -not $NoUpdater) {
     $Names += $StandIn
     $Targets += 'gow3_update'
 }
@@ -145,7 +147,7 @@ try {
     $compiler = Join-Path $env:LLVM_ROOT 'bin\clang-cl.exe'
     $configure = @('-S', $Root, '-B', $BuildDirectory, '-G', 'Ninja',
         "-DCMAKE_BUILD_TYPE=$BuildType", "-DCMAKE_C_COMPILER=$compiler", "-DCMAKE_CXX_COMPILER=$compiler",
-        "-DGOW3_RELEASE_TAG=$ReleaseTag", "-DGOW3_IVY_BRIDGE=$($IvyBridge.IsPresent)",
+        "-DGOW3_RELEASE_TAG=$ReleaseTag", "-DGOW3_IVY_BRIDGE=$($IvyBridge.IsPresent)", "-DGOW3_NO_UPDATER=$($NoUpdater.IsPresent)",
         "-DCMAKE_LINKER=$(Join-Path $env:LLVM_ROOT 'bin\lld-link.exe')",
         "-DCMAKE_PREFIX_PATH=$shadercRoot",
         "-DCMAKE_AR=$(Join-Path $env:LLVM_ROOT 'bin\llvm-lib.exe')",
@@ -163,6 +165,7 @@ try {
     & cmake --build $BuildDirectory --parallel $Jobs --target $Targets -- -k 0
     Assert-Exit 'Incremental build'
     $output = Join-Path $Root $(if ($IvyBridge) { 'build\ivybridge' } else { 'build' })
+    if ($NoUpdater) { $output = Join-Path $output 'no-updater' }
     New-Item -ItemType Directory -Path $output -Force | Out-Null
     Publish-Binaries (Join-Path $BuildDirectory 'bin') $output $Names
     if (-not $NoDeploy -and $GameDirectory) { Publish-Binaries $output $GameDirectory ($Names -ne $StandIn) }
