@@ -29,11 +29,12 @@ enum class CacheKind { Jit, Aot };
 
 // Content version of each cache file: bump it when a change makes the SPIR-V (or driver binary) stored for a key stale -
 // the translator's output, the shader layouts, the key (the AOT's also for its order). A file of another version is discarded
-// (and rewritten) when the game starts; the recipes are kept apart. 1: the first public release.
+// (and rewritten) when the game starts; the recipes are kept apart. 1: the first public release. 4: the pipeline paths' release
+// (every cache rebuilt once, in step with kAotPipelineVersion) with SGPR spills kept per invocation.
 // kAotPipelineVersion: the pipelines the AOT derives from the game's files (shader_contract.cpp's pipeline rules). Bumping it
 // derives them again and keeps every cache: the driver judges its own pipeline cache. 2: material permutation rules. 3: gated
-// on the recipes and the scene's sample count when built (the kept list holds neither).
-inline constexpr std::uint32_t kJitCacheVersion = 1, kAotCacheVersion = 1, kAotPipelineVersion = 3;
+// on the recipes and the scene's sample count when built (the kept list holds neither). 4: pruned shader contract (exact sample_log2).
+inline constexpr std::uint32_t kJitCacheVersion = 4, kAotCacheVersion = 4, kAotPipelineVersion = 4;
 
 struct CachedShader {
     std::uint32_t stage = 0;

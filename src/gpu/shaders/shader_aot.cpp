@@ -45,13 +45,13 @@ struct Kept {
     u64 key, code_start, fetch_start;
     u32 file, paths, code_size, fetch_size;  // file: the parser's files
 };
-constexpr u32 kKeptMagic = 0x43433347, kKeptFormat = 1;  // "G3CC"; kKeptFormat: the layout below and the variant rules
+constexpr u32 kKeptMagic = 0x43433347, kKeptFormat = 2;  // "G3CC"; kKeptFormat: the layout below and the variant rules
 struct KeptHead { u32 magic, format; u64 stamp; u32 count, reserved; };
 struct KeptFixed { RecipeHead h; u64 key, code_start, fetch_start; u32 file, paths, code_size, fetch_size, fetch_words, reserved; };
 
-// The scene's sample count as the contract sees it: its multisampled views are the same at x1 and x2 (one sample class), the
-// pipelines leave it 0. A switch between x1 and x2 keeps the contract.
-u32 SampleClass() { return std::max(Aot::sample_log2, 1u); }
+// The scene's sample count as the contract sees it: x1 uses single-sampled views, x2/x4 multisampled ones, and the
+// pipelines leave it 0. Switching between x1 and x2/x4 rebuilds the contract for the active sample count.
+u32 SampleClass() { return Aot::sample_log2; }
 
 // `version`: of the rules the kept list comes from (kKeptFormat, kAotPipelineVersion); its keys follow kAotCacheVersion.
 u64 KeptStamp(u64 files_stamp, bool no_storage_read_nofmt, u32 version) {

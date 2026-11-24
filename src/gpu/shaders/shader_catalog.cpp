@@ -371,13 +371,12 @@ Data Read(const std::filesystem::path& game, u32 threads, u32 sample_log2) {
         const auto& resource = resources[resources[id].alias];
         const bool depth = id == 20, refraction = id == 6;
         const std::optional<u32> type = refraction ? std::optional<u32>(9) : resource.configured ? std::nullopt : std::optional<u32>(resource.sample_log2 ? 14 : 9);
-        add_view(name, depth ? 0x204704u : refraction ? 0xf2e00au : resource.sampled, type, {8, 8, 1}, !depth && (refraction || resource.degamma),
-                 id == 8, id == 8 ? "packet_flags & 0x100" : "context semantic enabled");
+        add_view(name, depth ? 0x204704u : refraction ? 0xf2e00au : resource.sampled, type, {8, 8, 1}, !depth && (refraction || resource.degamma), id == 8, "");
         if (type == 14) data.views.back().image.sample_log2 = u8(resource.sample_log2);
     }
     data.depth_view = data.views[1].image;
     add_view("FogTextureSampler", 0x97770c, 10, {64, 32, 16}, false, false, "fog_mode == 1");
-    add_view("SpatialLightingSampler", 0xfac00a, 11, {8, 8, 1}, false, false, "PS3_RF_PixelLightProbes != 0");
+    add_view("SpatialLightingSampler", 0xfac00a, 11, {8, 8, 1}, false, false, "");
 
     std::vector<std::filesystem::path> paths;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(game / "EXEC" / "WAD"))

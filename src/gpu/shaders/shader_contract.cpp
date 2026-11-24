@@ -168,15 +168,6 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
     const auto msaa_type = [&](Job& job, u32 msaa, u32 kind) {
         for (auto& [slot, image] : job.images) if (msaa >> slot & 1) { image.type = u8(kind); image.sample_log2 = u8(kind == 14 ? std::max(sample_log2, 1u) : 0); }
     };
-    // Generic semantics may hold the MSAA scene color through an sRGB T#: every non-empty subset of those slots is a variant.
-    const auto srgb = [](const Job& job, u32 slots, const auto& emit) {
-        for (u32 mask = slots; mask; mask = (mask - 1) & slots) {
-            Job variant = job;
-            variant.path = kPsSrgb;
-            for (auto& [slot, image] : variant.images) if (mask >> slot & 1) image.num_format = 9;
-            emit(variant);
-        }
-    };
     const auto pixel_variants = [&](const Job& job, u32 msaa, std::optional<u32> exact, u32 generic = 0) {
         if (exact) {
             // Flipbook layers (several textures on one semantic) are sampled without their degamma flag: those subsets made 84%
@@ -189,14 +180,13 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         }
         const auto emit = [&](Job shared) { shared.mrt_map = 0xC6, add(shared); };
         for (const u32 kind : {9u, 14u}) {
-            if (kind == 14 && !msaa) break;
+            if (kind == 14 && (!sample_log2 || !msaa)) break;
             Job shared = job;
             msaa_type(shared, msaa, kind);
             emit(shared);
-            if (kind == 14) srgb(shared, generic, emit);
         }
         // Generic slots may hold plain material textures while the MSAA views switch.
-        if (const u32 views = msaa & ~generic; views && generic) { Job shared = job; msaa_type(shared, views, 14); emit(shared); }
+        if (const u32 views = msaa & ~generic; sample_log2 && views && generic) { Job shared = job; msaa_type(shared, views, 14); emit(shared); }
     };
     // Without vertex semantics the program builds a screen rectangle: the pass draws a RectList with clipping disabled.
     const auto vertex_variants = [&](Job job, u8 path) {
@@ -225,7 +215,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
     // Pass views win for pass semantics; otherwise the material's texture, or nothing when no material is known.
     const auto pixel_jobs = [&](const Mapping& f, const CatRecipe& recipe, u32 source, const std::map<u32, CatImage>* material, u32 pair_id) {
         std::optional<u32> exact;
-        if (material) exact = (recipe.permutation == ~u64{} ? 0 : u32(recipe.permutation)) & 2 ? 14u : 9u;
+        if (material) exact = sample_log2 && ((recipe.permutation == ~u64{} ? 0 : u32(recipe.permutation)) & 2) ? 14u : 9u;
         Job job = Base(f, *recipe.ps, source, HeaderBytes(f, *recipe.vs));
         job.path = material ? kPsMaterial : kPsPass;
         job.pair_id = pair_id;
@@ -247,10 +237,11 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
             job.samplers |= bit;
             job.degamma |= image.degamma ? bit : 0, job.unnormalized |= image.unnormalized ? bit : 0;
         }
-        // Each distinct pass-view condition may be off, leaving the engine's default 2D image on its slots.
+        // Only job-flag material permutations (bit 2: 0x4/0x6) ever sample a conditional pass view (FogTextureSampler) off.
         std::map<std::string, u32> conditions;
-        for (const auto& binding : recipe.textures)
-            if (const auto* view = view_of(binding.source); view && !view->condition.empty() && Find(job, binding.slot)) conditions[view->condition] |= 1u << binding.slot;
+        if (material && recipe.permutation != ~u64{} && (recipe.permutation & 4))
+            for (const auto& binding : recipe.textures)
+                if (const auto* view = view_of(binding.source); view && !view->condition.empty() && Find(job, binding.slot)) conditions[view->condition] |= 1u << binding.slot;
         std::vector<u32> groups;
         groups.reserve(conditions.size());
         for (const auto& [_, group] : conditions) groups.push_back(group);
@@ -282,7 +273,18 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         const Mapping& f = *file.map;
         const auto& recipes = file.recipes;
         std::unordered_map<u32, std::vector<size_t>> families;
-        for (size_t i = 0; i < recipes.size(); ++i) families[recipes[i].shader_key].push_back(i);
+        std::unordered_map<u32, u8> family_perms;  // bit 0: has perm 0, bit 1: has perm 2
+        for (size_t i = 0; i < recipes.size(); ++i) {
+            families[recipes[i].shader_key].push_back(i);
+            if (recipes[i].permutation == 0) family_perms[recipes[i].shader_key] |= 1;
+            else if (recipes[i].permutation == 2) family_perms[recipes[i].shader_key] |= 2;
+        }
+        // Material draws select bit 1 (dynamic shadow) and bit 2 (render job flag): odd permutations are never chosen, and
+        // the base fallback (~0) is unused once both 0 and 2 exist in the family.
+        const auto skip_material_perm = [&](const CatRecipe& r) {
+            const u64 p = r.permutation;
+            return p == ~u64{} ? (family_perms[r.shader_key] & 3) == 3 : (p & 1) != 0;
+        };
         std::unordered_set<u32> material_keys;
         for (const auto& material : file.materials) if (!material.pass_supplies_shader) for (const auto& layer : material.layers) material_keys.insert(layer.shader_key);
         const u32 pair_base = u32(pair_metas.size());
@@ -296,12 +298,8 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 for (const auto& layer : material.layers)
                     if (auto& list = classes[layer.shader_key]; std::ranges::find(list, c) == list.end()) list.push_back(c);
             }
-            // A material draw picks its technique's permutation from selector 0x23 (bit 1: the part receives a dynamic shadow,
-            // set by s_shadowJobList) and 0x49 (bit 2: a flag of the render job); bit 0 is never set, and a permutation the
-            // family lacks falls back to its base recipe (~0). Shadow receivers and those fallbacks follow the scene at run
-            // time: their pipelines are gated on the PS program, built once the recipes met its code.
-            std::unordered_set<u32> plain;  // families with permutation 0
-            for (const auto& r : recipes) if (r.permutation == 0) plain.insert(r.shader_key);
+            // Shadow receivers and fallbacks of families with permutation 0 follow the scene at run time: their pipelines
+            // are gated on the PS program, built once the recipes met its code.
             pair_metas.reserve(pair_base + recipes.size());
             for (const auto& r : recipes) {
                 PairMeta& m = pair_metas.emplace_back(PairMeta{index_file, classes[r.shader_key]});
@@ -309,9 +307,9 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                 if (r.ps && r.ps->code <= r.ps->footer && r.ps->footer <= f.size)
                     m.code = ::Gpu::PieceHash::ShaderCode(f.data + r.ps->code, r.ps->footer - r.ps->code);
                 const u64 p = r.permutation;
-                const bool follows_scene = p == ~u64{} ? plain.contains(r.shader_key) : (p & 2) != 0;
+                const bool follows_scene = p == ~u64{} ? (family_perms[r.shader_key] & 1) != 0 : (p & 2) != 0;
                 m.gate = follows_scene ? m.code : 0;
-                m.derive = (p == ~u64{} || !(p & 1)) && !(follows_scene && r.ps && !m.code);  // an unreadable program is never met
+                m.derive = !skip_material_perm(r) && !(follows_scene && r.ps && !m.code);  // an unreadable program is never met
             }
         }
         // Model meshes: the mesh streams bind for every layer recipe of the material.
@@ -322,7 +320,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
             const auto& material = file.materials.at(edge.material);
             for (const auto& layer : material.layers) for (const size_t index : families[layer.shader_key]) {
                 const auto& recipe = recipes[index];
-                if (!recipe.vs) continue;
+                if (!recipe.vs || (!material.pass_supplies_shader && skip_material_perm(recipe))) continue;
                 reached.insert(index);
                 if (!meshes_seen.emplace(index, presence(recipe, streams) | u64(material.flags & 0x40) << 32).second) continue;
                 const auto job = vertex_job(f, recipe, index_file, &streams, pipelines_out ? pair_base + u32(index) : ~0u);
@@ -352,7 +350,7 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
                         images[semantic] = image;
                     }
                     for (const size_t index : families[layer.shader_key])
-                        if (const auto& recipe = recipes[index]; recipe.ps && recipe.vs)
+                        if (const auto& recipe = recipes[index]; recipe.ps && recipe.vs && !skip_material_perm(recipe))
                             pixel_jobs(f, recipe, index_file, &images, pipelines_out ? pair_base + u32(index) : ~0u);
                 }
             } catch (const std::exception& error) { setup_failed(error); }
@@ -360,17 +358,19 @@ void Renderer::Impl::Contracts(const Catalog::Data& data, std::vector<Contracted
         for (size_t index = 0; index < recipes.size(); ++index) try {
             const auto& recipe = recipes[index];
             const u32 pid = pipelines_out ? pair_base + u32(index) : ~0u;
+            const bool pass_only = !material_keys.contains(recipe.shader_key);
             // Procedural recipes (pass code binds the streams): the recipe's own declaration, and each stream set the meshes
-            // supply. Other component counts pass code may pick at run time come from the recipes.
-            if (recipe.vs && !reached.contains(index)) {
+            // supply (pass-only techniques only: material VS not bound to a mesh in this WAD use their own declaration).
+            if (recipe.vs && !reached.contains(index) && (pass_only || !skip_material_perm(recipe))) {
                 const auto job = vertex_job(f, recipe, index_file, nullptr, pid);
                 vertex_variants(job, kVsProcedural);
-                std::set<u32> masks;
-                for (const auto& streams : layouts)
-                    if (masks.insert(presence(recipe, streams)).second) vertex_variants(vertex_job(f, recipe, index_file, &streams, pid), kVsLayout);
-                // Pass code may also widen several streams to four components at once (e.g. xyz1 -> xyzw).
+                if (pass_only) {
+                    std::set<u32> masks;
+                    for (const auto& streams : layouts)
+                        if (masks.insert(presence(recipe, streams)).second) vertex_variants(vertex_job(f, recipe, index_file, &streams, pid), kVsLayout);
+                }
             }
-            if (recipe.ps && recipe.vs && !material_keys.contains(recipe.shader_key)) pixel_jobs(f, recipe, index_file, nullptr, pid);
+            if (recipe.ps && recipe.vs && pass_only) pixel_jobs(f, recipe, index_file, nullptr, pid);
         } catch (const std::exception& error) { setup_failed(error); }
     }
     const Mapping& eboot = *data.eboot;
