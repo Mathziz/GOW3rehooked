@@ -556,13 +556,17 @@ void Renderer::Impl::LoadDeviceFunctions() {
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
     vkGetPhysicalDeviceProperties2(pd, &props);
     const bool integrated = props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-    uma_budget = integrated && HasExtension(available, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    const bool has_budget = HasExtension(available, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    uma_budget = integrated && has_budget;
     uma_single_heap = integrated && mem.memoryHeapCount == 1 &&
                       Type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != ~0u;
     direct_tables = uma_single_heap;
     u64 total_heap = 0;
     for (u32 i = 0; i < mem.memoryHeapCount; ++i) total_heap += mem.memoryHeaps[i].size;
-    compact_memory = integrated && total_heap <= (6ull << 30);
+    const u32 local_type = Type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const u32 vram_heap = local_type != ~0u ? mem.memoryTypes[local_type].heapIndex : 0;
+    if (has_budget) budget_heaps = integrated ? (1u << mem.memoryHeapCount) - 1 : 1u << vram_heap;
+    compact_memory = integrated ? total_heap <= (6ull << 30) : mem.memoryHeaps[vram_heap].size <= (4ull << 30);
     if (compact_memory) {
         chunk_size = chunk_used = 64ull << 20;
         image_block_size = 64ull << 20;
@@ -678,9 +682,9 @@ void Renderer::Impl::TempDeviceReport(std::span<const VkQueueFamilyProperties> f
     Report(std::format("Subgroup: size {} (from {} to {}) stages {:x} sized stages {:x} operations {:x} quad in all stages {}", p11.subgroupSize, p13.minSubgroupSize,
                        p13.maxSubgroupSize, (u32)p11.subgroupSupportedStages, (u32)p13.requiredSubgroupSizeStages, (u32)p11.subgroupSupportedOperations,
                        p11.subgroupQuadOperationsInAllStages));
-    Report(std::format("Sparse: binding {} residency buffer {} aliased {} non-resident strict {}; mirror page {:x} memory types {:x}, integrated with budget {}, single_heap {}, stage_dev {}, direct_tables {}, compact {} [chunk {} MB, img {} MB x{}, table {} MB, scratch {} MB, temp {} MB, stage {} MB], image copies through a temp buffer {}",
+    Report(std::format("Sparse: binding {} residency buffer {} aliased {} non-resident strict {}; mirror page {:x} memory types {:x}, integrated with budget {}, budget heaps {:x}, single_heap {}, stage_dev {}, direct_tables {}, compact {} [chunk {} MB, img {} MB x{}, table {} MB, scratch {} MB, temp {} MB, stage {} MB], image copies through a temp buffer {}",
                        f.sparseBinding, f.sparseResidencyBuffer, f.sparseResidencyAliased, p.sparseProperties.residencyNonResidentStrict, page, mirror_bits, uma_budget,
-                       uma_single_heap, use_stage_dev, direct_tables, compact_memory, chunk_size >> 20, image_block_size >> 20, image_reserve_blocks,
+                       budget_heaps, uma_single_heap, use_stage_dev, direct_tables, compact_memory, chunk_size >> 20, image_block_size >> 20, image_reserve_blocks,
                        table_bytes >> 20, scratch_reserve >> 20, temp_chunk_size >> 20, stage_chunk_size >> 20, image_copy_via_temp));
     std::string s;
     for (u32 i = 0; i < fp.size(); ++i)

@@ -1863,7 +1863,8 @@ void Renderer::Impl::EvictTextures(u32 age) {
 }
 
 void Renderer::Impl::CompactImageBlocks() {
-    if (!uma_single_heap && !uma_budget) return;  // integrated GPUs: its Retire costs a frame's overlap, and a discrete GPU's idle blocks take no system RAM
+    // Integrated GPUs, or a discrete one at its VRAM budget: its Retire costs a frame's overlap, and otherwise a discrete GPU's idle blocks take no system RAM.
+    if (!uma_single_heap && !uma_budget && !budget_pressure) return;
     constexpr u64 kBudget = 32ull << 20;  // texture bytes moved per call
     const auto idle = [](const ImageBlock& b) { VkDeviceSize n = 0; for (auto& [lo, s] : b.free) n += s; return n; };
     const auto candidate = [&](const ImageBlock& b) { const VkDeviceSize used = image_block_size - idle(b); return !b.lasting && !b.draining && used > 0 && used <= image_block_size / 4; };

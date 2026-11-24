@@ -42,16 +42,16 @@ u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size) {
 }
 
 // Frames a texture may go unused before an early eviction (0: no memory pressure): 4 after an allocation failed, 16 while
-// every heap of an integrated GPU is within an eighth of its budget (DeviceType's margin; looked up every 16 frames).
+// every watched heap (budget_heaps) is within an eighth of its budget (DeviceType's margin; looked up every 16 frames).
 u32 Renderer::Impl::PressureAge() {
     u32 age = alloc_pressure.exchange(false, std::memory_order_relaxed) ? 4 : 0;
-    if (uma_budget && frame % 16 == 0) {
+    if (budget_heaps && frame % 16 == 0) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
         vkGetPhysicalDeviceMemoryProperties2(pd, &query);
         budget_pressure = true;
         for (u32 h = 0; h < mem.memoryHeapCount; ++h)
-            if (budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]) budget_pressure = false;  // DeviceType spills there
+            if (budget_heaps >> h & 1 && budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]) budget_pressure = false;
     }
     if (!age && budget_pressure && frame % 16 == 0) age = 16;
     static bool logged = false;  // the Submit thread's alone
