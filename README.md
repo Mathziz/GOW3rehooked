@@ -36,9 +36,7 @@ The standard build requires an x86-64-v3 CPU (including AVX2, BMI1/2, FMA, F16C,
 
 The experimental AVX1 build may work on some CPUs older than 4th-generation Intel Core or AMD Ryzen 1000. The same GPU requirements apply. Feel free to [report any issues](#reporting-bugs).
 
-The renderer requires Vulkan 1.3 with depth clip control, push descriptors, conditional rendering, sparse buffer residency and min/max sampler filtering, and uses shader objects where the driver has them. Experimental fallbacks support older GPUs without them (AMD Vega/Polaris, Intel UHD Graphics; Arc/Xe untested, but should also work). Please update to the latest drivers. On Linux, Radeon also needs `VK_KHR_maintenance5`. Windows capability reports are available for the [Radeon RX 5300](https://vulkan.gpuinfo.org/displayreport.php?id=53293), [Radeon RX 5500 XT](https://vulkan.gpuinfo.org/displayreport.php?id=45797) and [GeForce GTX 950](https://vulkan.gpuinfo.org/displayreport.php?id=47069).
-
-The game has to be in a folder that contains `eboot.bin`, `sce_module` and `sce_sys`. A game that is still packaged in a single file has to be extracted first. Only version 1.02 works, because GOW3rehooked modifies the game at exact locations of that version's executable.
+The renderer requires Vulkan 1.3 with depth clip control, push descriptors, conditional rendering, sparse buffer residency and min/max sampler filtering, and uses shader objects where the driver has them. Experimental fallbacks support older GPUs without them (AMD Vega/Polaris, Intel UHD Graphics; Arc/Xe untested, but should also work). Please update to the latest drivers. On Linux, Radeon also needs `VK_KHR_maintenance5`.
 
 ## Installation
 
@@ -65,9 +63,7 @@ Only use the AVX1 build if your CPU doesn't meet the requirements for the standa
 3. Run `gow3.exe`. The first few launches may show the [shader preparation screen](#shaders-prepared-in-advance).
 4. Choose your settings under Rehooked in the title menu.
 
-Windows releases check for updates at startup. Choose **Yes** to install the same CPU variant and reopen the game, or **No** to skip that release. To see the offer again, delete `_rehooked_/settings/skipped-release.txt`. Updates keep your existing `gow3.exe` and `gow3_debug.exe` and replace the runtime they start. The previous runtime is saved as `gow3.update.old`. Release ZIPs also contain a `gow3_update.exe`, which lets v0.1.5 and v0.1.6 install them; the game deletes it when it starts.
-
-When installing another Windows build manually over one that already has `gow3.dll`, keep the two existing launchers and extract the new runtime and the other files.
+Windows releases check for updates at startup. Choose **Yes** to install the same CPU variant and reopen the game, or **No** to skip that release. To see the offer again, delete `_rehooked_/settings/skipped-release.txt`.
 
 ### Linux
 
@@ -80,6 +76,8 @@ On startup, release AppImages offer to install the latest version for your CPU v
 If your extractor dropped the executable bits, run `chmod +x gow3*.AppImage`. On systems without FUSE, run `APPIMAGE_EXTRACT_AND_RUN=1 ./gow3.AppImage`. For [diagnostics](#reporting-bugs), use `./gow3_debug.AppImage` with the same prefix if needed.
 
 For a source build, use Clang and LLD, a C++23 standard library such as libstdc++ 14, CMake, Ninja, NASM, Vulkan headers 1.4.328 or newer, `glslc`, shaderc, glslang, SPIRV-Tools, and libunwind. The [workflow](.github/workflows/windows.yml) lists the Ubuntu 24.04 packages. Run `bash build-fast.sh --release`, then `build-fast/Linux/Release/bin/gow3 --game-dir /path/to/game`. Add `--ivy-bridge` to build for AVX1.
+
+### Important files
 
 The game stores its settings, saves and diagnostics in `_rehooked_`:
 
@@ -158,9 +156,26 @@ The added screens show PlayStation symbols for a DualShock 3, DualShock 4 or Dua
 
 Every cheat and patch is off by default.
 
+Thanks to the people involved in developing, researching and porting these cheats and patches: **SpartanPort**, **Celogamez** and **erickmendes22**.
+
+<table>
+  <tr>
+    <td width="33%"><img src="assets/screenshots/controls.png" alt="Controls tab with Xbox-style gamepad prompts and keyboard and mouse bindings"></td>
+    <td width="33%"><img src="assets/screenshots/cheats-patches.png" alt="Cheats & Patches tab with controller vibration, cheats and visual patches"></td>
+    <td width="33%"><img src="assets/screenshots/help.png" alt="Help tab explaining the Resolution setting"></td>
+  </tr>
+  <tr>
+    <td align="center">Controls</td>
+    <td align="center">Cheats &amp; Patches</td>
+    <td align="center">Help</td>
+  </tr>
+</table>
+
 ### Menus and saves
 
 Continue appears above New Game once you have a save and directly loads the latest. The game originally has 32 manual save slots. GOW3rehooked raises that to 64. The save and load screens let you duplicate or delete saves. Open Save Folder opens the selected save in your file manager.
+
+On first launch, GOW3rehooked offers to import existing saves from **shadPS4** or **SpartanPort**. It looks in the usual locations automatically and lets you pick a folder if none are found. Existing saves are never overwritten; to see the import prompt again later, delete `_rehooked_/settings/saves.flag`.
 
 Rehooked holds every setting in the game's own menu style, feel free to tinker. [Controls and Extras](#controls-and-extras) explains each setting, remaps the controls and holds the cheats and patches.
 
@@ -174,14 +189,6 @@ The opening logos can be skipped, and so can any video or cutscene, by pressing 
   <tr>
     <td align="center">Load Game</td>
     <td align="center">Save Game</td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="assets/screenshots/controls.png" alt="Controls screen with Xbox-style gamepad prompts and keyboard and mouse bindings"></td>
-    <td width="50%"><img src="assets/screenshots/help.png" alt="Help screen explaining the Resolution setting"></td>
-  </tr>
-  <tr>
-    <td align="center">Controls</td>
-    <td align="center">Help</td>
   </tr>
 </table>
 
