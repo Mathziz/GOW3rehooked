@@ -28,12 +28,12 @@ int main(int count, char** args) {
 #ifdef _WIN32
     HANDLE parent{}, cancel{}, ready{};
     constexpr auto inspect_option = L"--inspect", validate_option = L"--validate-runtime", game_dir_option = L"--game-dir",
-                   debug_option = L"--debug";
-    constexpr auto usage = "Usage: gow3.exe [--inspect | --validate-runtime] [--debug] [--game-dir <directory>]";
+                   debug_option = L"--debug", deep_debug_option = L"--debug=2";
+    constexpr auto usage = "Usage: gow3.exe [--inspect | --validate-runtime] [--debug | --debug=2] [--game-dir <directory>]";
 #else
     constexpr auto inspect_option = "--inspect", validate_option = "--validate-runtime", game_dir_option = "--game-dir",
-                   debug_option = "--debug";
-    constexpr auto usage = "Usage: gow3 [--inspect | --validate-runtime] [--debug] [--game-dir <directory>]";
+                   debug_option = "--debug", deep_debug_option = "--debug=2";
+    constexpr auto usage = "Usage: gow3 [--inspect | --validate-runtime] [--debug | --debug=2] [--game-dir <directory>]";
 #endif
     try {
         const auto app = Gow3::ExecutableDirectory();
@@ -61,7 +61,7 @@ int main(int count, char** args) {
             if (arg == inspect_option) inspect = true;
             else if (arg == validate_option) validate_runtime = true;
             else if (arg == game_dir_option && i + 1 < count) game = args[++i];
-            else if (arg == debug_option) {} // read before main (DebugMode)
+            else if (arg == debug_option || arg == deep_debug_option) {} // read before main (DebugMode)
 #ifdef _WIN32
             else if (arg == L"--restart-after" && i + 3 < count) {
                 HANDLE* handles[]{&parent, &cancel, &ready};

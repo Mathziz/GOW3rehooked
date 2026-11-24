@@ -8,15 +8,15 @@
 
 // Diagnostics. GOW3_DEBUG=1 (or --debug) turns on, by itself, every diagnostic that keeps the game playable: the log,
 // timers, GPU timestamps, frame recorder, render probe, long-frame probe, fault diagnostics, labels and video trace (DebugAuto;
-// NAME=0 turns one off). GOW3_DEBUG=2 or NAME=1 turns on the deep/heavy ones (DebugDeep: texture dumping in F9, Khronos
+// NAME=0 turns one off). GOW3_DEBUG=2 (or --debug=2) or NAME=1 turns on the deep/heavy ones (DebugDeep: texture dumping in F9, Khronos
 // validation, exploded vertices (BOOM), light log, shadow trace, NVIDIA diagnostics config (TEMP_FAULT=1), S4, TEMP_STATS,
 // GPU_PROF, DRAWLOG, BARSITES, COPYLOG). Other
 // parameterized options (TRACE_EVERY, DUMP_STOP, the probes and the experiments) remain opt-in via DebugOption. The variable is
 // read once, before main, and is constant afterwards. Without it no other GOW3_* diagnostic variable is even read, and each
 // diagnostic costs the one predicted branch of GOW3_DIAG (or of DebugEnabled()).
 namespace Gow3 {
-// True when the command line has --debug (main/host.cpp).
-bool DebugArgument();
+// The level the command line asks for: '1' for --debug, '2' for --debug=2, '\0' without either (main/host.cpp).
+char DebugArgument();
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations" // the values are only read, never kept across changes
 inline char DebugMode() {
@@ -25,7 +25,8 @@ inline char DebugMode() {
         return '1'; // tools/framecap: the offline harness always runs the diagnostics
 #else
         const char* set = std::getenv("GOW3_DEBUG");
-        return set && (*set == '1' || *set == '2') && !set[1] ? *set : DebugArgument() ? '1' : '\0';
+        const char variable = set && (*set == '1' || *set == '2') && !set[1] ? *set : '\0', argument = DebugArgument();
+        return variable > argument ? variable : argument;
 #endif
     }();
     return mode;

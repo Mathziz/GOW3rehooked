@@ -120,7 +120,7 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
         const auto app = PreparePortDirectory(game);
         log_path = app / "gow3.log";
         if (DebugEnabled()) FlushLog(log_path); // debug lines are written through from here on
-        if (DebugEnabled()) Log("GOW3 Orbis runtime initialization; debug mode");
+        if (DebugEnabled()) Log(std::format("GOW3 Orbis runtime initialization; debug mode {}", DebugLevel()));
 #ifdef _WIN32
         Common::NtApi::Initialize();
 #endif

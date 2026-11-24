@@ -338,7 +338,7 @@ void Restart(const fs::path& app, const fs::path& game) {
     const auto exe = app / L"gow3.exe";
     // A trailing dot keeps a directory's final backslash away from the closing quote.
     std::wstring command = L"gow3.exe --game-dir \"" + (fs::absolute(game) / L".").native() + L"\"";
-    if (DebugEnabled()) command += L" --debug"; // a gow3_debug.cmd run restarts as one
+    if (DebugEnabled()) command += DebugLevel() == 2 ? L" --debug=2" : L" --debug"; // a debug run restarts as one
     STARTUPINFOW startup{sizeof(startup)};
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process))

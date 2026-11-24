@@ -33,18 +33,22 @@ auto debug_file = invalid_file; // debug: opened by the first FlushLog(), then L
 std::string debug_line;
 }
 
-bool DebugArgument() {
-    bool found = false;
+char DebugArgument() {
+    char level = '\0';
 #ifdef _WIN32
     int count{};
     const auto args = CommandLineToArgvW(GetCommandLineW(), &count);
-    for (int i = 1; args && i < count && !found; ++i) found = std::wstring_view(args[i]) == L"--debug";
+    for (int i = 1; args && i < count; ++i) {
+        const std::wstring_view arg(args[i]);
+        level = std::max(level, arg == L"--debug=2" ? '2' : arg == L"--debug" ? '1' : '\0');
+    }
     LocalFree(args);
 #else
     std::ifstream file("/proc/self/cmdline", std::ios::binary);
-    for (std::string arg; !found && std::getline(file, arg, '\0');) found = arg == "--debug";
+    for (std::string arg; std::getline(file, arg, '\0');)
+        level = std::max(level, arg == "--debug=2" ? '2' : arg == "--debug" ? '1' : '\0');
 #endif
-    return found;
+    return level;
 }
 
 std::filesystem::path ExecutableDirectory() {
