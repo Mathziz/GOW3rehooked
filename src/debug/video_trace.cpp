@@ -11,7 +11,7 @@
 namespace Gow3::VideoTrace {
 namespace {
 constexpr size_t capacity = 1 << 16;
-template <class T> std::unique_ptr<T[]> Buffer(size_t n) { return enabled ? std::make_unique<T[]>(n) : nullptr; }
+template <class T> std::unique_ptr<T[]> Buffer(size_t n) { return Enabled() ? std::make_unique<T[]>(n) : nullptr; }
 struct EventRing {
     std::unique_ptr<Event[]> data = Buffer<Event>(capacity);
     std::atomic<u64> count{};
@@ -32,7 +32,7 @@ std::atomic<u64> flow_count{};
 void Add(Ring ring, Event event) { rings[ring].Add(event); }
 
 void Write() {
-    if (!enabled) return;
+    if (!Enabled()) return;
     std::string trace = "time,address,serial,tag,kind,width,height,queue\n";
     for (auto& ring : rings) {
         const u64 end = ring.count.load(std::memory_order_acquire);
@@ -67,12 +67,12 @@ void Write() {
 
 namespace Gow3::GpuThread {
 void TraceVideoCopy(u64 address, u64 frame, bool end) {
-    if (VideoTrace::enabled) VideoTrace::Add(VideoTrace::Copies, {DiagClock(), address, VideoFrameVersion(address), frame, end ? 6u : 5u, 0, 0, 0});
+    if (VideoTrace::Enabled()) VideoTrace::Add(VideoTrace::Copies, {DiagClock(), address, VideoFrameVersion(address), frame, end ? 6u : 5u, 0, 0, 0});
 }
-bool VideoTraceEnabled() { return VideoTrace::enabled; }
+bool VideoTraceEnabled() { return VideoTrace::Enabled(); }
 u64 VideoTraceClock() { return DiagClock(); }
 void TraceAudioFlow(u32 kind, u64 port, s64 value) {
-    if (!VideoTrace::enabled) return;
+    if (!VideoTrace::Enabled()) return;
     using namespace VideoTrace;
     const u64 i = flow_count.fetch_add(1, std::memory_order_relaxed);
     auto& slot = flow[i % flow_capacity];
@@ -80,10 +80,10 @@ void TraceAudioFlow(u32 kind, u64 port, s64 value) {
     slot.seq.store(i + 1, std::memory_order_release);
 }
 void TraceVideoReadback(u64 address, u64 size, u64 frame, bool skipped) {
-    if (VideoTrace::enabled) VideoTrace::Add(VideoTrace::Readbacks, {DiagClock(), address, size, frame, skipped ? 12u : 11u, 0, 0, 0});
+    if (VideoTrace::Enabled()) VideoTrace::Add(VideoTrace::Readbacks, {DiagClock(), address, size, frame, skipped ? 12u : 11u, 0, 0, 0});
 }
 void TraceAudioQueue(u64 stream, u64 start, u64 schedule, u32 queued, u32 threshold, u32 buffer_size, u32 rate, u32 channels) {
-    if (!VideoTrace::enabled) return;
+    if (!VideoTrace::Enabled()) return;
     using namespace VideoTrace;
     const u64 n = audio_count.fetch_add(1, std::memory_order_relaxed);
     auto& slot = audio[n % capacity];

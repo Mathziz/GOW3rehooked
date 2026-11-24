@@ -17,21 +17,24 @@
 namespace Gow3 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations" // the values are only read, never kept across changes
-inline const char DebugMode = [] {
+inline char DebugMode() {
+    static const char mode = [] {
 #ifdef GOW3_OFFLINE
-    return '1'; // tools/framecap: the offline harness always runs the diagnostics
+        return '1'; // tools/framecap: the offline harness always runs the diagnostics
 #else
-    const char* set = std::getenv("GOW3_DEBUG");
-    return set && (*set == '1' || *set == '2') && !set[1] ? *set : '\0';
+        const char* set = std::getenv("GOW3_DEBUG");
+        return set && (*set == '1' || *set == '2') && !set[1] ? *set : '\0';
 #endif
-}();
-inline const char* DebugOption(const char* name) { return DebugMode ? std::getenv(name) : nullptr; }
+    }();
+    return mode;
+}
+inline const char* DebugOption(const char* name) { return DebugMode() ? std::getenv(name) : nullptr; }
 #pragma clang diagnostic pop
-inline bool DebugEnabled() { return DebugMode != '\0'; }
-inline int DebugLevel() { return DebugMode ? DebugMode - '0' : 0; }
+inline bool DebugEnabled() { return DebugMode() != '\0'; }
+inline int DebugLevel() { return DebugMode() ? DebugMode() - '0' : 0; }
 inline bool DebugFlag(const char* name) { const char* v = DebugOption(name); return v && !(v[0] == '0' && !v[1]); }
 // On in every debug run unless NAME=0.
-inline bool DebugAuto(const char* name) { const char* v = DebugOption(name); return DebugMode && !(v && v[0] == '0' && !v[1]); }
+inline bool DebugAuto(const char* name) { const char* v = DebugOption(name); return DebugMode() && !(v && v[0] == '0' && !v[1]); }
 // On automatically in GOW3_DEBUG=2 (unless NAME=0); opt-in in GOW3_DEBUG=1.
 inline bool DebugDeep(const char* name) {
     const char* v = DebugOption(name);
@@ -41,7 +44,7 @@ inline bool DebugDeep(const char* name) {
 // `GOW3_DIAG statement;` runs the statement only in a debug run.
 #define GOW3_DIAG if (::Gow3::DebugEnabled()) [[unlikely]]
 // The clock of a diagnostic timer: no clock read outside a debug run (the interval it feeds is not used there).
-inline std::chrono::steady_clock::time_point DiagNow() { return DebugMode ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; }
+inline std::chrono::steady_clock::time_point DiagNow() { return DebugMode() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; }
 inline double DiagMs(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); }
 // steady_clock in ns (QPC, the clock of ETW traces) for the records the tools read.
 inline std::uint64_t DiagClock() { return std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()); }

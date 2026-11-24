@@ -250,7 +250,7 @@ FrameMemory CaptureFrameMemory() {
     if (!eboot) return f;
     const u64 delta = eboot->GetBaseAddress() - kGhidraBase;
     f.motion_blur_dt = *reinterpret_cast<const float*>(delta + 0x013cdca0);
-    if (VideoTrace::enabled) {
+    if (VideoTrace::Enabled()) {
         const auto* t = reinterpret_cast<const u32*>(delta + 0x02a794f8);
         f.video_base = (u64(t[0]) | (u64(t[1] & 0x3f) << 32)) << 8;
         f.video_serial = VideoVersions::Serial(f.video_base);
@@ -531,13 +531,13 @@ void TraceDecodedVideo(u64 address, u32 width, u32 height, u64 tag) {
         slot.chroma.store(address + u64(Common::AlignUp(width, 64u)) * Common::AlignUp(height, 16u), std::memory_order_relaxed);
         const u64 serial = VideoVersions::next_serial.fetch_add(1, std::memory_order_relaxed) + 1;
         slot.serial.store(serial, std::memory_order_release);
-        if (VideoTrace::enabled) VideoTrace::Add(VideoTrace::Decoded, {Clock(), address, serial, tag, 0, width, height, 0});
+        if (VideoTrace::Enabled()) VideoTrace::Add(VideoTrace::Decoded, {Clock(), address, serial, tag, 0, width, height, 0});
         break;
     }
 }
 
 void TraceVideoTexture(u64 address, u64 frame, u32 flags) {
-    if (!VideoTrace::enabled) return;
+    if (!VideoTrace::Enabled()) return;
     bool chroma = false;
     if (const u64 serial = VideoVersions::Serial(address, &chroma))
         VideoTrace::Add(VideoTrace::Textures, {Clock(), address, serial, frame, chroma ? 4u : 3u, 0, 0, flags});
