@@ -266,7 +266,8 @@ std::vector<u8> StoredZip(const std::string& name, std::span<const u8> data) {
     z.insert(z.end(), data.begin(), data.end());
     const u32 central = u32(z.size());
     header(0x02014b50, true);
-    put(0x06054b50, 4), put(0, 4), put(1, 2), put(1, 2), put(u32(z.size()) - central, 4), put(central, 4), put(0, 2);
+    const u32 central_size = u32(z.size()) - central;
+    put(0x06054b50, 4), put(0, 4), put(1, 2), put(1, 2), put(central_size, 4), put(central, 4), put(0, 2);
     return z;
 }
 
