@@ -49,5 +49,7 @@ std::vector<unsigned char> ReadFile(const std::filesystem::path& path);
 std::string HostError(std::string_view action);
 // Cold: paths that log are laid out away from the hot code that branches to them.
 [[gnu::cold]] void Log(std::string_view message);
+// Log for the crash handler: gives up after ~50 ms instead of waiting on a lock the crashed thread may hold itself.
+[[gnu::cold]] void TryLog(std::string_view message);
 [[gnu::cold]] void FlushLog(const std::filesystem::path& path);
 }

@@ -52,7 +52,7 @@ LONG WINAPI ReportUnhandledCrash(EXCEPTION_POINTERS* info) {
     if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
         text += std::format(" ({} {:#x})", record->ExceptionInformation[0] ? "writing" : "reading",
                             record->ExceptionInformation[1]);
-    if (Gow3::DebugEnabled()) Gow3::Log(text);  // the dialog's text, kept in the log
+    if (Gow3::DebugEnabled()) Gow3::TryLog(text);  // the dialog's text, kept in the log
     text += "\n\nIf it happens while the game starts, make sure the Windows pagefile is enabled (system managed).";
     ShowFatalError(text.c_str());
     return EXCEPTION_EXECUTE_HANDLER; // ends the process

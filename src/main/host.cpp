@@ -2,6 +2,7 @@
 #include "main/host.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>
@@ -201,8 +203,8 @@ std::string HostError(std::string_view action) {
 #endif
 }
 
-void Log(std::string_view message) {
-    std::scoped_lock lock(log_mutex);
+namespace {
+void Append(std::string_view message) {  // under log_mutex
     if (DebugEnabled()) {
         if (debug_file == invalid_file) { debug_messages.emplace_back(message); return; }
         // Straight to the OS: the line survives a crash of the process.
@@ -226,6 +228,18 @@ void Log(std::string_view message) {
         ++dropped_messages;
     }
     messages[(message_begin + message_count++) % messages.size()].assign(message);
+}
+} // namespace
+
+void Log(std::string_view message) {
+    std::scoped_lock lock(log_mutex);
+    Append(message);
+}
+
+void TryLog(std::string_view message) {
+    std::unique_lock lock(log_mutex, std::defer_lock);
+    for (int i = 0; i < 50 && !lock.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (lock) Append(message);
 }
 
 void FlushLog(const std::filesystem::path& path) {

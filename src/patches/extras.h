@@ -4,7 +4,10 @@
 #include <cstddef>
 #include "main/config.h"
 #include "orbis/common/types.h"
-#include "orbis/core/module.h"
+
+namespace Core {
+class Module;
+}
 
 namespace Gow3::Extras {
 
