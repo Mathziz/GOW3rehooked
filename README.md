@@ -62,7 +62,7 @@ Only use the AVX1 build if your CPU doesn't meet the requirements for the standa
 3. Run `gow3.exe`. The first few launches may show the [shader preparation screen](#shaders-prepared-in-advance).
 4. Choose your settings under Rehooked in the title menu.
 
-Windows releases check for updates at startup. Choose **Yes** to install the same CPU variant and reopen the game, or **No** to skip that release. To see the offer again, delete `_rehooked_/settings/skipped-release.txt`.
+Windows releases check for updates at startup. Choose **Yes** to install the same CPU variant and reopen the game, or **No** to skip that release. To see the offer again, delete `_rehooked_/settings/skipped-release.txt`. The previous `gow3.exe` is kept as `gow3.update.old`.
 
 ### Linux
 
@@ -88,7 +88,7 @@ The game stores its settings, saves and diagnostics in `_rehooked_`:
 | `gow3.log` | A log, which grows with every launch |
 | `gow3-<date>-<time>.zip` | Diagnostics of one session run with the debug launcher, split into `.part1.zip`, `.part2.zip` and so on past 24 MB, see [Reporting bugs](#reporting-bugs) |
 
-To update, extract the new ZIP over the old files and let it replace them. Your settings, saves and translated shaders are not in the ZIP and stay as they are. To uninstall, delete the two executables and `licenses`, and `_rehooked_` as well if you don't want to keep your saves.
+To update, extract the new ZIP over the old files and let it replace them. Your settings, saves and translated shaders are not in the ZIP and stay as they are. To uninstall, delete `gow3.exe` and `gow3_debug.cmd` (or the two AppImages) and `licenses`, and `_rehooked_` as well if you don't want to keep your saves.
 
 ## Performance
 
@@ -245,6 +245,7 @@ Defaults are in bold.
 - “YOUR GAME IS NOT VERSION 1.02” means the game needs its 1.02 update, or is not the European (CUSA01715) or American (CUSA01623) release.
 - If the game crashed before reaching the title menu, the next launch offers to reset your settings. Answer Yes if the crashes began after you changed one.
 - To reset the settings by hand, delete `_rehooked_/settings/config.cfg`.
+- Windows Security reporting `gow3.exe` as `Trojan:Win32/Wacatac.B!ml` is a false positive that hit the small launchers of v0.1.5 to v0.2.1. Install the latest release, which no longer has them.
 
 ## Reporting bugs
 
@@ -260,14 +261,14 @@ Report problems on the [Issues](../../issues) page, after checking that yours is
    - your settings;
    - your CPU, GPU, driver version and operating system version.
 
-If you are asked for a more detailed capture, set `GOW3_DEBUG=2` before running the debug launcher. It is slower than the default debug mode.
+If you are asked for a more detailed capture, add `--debug=2` to the debug launcher. It is slower than the default debug mode.
 
 ```powershell
-$env:GOW3_DEBUG = "2"; & "C:\your\game\path\gow3_debug.cmd"
+& "C:\your\game\path\gow3_debug.cmd" --debug=2
 ```
 
 ```sh
-GOW3_DEBUG=2 ./gow3_debug.AppImage
+./gow3_debug.AppImage --debug=2
 ```
 
 ## Credits
