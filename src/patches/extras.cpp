@@ -323,21 +323,6 @@ constexpr StubHookSpec kStubHooks[]{
          0xa9, 0x00, 0x00, 0x00, 0x00, 0xeb, 0x09,
          0x41, 0xf6, 0x84, 0x24, 0xac, 0x04, 0x00, 0x00, 0x04},
     },
-    // erickmendes22 experimental DOF patch made live-toggleable.
-    {
-        Toggle::RemoveDofErick,
-        {"c5 fa 10 6d e4 c4 c1 7a 10 47 48 c4 c1 7a 10 4f 44", 5},
-        6, 4,
-        {0xc4, 0xc1, 0x7a, 0x10, 0x47, 0x48},
-        {0xc5, 0xf8, 0x57, 0xc0},
-    },
-    {
-        Toggle::RemoveDofErick,
-        {"c4 c1 7a 10 4f 44 c4 c1 7a 10 57 3c c4 c1 7a 10 5f 40 c5 da 58 e4", 12},
-        6, 4,
-        {0xc4, 0xc1, 0x7a, 0x10, 0x5f, 0x40},
-        {0xc5, 0xe0, 0x57, 0xdb},
-    },
 };
 
 struct ToggleBinding {
@@ -356,7 +341,6 @@ constexpr ToggleBinding kBindings[]{
     {Toggle::AutoQte, &Config::cheat_auto_qte},
     {Toggle::RemoveMotionBlur, &Config::remove_motion_blur},
     {Toggle::RemoveDofSpartan, &Config::remove_dof_spartan},
-    {Toggle::RemoveDofErick, &Config::remove_dof_erick},
 };
 
 } // namespace
@@ -454,7 +438,7 @@ void InstallHooks(Core::Module& eboot) {
         return true;
     };
 
-    // 1. Scan all cheat and erickmendes DOF sites BEFORE patching any bytes.
+    // 1. Scan all cheat sites BEFORE patching any bytes.
     std::array<u64, std::size(kStubHooks)> hook_rvas{};
     for (size_t i = 0; i < std::size(kStubHooks); ++i) {
         const auto& spec = kStubHooks[i];
@@ -467,7 +451,7 @@ void InstallHooks(Core::Module& eboot) {
         }
     }
 
-    // Group hooks by Toggle so multi-site toggles (InfiniteRage, RemoveDofErick) require all sites.
+    // Group hooks by Toggle so multi-site toggles (InfiniteRage) require all sites.
     for (size_t t = 0; t < kToggleCount; ++t) {
         const auto toggle = static_cast<Toggle>(t);
         bool has_spec = false;

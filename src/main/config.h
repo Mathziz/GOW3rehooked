@@ -87,7 +87,6 @@ struct Config {
     bool cheat_auto_qte = false;
     bool remove_motion_blur = false;
     bool remove_dof_spartan = false;
-    bool remove_dof_erick = false;
 };
 Config LoadConfig(const std::filesystem::path& path);
 void SaveMenuConfig(const std::filesystem::path& path, const Config& config);

@@ -152,11 +152,11 @@ The added screens show PlayStation symbols for a DualShock 3, DualShock 4 or Dua
 | Unlock Chaos Difficulty | Chaos can be chosen in New Game without finishing the game first. |
 | Automatic QTE | Quick-time prompts answer themselves: single presses, repeated presses, holds and stick rotations. |
 | Remove Motion Blur | Removes the blur on the camera and on fast-moving objects. |
-| Remove Depth of Field | Removes the background blur of cutscenes and close camera shots. Two implementations are offered to compare; enable one at a time. |
+| Remove Depth of Field | Removes the background blur of cutscenes and close camera shots. |
 
 Every cheat and patch is off by default.
 
-Thanks to the people involved in developing, researching and porting these cheats and patches: **SpartanPort**, **Celogamez** and **erickmendes22**.
+Thanks to the people involved in developing, researching and porting these cheats and patches: **SpartanPort** and **Celogamez**.
 
 <table>
   <tr>

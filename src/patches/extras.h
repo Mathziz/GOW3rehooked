@@ -22,7 +22,6 @@ enum class Toggle : size_t {
     AutoQte,
     RemoveMotionBlur,
     RemoveDofSpartan,
-    RemoveDofErick,
     Count
 };
 

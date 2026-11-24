@@ -207,16 +207,10 @@ constexpr ExtraItem extras[]{
         nullptr,
     },
     {
-        "Visual", "Remove Depth of Field (SpartanPort)", false, Extras::Toggle::RemoveDofSpartan, "Research", "SpartanPort",
+        "Visual", "Remove Depth of Field", false, Extras::Toggle::RemoveDofSpartan, "Research", "SpartanPort",
         "Removes the background blur of cutscenes and close camera shots at the renderer level, keeping the whole picture sharp.",
         nullptr,
-        "Two depth-of-field implementations are offered so you can compare them. Only one needs to be enabled at a time.",
-    },
-    {
-        "Visual", "Remove Depth of Field (erickmendes)", false, Extras::Toggle::RemoveDofErick, "Author", "erickmendes22",
-        "Removes depth of field by patching the game's blur parameters directly in memory, as an alternative to the renderer method.",
         nullptr,
-        "Two depth-of-field implementations are offered so you can compare them. Only one needs to be enabled at a time.",
     },
 };
 constexpr int extra_count = int(std::size(extras));

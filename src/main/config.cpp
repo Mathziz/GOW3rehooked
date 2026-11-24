@@ -130,8 +130,6 @@ Config LoadConfig(const std::filesystem::path& path) {
             valid = Boolean(value, config.remove_motion_blur);
         } else if (key == "remove_dof_spartan") {
             valid = Boolean(value, config.remove_dof_spartan);
-        } else if (key == "remove_dof_erick") {
-            valid = Boolean(value, config.remove_dof_erick);
         }
         if (!valid) Log(std::format("Invalid or unsupported config option: {}={}; using default", key, value));
     }
@@ -188,7 +186,7 @@ void WriteConfigValues(const std::filesystem::path& path,
     } catch (...) { std::filesystem::remove(temporary); throw; }
 }
 
-std::array<std::pair<std::string_view, std::string>, 12> ExtrasValues(const Config& config) {
+std::array<std::pair<std::string_view, std::string>, 11> ExtrasValues(const Config& config) {
     const auto flag = [](bool value) { return value ? "true" : "false"; };
     return {{
         {"vibration", std::to_string(config.vibration)},
@@ -202,7 +200,6 @@ std::array<std::pair<std::string_view, std::string>, 12> ExtrasValues(const Conf
         {"cheat_auto_qte", flag(config.cheat_auto_qte)},
         {"remove_motion_blur", flag(config.remove_motion_blur)},
         {"remove_dof_spartan", flag(config.remove_dof_spartan)},
-        {"remove_dof_erick", flag(config.remove_dof_erick)},
     }};
 }
 } // namespace
