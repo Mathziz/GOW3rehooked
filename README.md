@@ -2,7 +2,7 @@
 
 <p align="center"><i>“Your pawn has failed you, Gaia. Perhaps you should have chosen the other one!”</i></p>
 
-![Title menu with the added Continue, Rehooked, Help and Controls, and Quit Game entries](assets/screenshots/title-menu.png)
+![Title menu with the added Continue, Rehooked, Controls and Extras, and Quit Game entries](assets/screenshots/title-menu.png)
 
 GOW3rehooked lets you play God of War III Remastered on Windows and Linux PCs. The same developer who created the original GOW3 build for shadPS4 made it with a lot of love, care and obsession for performance.
 
@@ -26,9 +26,9 @@ No game code or assets are included. You need your own copy of the game.
 | Operating system | Windows 10 or 11, or Linux x86-64 |
 | Intel CPU | 4th-generation Core (Haswell) or newer for the standard build. |
 | AMD CPU | Ryzen 1000 or newer for the standard build. |
-| AMD GPU | Radeon RX 5300 (RDNA 1) or newer. |
+| AMD GPU | Radeon RX 5300 (RDNA 1) or newer. Vega and Polaris: experimental. |
 | NVIDIA GPU | GeForce GTX 950 or newer. |
-| Intel GPU | Untested. |
+| Intel GPU | UHD Graphics: experimental. Arc and Xe: untested. |
 | Memory | 16 GB of RAM recommended |
 | Game | God of War III Remastered, European (CUSA01715) or American (CUSA01623) release, updated to version 1.02 |
 
@@ -36,7 +36,7 @@ The standard build requires an x86-64-v3 CPU (including AVX2, BMI1/2, FMA, F16C,
 
 The experimental AVX1 build may work on some CPUs older than 4th-generation Intel Core or AMD Ryzen 1000. The same GPU requirements apply. Feel free to [report any issues](#reporting-bugs).
 
-Use a current graphics driver for your card. The renderer requires Vulkan 1.3 with shader objects, depth clip control, push descriptors, conditional rendering, sparse buffer residency and min/max sampler filtering. Radeon also needs `VK_KHR_maintenance5`. Windows capability reports are available for the [Radeon RX 5300](https://vulkan.gpuinfo.org/displayreport.php?id=53293), [Radeon RX 5500 XT](https://vulkan.gpuinfo.org/displayreport.php?id=45797) and [GeForce GTX 950](https://vulkan.gpuinfo.org/displayreport.php?id=47069).
+The renderer requires Vulkan 1.3 with depth clip control, push descriptors, conditional rendering, sparse buffer residency and min/max sampler filtering, and uses shader objects where the driver has them. Experimental fallbacks support older GPUs without them (AMD Vega/Polaris, Intel UHD Graphics; Arc/Xe untested, but should also work). Please update to the latest drivers. On Linux, Radeon also needs `VK_KHR_maintenance5`. Windows capability reports are available for the [Radeon RX 5300](https://vulkan.gpuinfo.org/displayreport.php?id=53293), [Radeon RX 5500 XT](https://vulkan.gpuinfo.org/displayreport.php?id=45797) and [GeForce GTX 950](https://vulkan.gpuinfo.org/displayreport.php?id=47069).
 
 The game has to be in a folder that contains `eboot.bin`, `sce_module` and `sce_sys`. A game that is still packaged in a single file has to be extracted first. Only version 1.02 works, because GOW3rehooked modifies the game at exact locations of that version's executable.
 
@@ -124,7 +124,7 @@ When the game's resolution and your monitor's differ, the image needs to be resi
 
 A shader is a small program the graphics card runs to draw a surface or an effect. The game's shaders were written for the PS4's GPU, so each one has to be translated before your graphics card can run it. Emulators usually translate a shader the first time the game needs it, in the middle of gameplay, and that pause is the familiar shader stutter.
 
-GOW3rehooked translates the game's shaders before gameplay instead, behind a progress screen at startup. This mode is called AOT (ahead of time) and is the default. The work is spread over up to four launches, so the first one isn't a long wait, and the results are saved for the next launches. The ZIP brings recipes for every shader variant met in a complete playthrough, and the first launch prepares all of them before the rest.
+GOW3rehooked translates the game's shaders before gameplay instead, behind a progress screen at startup. This mode is called AOT (ahead of time) and is the default. The work is spread over up to four launches, so the first one isn't a long wait, and the results are saved for the next launches. The ZIP brings recipes for every shader variant met in a complete playthrough, and the first launch prepares all of them before the rest. On the experimental fallbacks for older GPUs, the same screen also prepares the graphics pipelines, a longer step on weak GPUs.
 
 JIT (just in time) translates a shader when the game first needs it. With AOT it stays active as a safety net for any shader the preparation didn't catch, so nothing goes missing. It can also be used alone, with no preparation screen. Holding Esc, Circle (PlayStation controllers) or B (other gamepads) on the preparation screen skips it, and the game then restarts once with JIT alone.
 
@@ -132,15 +132,37 @@ Both modes are described under [Settings](#settings).
 
 <p align="center"><img src="assets/screenshots/shader-preparation.png" alt="Shader preparation screen with a progress bar and a hold-to-skip prompt" width="80%"></p>
 
-### Controls
+### Controls and Extras
 
-You can play with a gamepad or with keyboard and mouse, and remap both from a screen inside the game. The added screens show PlayStation symbols for a DualShock 3, DualShock 4 or DualSense, and Xbox-style buttons for other gamepads.
+You can play with a gamepad or with keyboard and mouse. Controls and Extras opens from the title menu and from the game's Options menu, also during play, and has three tabs:
+
+- **Controls** remaps the gamepad and the keyboard and mouse.
+- **Cheats & Patches** holds the controller's vibration strength, cheats and visual patches. They apply as soon as you change them and stay as you left them for the next launch.
+- **Help** explains each Rehooked setting.
+
+The added screens show PlayStation symbols for a DualShock 3, DualShock 4 or DualSense, and Xbox-style buttons for other gamepads.
+
+| Option | What it does |
+| --- | --- |
+| Vibration | Strength of the controller's vibration, from 0% (off) to **100%** (the game's own). |
+| Infinite Health | Kratos's health stays full. |
+| Infinite Magic | The magic meter stays full. |
+| Infinite Item Meter | The item meter stays full: the Bow of Apollo, the Head of Helios and the Boots of Hermes never run dry. |
+| Infinite Rage of Sparta | The Rage of Sparta meter stays full. |
+| Max Red Orbs | Red orbs stay at the maximum, so every upgrade can be bought. |
+| Infinite Double Jumps | Kratos can jump again in the air as many times as you like. |
+| Unlock Chaos Difficulty | Chaos can be chosen in New Game without finishing the game first. |
+| Automatic QTE | Quick-time prompts answer themselves: single presses, repeated presses, holds and stick rotations. |
+| Remove Motion Blur | Removes the blur on the camera and on fast-moving objects. |
+| Remove Depth of Field | Removes the background blur of cutscenes and close camera shots. Two implementations are offered to compare; enable one at a time. |
+
+Every cheat and patch is off by default.
 
 ### Menus and saves
 
 Continue appears above New Game once you have a save and directly loads the latest. The game originally has 32 manual save slots. GOW3rehooked raises that to 64. The save and load screens let you duplicate or delete saves. Open Save Folder opens the selected save in your file manager.
 
-Rehooked holds every setting in the game's own menu style, feel free to tinker. Help and Controls has an explanation of each setting and allows you to remap the controls.
+Rehooked holds every setting in the game's own menu style, feel free to tinker. [Controls and Extras](#controls-and-extras) explains each setting, remaps the controls and holds the cheats and patches.
 
 The opening logos can be skipped, and so can any video or cutscene, by pressing Cross.
 
