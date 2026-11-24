@@ -298,14 +298,17 @@ DynamicCaps QueryDynamicCaps(VkPhysicalDevice pd, std::span<const VkExtensionPro
             VkPhysicalDeviceFeatures2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &eds3_q};
             vkGetPhysicalDeviceFeatures2(pd, &q2);
 
-            VkPhysicalDeviceExtendedDynamicState3PropertiesEXT eds3_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT};
+            VkPhysicalDeviceDriverProperties driver_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceExtendedDynamicState3PropertiesEXT eds3_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT, &driver_p};
             VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &eds3_p};
             vkGetPhysicalDeviceProperties2(pd, &p2);
 
+            // AMD proprietary/AMDVLK (XGL/PAL) corrupts 2x MSAA in 8x8 tiles with dynamic rasterizationSamples; bake it into the pipeline.
+            const bool amd_xgl = driver_p.driverID == VK_DRIVER_ID_AMD_PROPRIETARY || driver_p.driverID == VK_DRIVER_ID_AMD_OPEN_SOURCE;
             c.unrestricted_topology = eds3_p.dynamicPrimitiveTopologyUnrestricted != VK_FALSE;
             c.depth_clip_negative_one_to_one = eds3_q.extendedDynamicState3DepthClipNegativeOneToOne != VK_FALSE;
             c.depth_clamp_enable = eds3_q.extendedDynamicState3DepthClampEnable != VK_FALSE;
-            c.rasterization_samples = eds3_q.extendedDynamicState3RasterizationSamples != VK_FALSE;
+            c.rasterization_samples = !amd_xgl && eds3_q.extendedDynamicState3RasterizationSamples != VK_FALSE;
             c.alpha_to_coverage_enable = eds3_q.extendedDynamicState3AlphaToCoverageEnable != VK_FALSE;
             c.color_blend_enable = eds3_q.extendedDynamicState3ColorBlendEnable != VK_FALSE;
             c.color_blend_equation = eds3_q.extendedDynamicState3ColorBlendEquation != VK_FALSE;
