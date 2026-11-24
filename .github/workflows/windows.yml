@@ -7,6 +7,10 @@ on:
         description: Build for Ivy Bridge CPUs such as the Core i5-3470
         type: boolean
         default: false
+      all_variants:
+        description: Build both standard and AVX1 variants (useful to warm all caches on master)
+        type: boolean
+        default: false
       no_updater:
         description: Build without the autoupdater (requires GOW3_ENABLE_NO_UPDATER=true)
         type: boolean
@@ -19,25 +23,70 @@ permissions:
 
 env:
   ENABLE_NO_UPDATER: ${{ vars.GOW3_ENABLE_NO_UPDATER == 'true' && 'true' || 'false' }}
+  VCPKG_REF: 3d22b64585ca026e881728fd87e541c23a611a43
 
 concurrency:
-  group: build-${{ github.ref }}${{ github.ref_type != 'tag' && inputs.ivy_bridge && '-ivybridge' || '' }}${{ github.ref_type != 'tag' && inputs.no_updater && '-no-updater' || '' }}
+  group: build-${{ github.ref }}${{ github.ref_type != 'tag' && inputs.all_variants && '-all' || github.ref_type != 'tag' && inputs.ivy_bridge && '-ivybridge' || '' }}${{ github.ref_type != 'tag' && inputs.no_updater && '-no-updater' || '' }}
   cancel-in-progress: true
 
 jobs:
+  windows-deps:
+    name: Windows vcpkg cache
+    if: startsWith(github.ref, 'refs/tags/v') || !inputs.no_updater || vars.GOW3_ENABLE_NO_UPDATER == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\build-fast\Windows\vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\build-fast\Windows\.cache\vcpkg-binaries
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/vcpkg
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: vcpkg-cache
+        with:
+          path: build-fast/Windows/.cache/vcpkg-binaries
+          key: windows2025-vcpkg-${{ env.VCPKG_REF }}-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake') }}
+          lookup-only: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REF }}
+          path: build-fast/Windows/vcpkg
+          persist-credentials: false
+      - name: Build shaderc and Vulkan packages (on cache miss)
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path $env:VCPKG_DEFAULT_BINARY_CACHE -Force | Out-Null
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          & "$env:VCPKG_ROOT\vcpkg.exe" install shaderc:x64-gow3-static vulkan-headers:x64-gow3-static vulkan-loader:x64-gow3-static --overlay-triplets="$env:GITHUB_WORKSPACE\tools\vcpkg"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows dependency installation failed' }
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-fast/Windows/.cache/vcpkg-binaries
+          key: windows2025-vcpkg-${{ env.VCPKG_REF }}-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake') }}
+
   windows:
-    name: Windows x86_64${{ startsWith(github.ref, 'refs/tags/v') && ' and AVX1' || inputs.ivy_bridge && ' AVX1' || '' }} (O3)${{ matrix.no_updater && ' without updater' || '' }}
+    name: Windows x86_64 (${{ matrix.variant }})${{ matrix.no_updater && ' without updater' || '' }}
+    needs: [windows-deps]
     if: startsWith(github.ref, 'refs/tags/v') || !inputs.no_updater || vars.GOW3_ENABLE_NO_UPDATER == 'true'
     runs-on: windows-2025
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
+        variant: ${{ fromJSON((startsWith(github.ref, 'refs/tags/v') || inputs.all_variants) && '["standard","ivybridge"]' || inputs.ivy_bridge && '["ivybridge"]' || '["standard"]') }}
         no_updater: ${{ fromJSON(vars.GOW3_ENABLE_NO_UPDATER == 'true' && (startsWith(github.ref, 'refs/tags/v') && '[false,true]' || inputs.no_updater && '[true]') || '[false]') }}
     env:
-      BUILD_VARIANTS: ${{ startsWith(github.ref, 'refs/tags/v') && 'standard,ivybridge' || inputs.ivy_bridge && 'ivybridge' || 'standard' }}
+      VARIANT: ${{ matrix.variant }}
       PACKAGE_SUFFIX: ${{ matrix.no_updater && '-NoUpdater' || '' }}
-      CACHE_SUFFIX: ${{ inputs.ivy_bridge && '-ivybridge' || '' }}${{ matrix.no_updater && '-no-updater' || '' }}
+      CACHE_SUFFIX: ${{ matrix.variant == 'ivybridge' && '-ivybridge' || '' }}${{ matrix.no_updater && '-no-updater' || '' }}
       VCPKG_ROOT: ${{ github.workspace }}\build-fast\Windows\vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\build-fast\Windows\.cache\vcpkg-binaries
       SCCACHE_DIR: ${{ github.workspace }}\build-fast\Windows\.cache\sccache
@@ -77,20 +126,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: microsoft/vcpkg
-          ref: 3d22b64585ca026e881728fd87e541c23a611a43
+          ref: ${{ env.VCPKG_REF }}
           path: build-fast/Windows/vcpkg
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: cache
+        id: vcpkg-cache
         with:
-          path: |
-            build-fast/Windows/.cache/sccache
-            build-fast/Windows/.cache/vcpkg-binaries
-          key: windows2025-clang22-o3${{ env.CACHE_SUFFIX }}-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake', 'build-fast.ps1', '.github/workflows/windows.yml') }}-${{ github.sha }}
+          path: build-fast/Windows/.cache/vcpkg-binaries
+          key: windows2025-vcpkg-${{ env.VCPKG_REF }}-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake') }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: sccache-cache
+        with:
+          path: build-fast/Windows/.cache/sccache
+          key: windows2025-clang22-o3-sccache${{ env.CACHE_SUFFIX }}-${{ hashFiles('CMakeLists.txt', 'build-fast.ps1') }}-${{ github.sha }}
           restore-keys: |
-            windows2025-clang22-o3${{ env.CACHE_SUFFIX }}-${{ hashFiles('tools/vcpkg/x64-gow3-static.cmake', 'build-fast.ps1', '.github/workflows/windows.yml') }}-
-            windows2025-clang22-o3${{ env.CACHE_SUFFIX }}-
-            windows2025-clang22-o3-
+            windows2025-clang22-o3-sccache${{ env.CACHE_SUFFIX }}-${{ hashFiles('CMakeLists.txt', 'build-fast.ps1') }}-
+            windows2025-clang22-o3-sccache${{ env.CACHE_SUFFIX }}-
       - name: Restore shaderc and Vulkan packages (build on cache miss)
         id: dependencies
         shell: pwsh
@@ -101,6 +152,7 @@ jobs:
           & "$env:VCPKG_ROOT\vcpkg.exe" install shaderc:x64-gow3-static vulkan-headers:x64-gow3-static vulkan-loader:x64-gow3-static --overlay-triplets="$env:GITHUB_WORKSPACE\tools\vcpkg"
           if ($LASTEXITCODE -ne 0) { throw 'Windows dependency installation failed' }
       - name: Build Windows Release with O3 and full LTO
+        id: build
         shell: pwsh
         run: |
           $cmake = Get-Content -LiteralPath CMakeLists.txt -Raw
@@ -113,30 +165,30 @@ jobs:
           $cmake = $cmake.Replace('project(gow3_recomp LANGUAGES C CXX)', $ciProject)
           $cmake = $cmake.Replace('-flto=thin', '-flto=full').Replace('add_link_options(', 'add_link_options(/opt:lldlto=3 ')
           Set-Content -LiteralPath CMakeLists.txt -Value $cmake
-          foreach ($variant in ($env:BUILD_VARIANTS -split ',')) {
-            $ivyBridge = $variant -eq 'ivybridge'
-            $noUpdater = $env:PACKAGE_SUFFIX -eq '-NoUpdater'
-            $releaseArgs = @{}
-            if ($env:GITHUB_REF_TYPE -eq 'tag') { $releaseArgs.ReleaseTag = $env:GITHUB_REF_NAME }
-            ./build-fast.ps1 @releaseArgs -Release -NoDeploy -IvyBridge:$ivyBridge -NoUpdater:$noUpdater
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            $buildDir = if ($ivyBridge) { 'build-fast/Release-ivybridge' } else { 'build-fast/Release' }
-            if ($noUpdater) { $buildDir += '-no-updater' }
-            $commands = Get-Content -LiteralPath "$buildDir/compile_commands.json" -Raw
-            $buildRules = Get-Content -LiteralPath "$buildDir/build.ninja" -Raw
-            if ($commands.Contains('-flto=thin') -or -not $commands.Contains('-flto=full') -or
-                -not $commands.Contains('/clang:-O3') -or
-                -not $buildRules.Contains('/opt:lldlto=3')) {
-              throw 'Expected O3 and full LTO with optimization level 3 in CI'
-            }
-            $cpu = if ($ivyBridge) { 'ivybridge' } else { 'x86-64-v3' }
-            foreach ($entry in ($commands | ConvertFrom-Json)) {
-              if ($entry.file -match '\.(c|cpp)$' -and $entry.command -notlike "* /clang:-march=$cpu *") {
-                throw "Expected CPU target $cpu for $($entry.file)"
-              }
+          $ivyBridge = $env:VARIANT -eq 'ivybridge'
+          $noUpdater = $env:PACKAGE_SUFFIX -eq '-NoUpdater'
+          $releaseArgs = @{}
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $releaseArgs.ReleaseTag = $env:GITHUB_REF_NAME }
+          ./build-fast.ps1 @releaseArgs -Release -NoDeploy -IvyBridge:$ivyBridge -NoUpdater:$noUpdater
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $buildDir = if ($ivyBridge) { 'build-fast/Release-ivybridge' } else { 'build-fast/Release' }
+          if ($noUpdater) { $buildDir += '-no-updater' }
+          $commands = Get-Content -LiteralPath "$buildDir/compile_commands.json" -Raw
+          $buildRules = Get-Content -LiteralPath "$buildDir/build.ninja" -Raw
+          if ($commands.Contains('-flto=thin') -or -not $commands.Contains('-flto=full') -or
+              -not $commands.Contains('/clang:-O3') -or
+              -not $buildRules.Contains('/opt:lldlto=3')) {
+            throw 'Expected O3 and full LTO with optimization level 3 in CI'
+          }
+          $cpu = if ($ivyBridge) { 'ivybridge' } else { 'x86-64-v3' }
+          foreach ($entry in ($commands | ConvertFrom-Json)) {
+            if ($entry.file -match '\.(c|cpp)$' -and $entry.command -notlike "* /clang:-march=$cpu *") {
+              throw "Expected CPU target $cpu for $($entry.file)"
             }
           }
-      - name: Package both Windows executables with the licenses, the third-party notices and the shader recipes
+          sccache --show-stats
+      - name: Package Windows executables with the licenses, the third-party notices and the shader recipes
+        id: package
         shell: pwsh
         env:
           SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
@@ -177,41 +229,29 @@ jobs:
           Copy-Item assets/shader_cache/recipes-hash2-aes.bin "$package/_rehooked_/shader_cache"
           Set-Content -LiteralPath "$package/licenses/THIRD-PARTY-NOTICES.txt" -Value $notices -Encoding utf8
           $standIn = $env:GITHUB_REF_TYPE -eq 'tag' -and $env:PACKAGE_SUFFIX -ne '-NoUpdater'
-          foreach ($variant in ($env:BUILD_VARIANTS -split ',')) {
-            $binaries = if ($variant -eq 'ivybridge') { 'build/ivybridge' } else { 'build' }
-            $suffix = if ($variant -eq 'ivybridge') { '-AVX1' } else { '' }
-            if ($env:PACKAGE_SUFFIX -eq '-NoUpdater') { $binaries += '/no-updater' }
-            Copy-Item "$binaries/gow3.exe", "$binaries/gow3_debug.exe", "$binaries/gow3.dll" $package -Force
-            # The stand-in for the updaters of v0.1.5 and v0.1.6, which refuse a release without gow3_update.exe.
-            if ($standIn) { Copy-Item "$binaries/gow3_update.exe" $package -Force }
-            $zip = "build/GOW3rehooked-Windows-x86_64$suffix$env:PACKAGE_SUFFIX.zip"
-            Compress-Archive -Path "$package/*" -DestinationPath $zip -CompressionLevel Optimal
-            ./tools/release/check-windows-zip.ps1 -Zip $zip -Release:$standIn
-          }
-      - name: Upload standard Windows ZIP
-        if: contains(env.BUILD_VARIANTS, 'standard')
+          $binaries = if ($env:VARIANT -eq 'ivybridge') { 'build/ivybridge' } else { 'build' }
+          $suffix = if ($env:VARIANT -eq 'ivybridge') { '-AVX1' } else { '' }
+          if ($env:PACKAGE_SUFFIX -eq '-NoUpdater') { $binaries += '/no-updater' }
+          Copy-Item "$binaries/gow3.exe", "$binaries/gow3_debug.exe", "$binaries/gow3.dll" $package -Force
+          # The stand-in for the updaters of v0.1.5 and v0.1.6, which refuse a release without gow3_update.exe.
+          if ($standIn) { Copy-Item "$binaries/gow3_update.exe" $package -Force }
+          $zip = "build/GOW3rehooked-Windows-x86_64$suffix$env:PACKAGE_SUFFIX.zip"
+          Compress-Archive -Path "$package/*" -DestinationPath $zip -CompressionLevel Optimal
+          ./tools/release/check-windows-zip.ps1 -Zip $zip -Release:$standIn
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+      - name: Upload Windows ZIP
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          path: build/GOW3rehooked-Windows-x86_64${{ env.PACKAGE_SUFFIX }}.zip
+          path: ${{ steps.package.outputs.zip }}
           archive: false
           if-no-files-found: error
           retention-days: 14
-      - name: Upload AVX1 Windows ZIP
-        if: contains(env.BUILD_VARIANTS, 'ivybridge')
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          path: build/GOW3rehooked-Windows-x86_64-AVX1${{ env.PACKAGE_SUFFIX }}.zip
-          archive: false
-          if-no-files-found: error
-          retention-days: 14
-      - name: Save compiler and dependency caches
-        if: always() && steps.dependencies.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+      - name: Save compiler cache
+        if: always() && steps.build.outcome == 'success' && steps.sccache-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            build-fast/Windows/.cache/sccache
-            build-fast/Windows/.cache/vcpkg-binaries
-          key: ${{ steps.cache.outputs.cache-primary-key }}
+          path: build-fast/Windows/.cache/sccache
+          key: ${{ steps.sccache-cache.outputs.cache-primary-key }}
 
   linux:
     name: Linux x86_64 (${{ matrix.variant }})
@@ -224,7 +264,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '["standard","ivybridge"]' || inputs.ivy_bridge && '["ivybridge"]' || '["standard"]') }}
+        variant: ${{ fromJSON((startsWith(github.ref, 'refs/tags/v') || inputs.all_variants) && '["standard","ivybridge"]' || inputs.ivy_bridge && '["ivybridge"]' || '["standard"]') }}
     env:
       CC: clang-18
       CXX: clang++-18
