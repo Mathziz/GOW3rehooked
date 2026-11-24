@@ -11,7 +11,9 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <shellapi.h>
+#else
 #include <cerrno>
 #include <fcntl.h>
 #endif
@@ -29,6 +31,20 @@ constexpr int invalid_file = -1;
 #endif
 auto debug_file = invalid_file; // debug: opened by the first FlushLog(), then Log() writes through
 std::string debug_line;
+}
+
+bool DebugArgument() {
+    bool found = false;
+#ifdef _WIN32
+    int count{};
+    const auto args = CommandLineToArgvW(GetCommandLineW(), &count);
+    for (int i = 1; args && i < count && !found; ++i) found = std::wstring_view(args[i]) == L"--debug";
+    LocalFree(args);
+#else
+    std::ifstream file("/proc/self/cmdline", std::ios::binary);
+    for (std::string arg; !found && std::getline(file, arg, '\0');) found = arg == "--debug";
+#endif
+    return found;
 }
 
 std::filesystem::path ExecutableDirectory() {

@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Windows release updates, inside the runtime. The latest GitHub release is offered through a `gow3.exe --update-offer`
-// child (the prompt the Linux AppImage updater uses too); on Yes its ZIP replaces gow3.dll and the licenses in place and the
-// game restarts. The launchers are never replaced: Explorer shortcuts keep pointing at the files the player approved.
+// Windows release updates. The latest GitHub release is offered through a `gow3.exe --update-offer` child (the prompt the
+// Linux AppImage updater uses too); on Yes its ZIP replaces gow3.exe, gow3_debug.cmd and the licenses in place and the game
+// restarts.
 #include "main/update.h"
 #include "main/host.h"
 #include <windows.h>
 #include <unknwn.h>
 #include <bcrypt.h>
-#include <shobjidl_core.h>
 #include <winhttp.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -33,9 +32,8 @@ namespace fs = std::filesystem;
 namespace Gow3::Update {
 namespace {
 constexpr std::wstring_view Repository = L"cuesta4/GOW3rehooked";
-constexpr std::string_view Runtime = "gow3.dll", Retired = "gow3_update.exe",
+constexpr std::string_view Program = "gow3.exe", DebugScript = "gow3_debug.cmd",
                            Cache = "_rehooked_/shader_cache/recipes-hash2-aes.bin";
-constexpr std::string_view Launchers[]{"gow3.exe", "gow3_debug.exe"};
 constexpr uint64_t MaxArchive = 128ull << 20, MaxContents = 256ull << 20;
 #ifdef GOW3_IVY_BRIDGE
 constexpr std::wstring_view Asset = L"GOW3rehooked-Windows-x86_64-AVX1.zip";
@@ -45,7 +43,6 @@ constexpr std::wstring_view Asset = L"GOW3rehooked-Windows-x86_64.zip";
 
 [[noreturn]] void Fail(const std::string& what) { throw std::runtime_error(what); }
 std::string Utf8(const fs::path& path) { return winrt::to_string(path.native()); }
-bool IsLauncher(std::string_view name) { return std::ranges::find(Launchers, name) != std::end(Launchers); }
 
 // Release order: major, minor, patch, then alpha < beta < rc < final, then the pre-release number.
 using Version = std::array<int, 5>;
@@ -184,16 +181,6 @@ std::vector<ZipFile> Unzip(std::span<const uint8_t> zip) {
     return files;
 }
 
-// Attachment Services applies the machine's policy for downloaded programs and records where they came from.
-void MarkDownloaded(const fs::path& file, const std::wstring& url) {
-    constexpr CLSID attachment_services{0x4125dd96, 0xe03a, 0x4103, {0x8f, 0x70, 0xe0, 0x59, 0x7d, 0x80, 0x3b, 0x9c}};
-    winrt::com_ptr<IAttachmentExecute> attachment;
-    winrt::check_hresult(CoCreateInstance(attachment_services, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(attachment.put())));
-    winrt::check_hresult(attachment->SetLocalPath(file.c_str()));
-    winrt::check_hresult(attachment->SetSource(url.c_str()));
-    winrt::check_hresult(attachment->Save());
-}
-
 void WriteNew(const fs::path& file, std::span<const uint8_t> data) {
     const HANDLE handle = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) Fail(HostError("Create " + Utf8(file)));
@@ -217,21 +204,20 @@ struct Replacement {
     bool moved{}, installed{};
 };
 
-// Moves every file of the release into `app`, the runtime last, then calls `restart`. A failure puts the previous files back.
-void Install(std::vector<ZipFile> files, const fs::path& app, const std::wstring& url, const std::function<void()>& restart) {
+// Moves every file of the release into `app`, gow3.exe last, then calls `restart`. A failure puts the previous files back.
+void Install(std::vector<ZipFile> files, const fs::path& app, const std::function<void()>& restart) {
     std::vector<std::string> names;
     for (const auto& file : files) {
         const auto& name = file.name;
         static const std::regex license(R"(^licenses/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.txt$)");
-        if (name != Runtime && !IsLauncher(name) && name != Retired && name != Cache && !std::regex_match(name, license))
+        if (name != Program && name != DebugScript && name != Cache && !std::regex_match(name, license))
             Fail("Unexpected file in the release: " + name);
         auto folded = name;
         std::ranges::transform(folded, folded.begin(), [](unsigned char c) { return char(std::tolower(c)); });
         if (std::ranges::find(names, folded) != names.end() || file.data.empty()) Fail("Invalid release contents.");
         names.push_back(std::move(folded));
     }
-    for (const auto required : {Runtime, Launchers[0], Launchers[1]})
-        if (std::ranges::find(names, required) == names.end()) Fail("The release has no " + std::string(required) + ".");
+    if (std::ranges::find(names, Program) == names.end()) Fail("The release has no gow3.exe.");
 
     const auto stage = app / std::format(L".gow3-update-{}-{}", GetCurrentProcessId(), GetTickCount64());
     if (!CreateDirectoryW(stage.c_str(), nullptr)) Fail(HostError("Create " + Utf8(stage)));
@@ -244,23 +230,20 @@ void Install(std::vector<ZipFile> files, const fs::path& app, const std::wstring
     std::vector<Replacement> replacements;
     try {
         for (const auto& file : files) {
-            // gow3_update.exe stays in releases for the updaters of v0.1.5 and v0.1.6; this one leaves it out.
-            if (file.name == Retired) continue;
             const fs::path relative(std::wstring(file.name.begin(), file.name.end())); // checked ASCII names
             const auto target = app / relative.lexically_normal();
-            if ((file.name == Cache || IsLauncher(file.name)) && fs::exists(target)) continue;
+            if (file.name == Cache && fs::exists(target)) continue;
             auto folder = app;
             for (const auto& part : relative.parent_path()) PrepareFolder(folder /= part);
             const auto source = stage / relative.filename();
             WriteNew(source, file.data);
-            if (file.name == Runtime || IsLauncher(file.name)) MarkDownloaded(source, url);
             replacements.push_back({source, target, stage / (relative.filename().native() + L".old")});
         }
-        std::ranges::stable_partition(replacements, [](const Replacement& r) { return r.target.filename() != L"gow3.dll"; });
+        std::ranges::stable_partition(replacements, [](const Replacement& r) { return r.target.filename() != L"gow3.exe"; });
         for (auto& replacement : replacements) {
             if (fs::exists(replacement.target)) {
-                // This process and the offer still map the running runtime: it can be renamed, not overwritten.
-                if (replacement.target.filename() == L"gow3.dll") {
+                // This process and the offer still run gow3.exe: it can be renamed, not overwritten.
+                if (replacement.target.filename() == L"gow3.exe") {
                     replacement.backup = app / L"gow3.update.old";
                     DeleteFileW(replacement.backup.c_str());
                 }
@@ -355,6 +338,7 @@ void Restart(const fs::path& app, const fs::path& game) {
     const auto exe = app / L"gow3.exe";
     // A trailing dot keeps a directory's final backslash away from the closing quote.
     std::wstring command = L"gow3.exe --game-dir \"" + (fs::absolute(game) / L".").native() + L"\"";
+    if (DebugEnabled()) command += L" --debug"; // a gow3_debug.cmd run restarts as one
     STARTUPINFOW startup{sizeof(startup)};
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process))
@@ -417,7 +401,7 @@ bool Check(const fs::path& app, const fs::path& game, const Version& current) {
         const auto zip = Fetch(url, release->size, 30000, 180000);
         if (zip.size() != release->size || "sha256:" + Sha256(zip) != release->digest)
             Fail("The ZIP does not match the release checksum.");
-        Install(Unzip(zip), app, url, [&] {
+        Install(Unzip(zip), app, [&] {
             offer.Close();
             Restart(app, game);
         });
@@ -432,8 +416,7 @@ bool Check(const fs::path& app, const fs::path& game, const Version& current) {
     return false;
 }
 
-// WinRT JSON and Attachment Services need COM on this thread, which goes on to run the game. Attachment Services is an
-// apartment-threaded object: a single-threaded apartment uses it directly.
+// WinRT JSON needs COM on this thread, which goes on to run the game.
 struct Apartment {
     bool joined{};
     Apartment() {
@@ -448,10 +431,6 @@ struct Apartment {
     ~Apartment() { if (joined) winrt::uninit_apartment(); }
 };
 } // namespace
-
-void RemoveRetiredUpdater(const fs::path& app) {
-    for (const auto* name : {L"gow3_update.exe", L"gow3_update.update.old"}) DeleteFileW((app / name).c_str());
-}
 
 bool OfferAndInstall(const fs::path& app, const fs::path& game, std::wstring_view tag) {
     const auto current = ParseVersion(winrt::to_string(tag));

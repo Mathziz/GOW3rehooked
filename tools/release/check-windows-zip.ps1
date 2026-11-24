@@ -1,51 +1,18 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Checks a Windows release ZIP before it is published:
-# - the updaters of v0.1.5 and v0.1.6 accept it (the rules of their gow3_update.exe, src/main/update.cs until v0.1.6);
-# - every program in it names itself in a version resource;
-# - gow3_update.exe is the native stand-in, without .NET or networking, so no downloader ships again.
-param(
-    [Parameter(Mandatory)][string]$Zip,
-    [switch]$Release # tag builds, whose ZIP must carry the stand-in for those updaters
-)
+# - the updater (src/main/update.cpp) accepts it;
+# - gow3.exe names itself in a version resource and carries its real link time: a /Brepro hash in the PE timestamp turned
+#   Microsoft Defender's machine learning against the executables of v0.1.5 to v0.2.1.
+param([Parameter(Mandatory)][string]$Zip)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 
-$programs = 'gow3.exe', 'gow3_debug.exe', 'gow3.dll', 'gow3_update.exe'
+$files = 'gow3.exe', 'gow3_debug.cmd'
 $cache = '_rehooked_/shader_cache/recipes-hash2-aes.bin'
 
-# DLL names in a PE import table, and whether the file is a .NET assembly.
-function Read-Imports([string]$Path) {
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $pe = [BitConverter]::ToInt32($bytes, 0x3c)
-    $sections = [BitConverter]::ToUInt16($bytes, $pe + 6)
-    $optional = $pe + 24
-    $directories = $optional + $(if ([BitConverter]::ToUInt16($bytes, $optional) -eq 0x20b) { 112 } else { 96 })
-    $table = $optional + [BitConverter]::ToUInt16($bytes, $pe + 20)
-    $offset = {
-        param([uint32]$Rva)
-        for ($i = 0; $i -lt $sections; $i++) {
-            $section = $table + 40 * $i
-            $start = [BitConverter]::ToUInt32($bytes, $section + 12)
-            $size = [Math]::Max([BitConverter]::ToUInt32($bytes, $section + 8), [BitConverter]::ToUInt32($bytes, $section + 16))
-            if ($Rva -ge $start -and $Rva -lt $start + $size) { return $Rva - $start + [BitConverter]::ToUInt32($bytes, $section + 20) }
-        }
-        throw "$Path has an import outside its sections."
-    }
-    $dlls = @()
-    $imports = [BitConverter]::ToUInt32($bytes, $directories + 8)
-    if ($imports) {
-        for ($descriptor = & $offset $imports; ($name = [BitConverter]::ToUInt32($bytes, $descriptor + 12)) -ne 0; $descriptor += 20) {
-            $start = & $offset $name
-            $end = [Array]::IndexOf($bytes, [byte]0, $start)
-            $dlls += [Text.Encoding]::ASCII.GetString($bytes, $start, $end - $start)
-        }
-    }
-    [pscustomobject]@{ Dlls = $dlls; DotNet = [BitConverter]::ToUInt32($bytes, $directories + 8 * 14 + 4) -ne 0 }
-}
-
 $size = (Get-Item -LiteralPath $Zip).Length
-if ($size -le 0 -or $size -gt 128MB) { throw "$Zip is $size bytes: the updaters take up to 128 MiB." }
+if ($size -le 0 -or $size -gt 128MB) { throw "$Zip is $size bytes: the updater takes up to 128 MiB." }
 $work = Join-Path ([IO.Path]::GetTempPath()) "gow3-zip-check-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
@@ -56,36 +23,28 @@ try {
         foreach ($entry in $archive.Entries) {
             $name = $entry.FullName.Replace('\', '/')
             if ($name.EndsWith('/')) { continue }
-            if ($name -cnotin $programs -and $name -cne $cache -and $name -cnotmatch '^licenses/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.txt$') {
-                throw "The updaters refuse $name."
+            if ($name -cnotin $files -and $name -cne $cache -and $name -cnotmatch '^licenses/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.txt$') {
+                throw "The updater refuses $name."
             }
             if (-not $names.Add($name) -or $entry.Length -le 0) { throw "$name is empty or appears twice." }
             $total += $entry.Length
-            if ($name -cin $programs) { [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $work $name)) }
+            if ($name -ceq 'gow3.exe') { [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $work $name)) }
         }
-        if ($total -gt 256MB) { throw "The files add up to $total bytes: the updaters take up to 256 MiB." }
-        foreach ($program in $(if ($Release) { $programs } else { $programs[0..2] })) {
-            if (-not $names.Contains($program)) { throw "The ZIP has no $program." }
-        }
+        if ($total -gt 256MB) { throw "The files add up to $total bytes: the updater takes up to 256 MiB." }
+        foreach ($file in $files) { if (-not $names.Contains($file)) { throw "The ZIP has no $file." } }
     } finally {
         $archive.Dispose()
     }
 
-    foreach ($file in Get-ChildItem -LiteralPath $work -File) {
-        $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($file.FullName)
-        if ([string]::IsNullOrWhiteSpace($info.FileDescription) -or [string]::IsNullOrWhiteSpace($info.ProductName) -or
-            [string]::IsNullOrWhiteSpace($info.FileVersion) -or $info.OriginalFilename -ne $file.Name) {
-            throw "$($file.Name) has no complete version resource."
-        }
+    $exe = Join-Path $work 'gow3.exe'
+    $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+    if ([string]::IsNullOrWhiteSpace($info.FileDescription) -or [string]::IsNullOrWhiteSpace($info.ProductName) -or
+        [string]::IsNullOrWhiteSpace($info.FileVersion) -or $info.OriginalFilename -ne 'gow3.exe') {
+        throw 'gow3.exe has no complete version resource.'
     }
-    $standIn = Join-Path $work 'gow3_update.exe'
-    if (Test-Path -LiteralPath $standIn) {
-        $imports = Read-Imports $standIn
-        $others = @($imports.Dlls | Where-Object { $_ -notmatch '^kernel32\.dll$' })
-        if ($imports.DotNet -or $others.Count -or (Get-Item -LiteralPath $standIn).Length -gt 1MB) {
-            throw "gow3_update.exe is not the native stand-in (imports: $($imports.Dlls -join ', '))."
-        }
-    }
+    $bytes = [IO.File]::ReadAllBytes($exe)
+    $linked = [DateTimeOffset]::FromUnixTimeSeconds([BitConverter]::ToUInt32($bytes, [BitConverter]::ToInt32($bytes, 0x3c) + 8))
+    if ([Math]::Abs(($linked - [DateTimeOffset]::UtcNow).TotalDays) -gt 2) { throw "gow3.exe was not linked now ($linked): /Brepro?" }
     Write-Output "$Zip passes the release checks."
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force

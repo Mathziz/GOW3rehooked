@@ -228,16 +228,13 @@ jobs:
           # The shader variants of a full playthrough: the first AOT preparation starts with them.
           Copy-Item assets/shader_cache/recipes-hash2-aes.bin "$package/_rehooked_/shader_cache"
           Set-Content -LiteralPath "$package/licenses/THIRD-PARTY-NOTICES.txt" -Value $notices -Encoding utf8
-          $standIn = $env:GITHUB_REF_TYPE -eq 'tag' -and $env:PACKAGE_SUFFIX -ne '-NoUpdater'
           $binaries = if ($env:VARIANT -eq 'ivybridge') { 'build/ivybridge' } else { 'build' }
           $suffix = if ($env:VARIANT -eq 'ivybridge') { '-AVX1' } else { '' }
           if ($env:PACKAGE_SUFFIX -eq '-NoUpdater') { $binaries += '/no-updater' }
-          Copy-Item "$binaries/gow3.exe", "$binaries/gow3_debug.exe", "$binaries/gow3.dll" $package -Force
-          # The stand-in for the updaters of v0.1.5 and v0.1.6, which refuse a release without gow3_update.exe.
-          if ($standIn) { Copy-Item "$binaries/gow3_update.exe" $package -Force }
+          Copy-Item "$binaries/gow3.exe", src/main/gow3_debug.cmd $package -Force
           $zip = "build/GOW3rehooked-Windows-x86_64$suffix$env:PACKAGE_SUFFIX.zip"
           Compress-Archive -Path "$package/*" -DestinationPath $zip -CompressionLevel Optimal
-          ./tools/release/check-windows-zip.ps1 -Zip $zip -Release:$standIn
+          ./tools/release/check-windows-zip.ps1 -Zip $zip
           "zip=$zip" >> $env:GITHUB_OUTPUT
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

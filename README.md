@@ -54,8 +54,7 @@ Only use the AVX1 build if your CPU doesn't meet the requirements for the standa
    ├── sce_sys\
    ├── EXEC\ ...
    ├── gow3.exe
-   ├── gow3_debug.exe
-   ├── gow3.dll
+   ├── gow3_debug.cmd
    ├── licenses\
    └── _rehooked_\      the shader recipes; everything else is created on first launch
    ```
@@ -251,7 +250,7 @@ Defaults are in bold.
 
 Report problems on the [Issues](../../issues) page, after checking that yours isn't already there. The bug report form requires `gow3.log`, and a report that also comes with the debug dump is much easier to act on.
 
-1. Start the game with `gow3_debug.exe` on Windows or `gow3_debug.AppImage` on Linux. The game runs slower with diagnostics turned on.
+1. Start the game with `gow3_debug.cmd` (or `gow3.exe --debug`) on Windows or `gow3_debug.AppImage` on Linux. The game runs slower with diagnostics turned on.
 2. Reproduce the problem. If it is visual, press F9 while it is on screen. The game pauses for a moment while it records that frame, and **SAVING DEBUG DUMP** shows in the bottom-left corner. Wait until it says **DEBUG DUMP SAVED** before you close the game, or the dump loses that frame's images.
 3. Quit from the title menu, or close the window.
 4. Open `_rehooked_` and find `gow3.log` and the newest `gow3-<date>-<time>.zip`, or all its `.part1.zip`, `.part2.zip`… files when the dump is larger than 24 MB (a crash may leave only `gow3.log`).
@@ -264,7 +263,7 @@ Report problems on the [Issues](../../issues) page, after checking that yours is
 If you are asked for a more detailed capture, set `GOW3_DEBUG=2` before running the debug launcher. It is slower than the default debug mode.
 
 ```powershell
-$env:GOW3_DEBUG = "2"; & "C:\your\game\path\gow3_debug.exe"
+$env:GOW3_DEBUG = "2"; & "C:\your\game\path\gow3_debug.cmd"
 ```
 
 ```sh

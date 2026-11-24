@@ -5,20 +5,16 @@
 #include <stdexcept>
 #include <cstdlib>
 #ifdef _WIN32
+#ifdef GOW3_EXE_ICON
 #include "exe_icon.h"
-#ifndef GOW3_NO_UPDATER
-#include "main/update.h"
 #endif
-#include <shellapi.h>
 #ifdef GOW3_RELEASE_TAG
+#include "main/update.h"
 #include "present/window.h"
 #endif
+#include <shellapi.h>
 
-#ifdef GOW3_RUNTIME_DLL
-extern "C" __declspec(dllexport) int Gow3Main() {
-#else
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
-#endif
 #else
 #include <SDL3/SDL.h>
 #include "present/window.h"
@@ -31,11 +27,13 @@ int main(int count, char** args) {
     bool validate_runtime{};
 #ifdef _WIN32
     HANDLE parent{}, cancel{}, ready{};
-    constexpr auto inspect_option = L"--inspect", validate_option = L"--validate-runtime", game_dir_option = L"--game-dir";
-    constexpr auto usage = "Usage: gow3.exe [--inspect | --validate-runtime] [--game-dir <directory>]";
+    constexpr auto inspect_option = L"--inspect", validate_option = L"--validate-runtime", game_dir_option = L"--game-dir",
+                   debug_option = L"--debug";
+    constexpr auto usage = "Usage: gow3.exe [--inspect | --validate-runtime] [--debug] [--game-dir <directory>]";
 #else
-    constexpr auto inspect_option = "--inspect", validate_option = "--validate-runtime", game_dir_option = "--game-dir";
-    constexpr auto usage = "Usage: gow3 [--inspect | --validate-runtime] [--game-dir <directory>]";
+    constexpr auto inspect_option = "--inspect", validate_option = "--validate-runtime", game_dir_option = "--game-dir",
+                   debug_option = "--debug";
+    constexpr auto usage = "Usage: gow3 [--inspect | --validate-runtime] [--debug] [--game-dir <directory>]";
 #endif
     try {
         const auto app = Gow3::ExecutableDirectory();
@@ -63,6 +61,7 @@ int main(int count, char** args) {
             if (arg == inspect_option) inspect = true;
             else if (arg == validate_option) validate_runtime = true;
             else if (arg == game_dir_option && i + 1 < count) game = args[++i];
+            else if (arg == debug_option) {} // read before main (DebugMode)
 #ifdef _WIN32
             else if (arg == L"--restart-after" && i + 3 < count) {
                 HANDLE* handles[]{&parent, &cancel, &ready};
@@ -93,12 +92,12 @@ int main(int count, char** args) {
             if (result != WAIT_OBJECT_0 + 1) throw std::runtime_error(Gow3::HostError("Wait for previous game"));
         }
         if (!parent && !inspect && !validate_runtime) {
-#ifndef GOW3_NO_UPDATER
-            Gow3::Update::RemoveRetiredUpdater(app);
-#endif
+            // The runtime DLL, launchers and update stand-in of v0.1.5 to v0.2.1, which antiviruses flagged.
+            for (const auto* name : {L"gow3.dll", L"gow3_debug.exe", L"gow3_update.exe", L"gow3_update.update.old"})
+                DeleteFileW((app / name).c_str());
 #ifdef GOW3_RELEASE_TAG
             if (Gow3::Update::OfferAndInstall(app, game, GOW3_RELEASE_TAG)) return 0;
-#elif !defined(GOW3_RUNTIME_DLL)
+#elif defined(GOW3_EXE_ICON)
             Gow3::EmbedGameIcon(game / L"sce_sys" / L"icon0.png");
 #endif
         }

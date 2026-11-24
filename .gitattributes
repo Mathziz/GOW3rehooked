@@ -1,2 +1,3 @@
 /build-fast.sh text eol=lf
 /tools/appimage/package.sh text eol=lf
+/src/main/gow3_debug.cmd text eol=crlf
