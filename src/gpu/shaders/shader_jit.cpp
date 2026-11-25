@@ -378,7 +378,7 @@ bool Renderer::Impl::ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool 
         const u32* cb = &ctx[0x318 + k * 15];
         const VkFormat fmt = ColorFormat(cb[4]);
         if (!cb[0] || fmt == VK_FORMAT_UNDEFINED || !(col_format >> (4 * k) & 0xF) || !(target_mask >> (4 * k) & 0xF)) continue;
-        const u32 s = 1u << (cb[5] >> 12 & 7);
+        const u32 s = ClampSamples(1u << (cb[5] >> 12 & 7));
         if (samples && samples != s) return false;
         samples = s;
         has_color[k] = true;
@@ -403,7 +403,7 @@ bool Renderer::Impl::ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool 
     VkFormat depth_fmt = VK_FORMAT_UNDEFINED, stencil_fmt = VK_FORMAT_UNDEFINED;
     if (z_fmt && (z_effect || db_clear)) {
         const VkFormat fmt = z_fmt == 1 ? VK_FORMAT_D16_UNORM : s_fmt ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
-        const u32 zs = 1u << (ctx[0x010] >> 2 & 3);
+        const u32 zs = ClampSamples(1u << (ctx[0x010] >> 2 & 3));
         if (samples && zs != samples) {
             if (z_effect) return false;
         } else {

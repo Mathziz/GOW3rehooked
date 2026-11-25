@@ -493,6 +493,12 @@ struct Renderer::Impl {
     std::unordered_map<u64, std::pair<Target*, u32>> stencil_at;
     // width | height << 16 from the NOP hint after the CB / DB setup (0: none)
     static inline thread_local u32 cb_extent[8]{}, db_extent = 0;
+    VkSampleCountFlags msaa_samples = VK_SAMPLE_COUNT_1_BIT;  // sample counts supported across color, depth, stencil and sampled views
+    u32 ClampSamples(u32 requested) const {
+        u32 s = std::max(1u, requested);
+        while (s > 1u && !(msaa_samples & s)) s >>= 1;
+        return s;
+    }
     const Target* GetTarget(u64 base, u32 pitch, u32 height, VkFormat fmt, bool depth, bool stencil, u32 extent, u32 samples, u32 tile);
     void RegisterStencil();
     VkImageView TargetAttachment(const Target& t, VkFormat fmt);
