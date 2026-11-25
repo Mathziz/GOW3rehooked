@@ -207,7 +207,6 @@ bool Renderer::Impl::Setup(std::string& error) {
     ClearState();
     const auto fp = QueueFamilies(pd);
     copy_family = CopyFamily(fp);  // CreateDevice asks for the copy engine's queues
-    use_stage_dev = !(uma_single_heap && copy_family == ~0u);
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, family};
     vkCreateCommandPool(dev, &pci, nullptr, &cmd_pool);
     if (copy_family != ~0u) pci.queueFamilyIndex = copy_family, vkCreateCommandPool(dev, &pci, nullptr, &copy_pool), pci.queueFamilyIndex = family;

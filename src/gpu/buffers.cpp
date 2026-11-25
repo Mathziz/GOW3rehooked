@@ -49,9 +49,11 @@ u32 Renderer::Impl::PressureAge() {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
         vkGetPhysicalDeviceMemoryProperties2(pd, &query);
-        budget_pressure = true;
+        bool pressed = true;
         for (u32 h = 0; h < mem.memoryHeapCount; ++h)
-            if (budget_heaps >> h & 1 && budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]) budget_pressure = false;
+            if (budget_heaps >> h & 1 && budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]) pressed = false;
+        // On entering pressure, the empty blocks FreeImage kept as reserve go back too.
+        if (!budget_pressure.exchange(pressed, std::memory_order_relaxed) && pressed) ReclaimEmptyImageBlocks();
     }
     if (!age && budget_pressure && frame % 16 == 0) age = 16;
     static bool logged = false;  // the Submit thread's alone
@@ -620,7 +622,9 @@ Renderer::Impl::TempSlice Renderer::Impl::Temp(u64 size) {
 void Renderer::Impl::NoteFrameBuffers() {
     auto note = [](bool over, bool needed, u32& quiet) { quiet = over ? (needed ? 0u : quiet + 1) : 0u; };
     note(frame_temp.size() > 1 || (frame_temp.size() == 1 && frame_temp[0].size > temp_chunk_size), temp_at > 0 || temp_used > temp_chunk_size, temp_quiet);
-    note(scratch.size > scratch_reserve, scratch_used > scratch_reserve, scratch_quiet);
+    // Under pressure the scratch follows its use: it goes once frames use under half of it (Upload makes it anew, smaller).
+    const u64 keep = Pressed() ? 0 : scratch_reserve;
+    note(scratch.size > keep, scratch_used > (keep ? keep : scratch.size / 2), scratch_quiet);
     note(stage.size() > 1 || (stage.size() == 1 && stage[0].size > stage_chunk_size), stage_at > 0 || stage_used > stage_chunk_size, stage_quiet);
     note(rb.size > kRbReserve || rb_dev.size > kRbReserve, rb_used > kRbReserve, rb_quiet);
 }
@@ -632,7 +636,7 @@ void Renderer::Impl::TrimFrameBuffers() {
         while (frame_temp.size() > keep) FreeBuffer(frame_temp.back()), frame_temp.pop_back();
         temp_quiet = 0;
     }
-    if (scratch.size > scratch_reserve && scratch_quiet >= limit) FreeBuffer(scratch), scratch_quiet = 0;
+    if (scratch.size > (Pressed() ? 0 : scratch_reserve) && scratch_quiet >= std::max(limit, 1u)) FreeBuffer(scratch), scratch_quiet = 0;
     if ((stage.size() > 1 || (stage.size() == 1 && stage[0].size > stage_chunk_size)) && stage_quiet >= limit) {
         const size_t keep = !stage.empty() && stage[0].size <= stage_chunk_size ? 1 : 0;
         while (stage.size() > keep) {

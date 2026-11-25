@@ -570,12 +570,14 @@ void Renderer::Impl::LoadDeviceFunctions() {
     uma_single_heap = integrated && mem.memoryHeapCount == 1 &&
                       Type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != ~0u;
     direct_tables = uma_single_heap;
+    use_stage_dev = !integrated;  // a VRAM twin of the staging chunks would be a second copy in the same RAM
     u64 total_heap = 0;
     for (u32 i = 0; i < mem.memoryHeapCount; ++i) total_heap += mem.memoryHeaps[i].size;
     const u32 local_type = Type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     const u32 vram_heap = local_type != ~0u ? mem.memoryTypes[local_type].heapIndex : 0;
     if (has_budget) budget_heaps = integrated ? (1u << mem.memoryHeapCount) - 1 : 1u << vram_heap;
-    compact_memory = integrated ? total_heap <= (6ull << 30) : mem.memoryHeaps[vram_heap].size <= (4ull << 30);
+    // An 8 GB APU reports ~6.8 GiB of heaps (carve-out + shared); 16 GB ones ~10 GiB.
+    compact_memory = integrated ? total_heap <= (8ull << 30) : mem.memoryHeaps[vram_heap].size <= (4ull << 30);
     if (compact_memory) {
         chunk_size = chunk_used = 64ull << 20;
         image_block_size = 64ull << 20;

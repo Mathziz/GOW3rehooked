@@ -1750,8 +1750,9 @@ void Renderer::Impl::FreeImage(const Tex& t) {
             if (auto prev = it; it != b.free.begin() && (--prev)->first + prev->second == it->first) prev->second += it->second, b.free.erase(it);
             if (!b.draining) image_free[b.lasting] += t.mem_size;
             // A block free as a whole goes back to the driver (a level load's peak otherwise stays allocated for good),
-            // keeping image_reserve_blocks of room for the next textures; a lasting or draining one always goes.
-            if (b.free.size() == 1 && b.free.begin()->second == image_block_size && (b.lasting || b.draining || image_free[0] - image_block_size >= image_reserve_blocks * image_block_size))
+            // keeping image_reserve_blocks of room for the next textures (none under memory pressure); a lasting or draining one always goes.
+            if (b.free.size() == 1 && b.free.begin()->second == image_block_size &&
+                (b.lasting || b.draining || image_free[0] - image_block_size >= (Pressed() ? 0 : image_reserve_blocks) * image_block_size))
                 empty = b.mem, image_free[b.lasting] -= (b.draining ? 0 : image_block_size), image_blocks.erase(block);
             break;
         }
@@ -2734,7 +2735,7 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
         if (buf) {
             if (buf->size < need) {
                 FreeBuffer(*buf);
-                const u64 alloc_size = std::max(need, reserve);
+                const u64 alloc_size = std::max(need, Pressed() ? std::min(std::bit_ceil(need), reserve) : reserve);
                 *buf = MakeBuffer(alloc_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
                                   prologue ? "scratch" : "upload temp");
                 if (!buf->buf && alloc_size > need)

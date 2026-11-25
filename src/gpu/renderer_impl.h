@@ -151,17 +151,19 @@ struct Renderer::Impl {
     // Steam Deck), so DeviceType takes the largest heap once that budget is spent.
     bool uma_budget = false;
     bool uma_single_heap = false;  // integrated GPU with one DEVICE_LOCAL+HOST_VISIBLE heap
-    bool use_stage_dev = true;     // false on single-heap UMA without a copy engine: stage -> mirror directly
+    bool use_stage_dev = true;     // false on integrated GPUs (host and device heaps are the same RAM): stage -> mirror directly
     bool direct_tables = false;    // single-heap UMA: write draw tables directly into host-visible device memory
     // Heaps PressureAge watches (VK_EXT_memory_budget): all of an integrated GPU's (DeviceType spills between them), the
     // device-local one of a discrete GPU.
     u32 budget_heaps = 0;
-    bool compact_memory = false;   // integrated GPU with <= 6 GiB total Vulkan heap or discrete with <= 4 GiB VRAM: smaller fixed chunks/reserves
+    bool compact_memory = false;   // integrated GPU with <= 8 GiB total Vulkan heap (8 GB of RAM) or discrete with <= 4 GiB VRAM: smaller fixed chunks/reserves
     std::atomic<bool> spilled{false};
     std::atomic<bool> alloc_failed{false};
-    std::atomic<bool> alloc_pressure{false};  // an allocation failed since the last Submit start (PressureAge)
-    bool budget_pressure = false;             // PressureAge saw every watched heap within an eighth of its budget
+    std::atomic<bool> alloc_pressure{false};   // an allocation failed since the last Submit start (PressureAge)
+    std::atomic<bool> budget_pressure{false};  // PressureAge saw every watched heap within an eighth of its budget
     u32 PressureAge();  // frames a texture may go unused under memory pressure, 0 without any
+    // Under memory pressure the reserves (empty image blocks, prologue scratch) shrink to what is used.
+    bool Pressed() const { return alloc_pressure.load(std::memory_order_relaxed) || budget_pressure.load(std::memory_order_relaxed); }
     // The mirror is larger than the driver's maxBufferSize (AMD, RADV): copies between it and an image go through a temp
     // buffer. Mesa 26.0 RADV read zeros from it in buffer-to-image copies past 4 GB (issue #24: green video, black frame);
     // buffer copies and storage buffer descriptors reach the whole mirror.
