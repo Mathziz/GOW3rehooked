@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <SDL3/SDL.h>
 #ifdef _WIN32
 #include <evntprov.h>
@@ -271,6 +272,21 @@ u32 ContactFlags(uintptr_t surface) {
     return u32(p[0]) << 24 | u32(p[1]) << 16 | u32(p[2]) << 8 | p[3];
 }
 
+// Motion sounds compare per-frame movement with cutoffs authored for 59.94 Hz; above it they never start (#9).
+struct MotionSoundOperands {
+    float cutoff;                             // 0.01 scaled to the frame's gameplay step
+    alignas(16) float displacement_scale[4];  // the actor's displacement scaled to its 59.94 Hz share
+};
+MotionSoundOperands* motion_sound;
+
+void UpdateMotionSound() {
+    if (!motion_sound) return;
+    constexpr float reference_rate = GameFrameRate(60);
+    const float gameplay_dt = *Guest<const float*>(0x3cdcb0), frame_dt = *Guest<const float*>(0x3cdca0);
+    motion_sound->cutoff = gameplay_dt > 0.f ? 0.01f * gameplay_dt * reference_rate : 0.01f;
+    std::fill_n(motion_sound->displacement_scale, 4, frame_dt > 0.f ? 1.f / (frame_dt * reference_rate) : 1.f);
+}
+
 // 011EFE10: the timing globals at the configured rate, without overwriting the 59.94 Hz constant.
 void PS4_SYSV_ABI SetFrameRate(float) {
     *Guest<float*>(0x3cdc80) = configured_frame_rate;
@@ -278,6 +294,7 @@ void PS4_SYSV_ABI SetFrameRate(float) {
     const float delta = 1.f / configured_frame_rate;
     *Guest<float*>(0x3cdca0) = delta;
     std::fill_n(Guest<float*>(0x3cdcb0), 4, delta);
+    UpdateMotionSound();
 }
 
 // 011EF9E0: the frame's step, the TSC since its last call (02A77F40) in nominal frames, at least one and four above four.
@@ -290,8 +307,10 @@ void PS4_SYSV_ABI StepFrame() {
     static float debt;  // <= 0
     original_frame_step();
     // The variable step only: not the fixed step (02A77F50) or the averaged and doubled ones (02A77F34).
-    if ((*Guest<const u32*>(0x3cdcc0) & 3) != 1 || *Guest<const s32*>(0x1a77f50) || *Guest<const s32*>(0x1a77f34))
-        return void(debt = 0);
+    if ((*Guest<const u32*>(0x3cdcc0) & 3) != 1 || *Guest<const s32*>(0x1a77f50) || *Guest<const s32*>(0x1a77f34)) {
+        debt = 0;
+        return UpdateMotionSound();
+    }
     const float rate = *Guest<const float*>(0x3cdc80);
     const float want = std::min(float(*Guest<const s64*>(0x1a77f40)) * rate / tsc, 4.f) + debt, step = std::max(want, 1.f);
     debt = std::max(want - step, -4.f);
@@ -299,6 +318,56 @@ void PS4_SYSV_ABI StepFrame() {
     const float k = step / (dt * rate);  // the channels (013CDCB0) scale with the step
     dt *= k;
     for (float& c : std::span(Guest<float*>(0x3cdcb0), 4)) c *= k;
+    UpdateMotionSound();
+}
+
+void AddMotionSoundPatches(Core::Module& eboot, std::vector<MemoryPatch>& patches) {
+    // The operands (first 16 KB) and the displacement stub (next 16 KB) within rel32 reach of the EBOOT.
+    void* page{};
+    if (eboot.memory->MapMemory(&page, guest_base, 0x8000, Core::MemoryProt::CpuReadWrite, Core::MemoryMapFlags::NoFlags,
+                                Core::VMAType::System, "gow3 motion sound"))
+        throw std::runtime_error("Map motion sound operands");
+    motion_sound = static_cast<MotionSoundOperands*>(page);
+    *motion_sound = {0.01f, {1.f, 1.f, 1.f, 1.f}};  // SetFrameRate supplies the delta before the first simulation step.
+    const auto rel32 = [](uintptr_t end, const void* target) {
+        const auto displacement = s64(reinterpret_cast<uintptr_t>(target)) - s64(end);
+        if (!std::in_range<s32>(displacement)) throw std::runtime_error("Motion sound operand out of rel32 range");
+        return s32(displacement);
+    };
+    // `vucomiss xmm, [0.01]` on the movement of the frame: the push/pull loop (01062810) and scrape (01062CD0), then
+    // both start/stop pairs of the balance beam's loop (012B51C0, 012B5800).
+    for (const auto& [rva, original] : std::initializer_list<std::pair<u64, std::vector<u8>>>{
+             {0x62893, {0xc5, 0xf8, 0x2e, 0x0d, 0x29, 0x21, 0x29, 0x00}},
+             {0x63032, {0xc5, 0xf8, 0x2e, 0x05, 0xaa, 0x19, 0x29, 0x00}},
+             {0x2b539f, {0xc5, 0xf8, 0x2e, 0x05, 0xa5, 0xc0, 0x09, 0x00}},
+             {0x2b5407, {0xc5, 0xf8, 0x2e, 0x05, 0x3d, 0xc0, 0x09, 0x00}},
+             {0x2b58ad, {0xc5, 0xf8, 0x2e, 0x05, 0xab, 0xbb, 0x09, 0x00}},
+             {0x2b5915, {0xc5, 0xf8, 0x2e, 0x05, 0x43, 0xbb, 0x09, 0x00}}}) {
+        auto replacement = original;
+        const s32 rel = rel32(guest_base + rva + original.size(), &motion_sound->cutoff);
+        std::memcpy(replacement.data() + 4, &rel, sizeof(rel));
+        patches.push_back({rva, original, std::move(replacement)});
+    }
+    // 0109E9FC, the actor's motion sounds (0109E820, the Gaia pillar's SND_PUSHPULL_LP): `vmovaps xmm0, [rdx+0x140]` loads
+    // its displacement of the frame, whose length starts the loop above 0.02 and sets its intensity. It jumps to a copy
+    // that scales it to its 59.94 Hz share and back.
+    constexpr u64 load = 0x9e9fc;
+    auto* const code = static_cast<u8*>(page) + 0x4000;
+    const auto stub = reinterpret_cast<uintptr_t>(code);
+    u8 scaled[]{0xc5, 0xf8, 0x28, 0x82, 0x40, 0x01, 0x00, 0x00,  // vmovaps xmm0, [rdx+0x140]
+                0xc5, 0xf8, 0x59, 0x05, 0, 0, 0, 0,              // vmulps xmm0, xmm0, [displacement_scale]
+                0xe9, 0, 0, 0, 0};                               // jmp 0109EA04
+    const s32 scale = rel32(stub + 16, motion_sound->displacement_scale);
+    const s32 back = rel32(stub + 21, reinterpret_cast<const void*>(guest_base + load + 8));
+    std::memcpy(scaled + 12, &scale, sizeof(scale));
+    std::memcpy(scaled + 17, &back, sizeof(back));
+    std::memcpy(code, scaled, sizeof(scaled));
+    if (eboot.memory->Protect(stub, 0x4000, Core::MemoryProt::CpuRead | Core::MemoryProt::CpuExec))
+        throw std::runtime_error("Protect motion sound stub");
+    std::vector<u8> jump{0xe9, 0, 0, 0, 0, 0x0f, 0x1f, 0x00};  // jmp stub; nop
+    const s32 out = rel32(guest_base + load + 5, code);
+    std::memcpy(jump.data() + 1, &out, sizeof(out));
+    patches.push_back({load, {scaled, scaled + 8}, std::move(jump)});
 }
 
 // 010E7DF0: an animation event (FUN_010e1810 case 0x12) starts a slow motion, scale DAT_0144e9f4 for DAT_0144e9f8 s through
@@ -360,6 +429,55 @@ __m128 PS4_SYSV_ABI ProbeMotionPhysics(uintptr_t actor, uintptr_t context) {
         }
     }
     return original_motion_physics(actor, context);
+}
+
+using PrepareActorMotion = void(PS4_SYSV_ABI*)(uintptr_t, u32, uintptr_t);
+using RebaseActor = void(PS4_SYSV_ABI*)(uintptr_t, const __m128*);
+PrepareActorMotion original_prepare_actor_motion;
+RebaseActor original_rebase_actor;
+struct GrappleRelease { uintptr_t object; bool hanging, blending; };
+struct GrappleMotionStep { uintptr_t actor; float share; };
+thread_local GrappleRelease grapple_release{};
+thread_local GrappleMotionStep* grapple_motion_step{};
+
+// 010800F0 sees the change from grapple motion to collision-only motion before the actor becomes airborne.
+void PS4_SYSV_ABI PrepareGrappleRelease(uintptr_t actor, u32 mode, uintptr_t context) {
+    if (actor != MainActor()) {
+        original_prepare_actor_motion(actor, mode, context);
+        return;
+    }
+    const auto object = *reinterpret_cast<const uintptr_t*>(actor + 8);
+    const auto state = *reinterpret_cast<const u16*>(actor + 0x1c0);
+    const auto motion = *reinterpret_cast<const u32*>(context + 0x16c);
+    const float blend = *reinterpret_cast<const float*>(actor + 0x1a8);
+    const bool releasing = object && grapple_release.object == object && motion == 1 &&
+        ((state == 0x4000 && grapple_release.hanging && blend < 1.f) ||
+         ((state == 0x4000 || state == 8) && grapple_release.blending));
+    // Apply once more when the blend ends. The object can still hold the last blended pose.
+    grapple_release = {object, state == 0x4000 && motion == 0x17, releasing && blend < 1.f};
+    const float share = *reinterpret_cast<const float*>(context + 0x148) * GameFrameRate(60);
+    GrappleMotionStep step{actor, share};
+    const auto previous = grapple_motion_step;
+    grapple_motion_step = releasing && share > 0.f && share < 1.f ? &step : nullptr;
+    original_prepare_actor_motion(actor, mode, context);
+    grapple_motion_step = previous;
+}
+
+// 010E8C99 feeds the actor's own visual origin back into physics. Keep its 59.94 Hz displacement share.
+void PS4_SYSV_ABI RebaseGrappleRelease(uintptr_t actor, const __m128* pose) {
+    const auto* step = grapple_motion_step;
+    if (step && actor == step->actor && Caller(__builtin_return_address(0)) == 0x010e8c9c) {
+        const auto object = *reinterpret_cast<const uintptr_t*>(actor + 8);
+        if (object && *reinterpret_cast<const s16*>(object + 0x80) == -1 &&
+            !*reinterpret_cast<const uintptr_t*>(object + 0x28)) {
+            const auto position = _mm_load_ps(reinterpret_cast<const float*>(actor + 0xa0));
+            const auto delta = _mm_mul_ps(_mm_sub_ps(pose[3], position), _mm_set1_ps(step->share));
+            const __m128 adjusted[]{pose[0], pose[1], pose[2], _mm_blend_ps(_mm_add_ps(position, delta), pose[3], 8)};
+            original_rebase_actor(actor, adjusted);
+            return;
+        }
+    }
+    original_rebase_actor(actor, pose);
 }
 
 // 010597A0: hang contact. During a ledge corner (ResolveLedgeMotion) a rejected hang retries pushed off the wall.
@@ -1520,6 +1638,16 @@ void InstallHooks(Core::Module& eboot, const Config& config) {
         {0x970f0, reinterpret_cast<const void*>(ResolveBladeAirMotion)},
         {0x1a5e30, reinterpret_cast<const void*>(WaitJobs)},
     };
+    if (config.fps > 60) {
+        constexpr u8 prepare_motion[]{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+                                      0x53, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00};
+        constexpr u8 rebase_actor[]{0xc5, 0xf8, 0x28, 0x46, 0x30, 0xc5, 0xf8, 0x5c, 0x87, 0xa0, 0x00, 0x00, 0x00,
+                                   0xc5, 0xf8, 0x58, 0x8f, 0xe0, 0x02, 0x00, 0x00};
+        original_prepare_actor_motion = reinterpret_cast<PrepareActorMotion>(PrepareTrampoline(0x800f0, prepare_motion));
+        original_rebase_actor = reinterpret_cast<RebaseActor>(PrepareTrampoline(0x5f920, rebase_actor));
+        detours.emplace_back(0x800f0, reinterpret_cast<const void*>(PrepareGrappleRelease));
+        detours.emplace_back(0x5f920, reinterpret_cast<const void*>(RebaseGrappleRelease));
+    }
     if (config.nvidia_reflex) {
         constexpr u8 input[]{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
         original_input_update = reinterpret_cast<InputUpdate>(PrepareTrampoline(0x1eec40, input));
@@ -1594,6 +1722,7 @@ void InstallHooks(Core::Module& eboot, const Config& config) {
         jump.insert(jump.end(), reinterpret_cast<const u8*>(&address), reinterpret_cast<const u8*>(&address) + 8);
         patches.push_back({rva, {Guest<const u8*>(rva), Guest<const u8*>(rva) + jump.size()}, std::move(jump)});
     }
+    if (config.fps > 60) AddMotionSoundPatches(eboot, patches);
     // The job queue's three spin loops ([mov ecx, 1;] xor eax, eax; lock cmpxchg [DAT_024ba6e0], rcx; test rax, rax; jnz),
     // each replaced whole by `mov rax, LockJobQueue; call rax`: only callee-saved registers are live past them.
     for (const auto& [rva, loop] : std::initializer_list<std::pair<u64, std::vector<u8>>>{

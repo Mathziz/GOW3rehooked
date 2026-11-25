@@ -125,6 +125,8 @@ AjmMp3Decoder::~AjmMp3Decoder() {
 
 void AjmMp3Decoder::Reset() {
     avcodec_flush_buffers(m_codec_context);
+    av_parser_close(m_parser); // its partial frame belongs to the stream before the reset
+    m_parser = av_parser_init(m_codec->id);
     m_header.reset();
     m_frame_samples = 0;
 }
@@ -159,11 +161,14 @@ DecoderResult AjmMp3Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuff
     in_buf = in_buf.subspan(ret);
 
     if (pkt->size >= 4) {
+        // The OFL (LAME, VBRI or FGH gapless header) is the stream's first frame. Audio data passed the FGH check by
+        // chance and restarted the skip mid-stream: HEPHFETCH.XVAG's front-left layer jumped 1.17 s ahead at 76 s.
+        const bool parse_ofl = !m_header && False(m_flags & AjmMp3CodecFlags::IgnoreOfl);
         u32 raw_header = 0;
         std::memcpy(&raw_header, pkt->data, sizeof(raw_header));
         m_header = std::byteswap(raw_header);
         AjmDecMp3ParseFrame info{};
-        auto res = ParseMp3Header(pkt->data, pkt->size, true, &info);
+        auto res = ParseMp3Header(pkt->data, pkt->size, parse_ofl, &info);
         ASSERT(res == ORBIS_OK);
 
         m_frame_samples = info.samples_per_channel;

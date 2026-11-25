@@ -19,6 +19,12 @@ No game code or assets are included. You need your own copy of the game.
 > [!IMPORTANT]
 > GOW3rehooked is independent from shadPS4. Please don't take questions or bug reports about it to the shadPS4 developers. Use the [Issues](../../issues) page of this repository.
 
+<br>
+
+[Requirements](#requirements) | [Installation](#installation) | [Performance](#performance) | [Features](#features) | [Settings](#settings) | [Troubleshooting](#troubleshooting) | [Reporting bugs](#reporting-bugs) | [Credits](#credits) | [License](#license)
+
+<br>
+
 ## Requirements
 
 | Component | Requirement |

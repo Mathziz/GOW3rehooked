@@ -303,13 +303,14 @@ DynamicCaps QueryDynamicCaps(VkPhysicalDevice pd, std::span<const VkExtensionPro
             VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &eds3_p};
             vkGetPhysicalDeviceProperties2(pd, &p2);
 
-            // AMD proprietary/AMDVLK (XGL/PAL) corrupts 2x MSAA in 8x8 tiles with dynamic rasterizationSamples; bake it into the pipeline.
+            // AMD proprietary/AMDVLK (XGL/PAL): dynamic rasterizationSamples corrupts 2x MSAA in 8x8 tiles, and PAL gfx6 (Polaris)
+            // clobbers DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE on pipeline switches with dynamic alphaToCoverageEnable. Bake both.
             const bool amd_xgl = driver_p.driverID == VK_DRIVER_ID_AMD_PROPRIETARY || driver_p.driverID == VK_DRIVER_ID_AMD_OPEN_SOURCE;
             c.unrestricted_topology = eds3_p.dynamicPrimitiveTopologyUnrestricted != VK_FALSE;
             c.depth_clip_negative_one_to_one = eds3_q.extendedDynamicState3DepthClipNegativeOneToOne != VK_FALSE;
             c.depth_clamp_enable = eds3_q.extendedDynamicState3DepthClampEnable != VK_FALSE;
             c.rasterization_samples = !amd_xgl && eds3_q.extendedDynamicState3RasterizationSamples != VK_FALSE;
-            c.alpha_to_coverage_enable = eds3_q.extendedDynamicState3AlphaToCoverageEnable != VK_FALSE;
+            c.alpha_to_coverage_enable = !amd_xgl && eds3_q.extendedDynamicState3AlphaToCoverageEnable != VK_FALSE;
             c.color_blend_enable = eds3_q.extendedDynamicState3ColorBlendEnable != VK_FALSE;
             c.color_blend_equation = eds3_q.extendedDynamicState3ColorBlendEquation != VK_FALSE;
             c.color_write_mask = eds3_q.extendedDynamicState3ColorWriteMask != VK_FALSE;

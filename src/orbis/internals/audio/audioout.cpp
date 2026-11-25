@@ -148,11 +148,9 @@ static int AllocatePort(OrbisAudioOutPort type) {
 
 static void ApplyVolume(PortOut& port) {
     auto volume = port.volume;
-    if (port.type == OrbisAudioOutPort::PadSpk && port.is_mix_to_main) {
-        for (auto& channel_volume : volume) {
-            channel_volume = static_cast<s64>(channel_volume) * port.mixLevelPadSpk /
-                             ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_0DB;
-        }
+    // No controller speaker here, and the game also plays the pad's sounds on the main mix (the weapon upgrade, #56).
+    if (port.type == OrbisAudioOutPort::PadSpk) {
+        volume.fill(0);
     }
     port.impl->SetVolume(volume);
 }
@@ -529,7 +527,8 @@ s32 PS4_SYSV_ABI sceAudioOutGetPortState(s32 handle, OrbisAudioOutPortState* sta
     case OrbisAudioOutPort::Bgm:
     case OrbisAudioOutPort::Audio3d:
         state->output = ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_PRIMARY;
-        state->channel = port->format_info.num_channels > 2 ? 2 : port->format_info.num_channels;
+        // brbDriver::Initialize reads it once and mixes for that many speakers (stereo, 5.1 or 7.1).
+        state->channel = port->impl->OutputChannels();
         break;
     case OrbisAudioOutPort::Voice:
     case OrbisAudioOutPort::Personal:

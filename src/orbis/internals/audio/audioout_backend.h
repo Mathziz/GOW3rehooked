@@ -5,6 +5,7 @@
 
 #include <array>
 #include <memory>
+#include "orbis/common/types.h"
 
 namespace Libraries::AudioOut {
 
@@ -19,6 +20,9 @@ public:
     virtual void Output(void* ptr) = 0;
 
     virtual void SetVolume(const std::array<int, 8>& ch_volumes) = 0;
+
+    /// The output device's speakers, which the game mixes for: 2, 6 (5.1) or 8 (7.1).
+    virtual u8 OutputChannels() const = 0;
 };
 
 class AudioOutBackend {

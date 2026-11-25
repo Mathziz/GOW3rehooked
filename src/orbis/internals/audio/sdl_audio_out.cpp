@@ -138,6 +138,10 @@ public:
         }
     }
 
+    u8 OutputChannels() const override {
+        return output_channels;
+    }
+
     u64 GetLastOutputTime() const {
         return last_output_time.load(std::memory_order_acquire);
     }
@@ -286,9 +290,13 @@ private:
         }
 
         SDL_AudioSpec dev_spec{};
-        if (num_channels >= 6 &&
-            SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &dev_spec, nullptr) &&
-            dev_spec.channels >= 1 && dev_spec.channels <= 2) {
+        const bool device_known =
+            SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &dev_spec, nullptr);
+        // Other layouts would take the game's 8 channel mix (brbDriver maps 3, 4, 5 and 7 to 8).
+        output_channels = device_known && (dev_spec.channels == 6 || dev_spec.channels == 8)
+                              ? u8(dev_spec.channels)
+                              : 2;
+        if (num_channels >= 6 && device_known && dev_spec.channels >= 1 && dev_spec.channels <= 2) {
             ps4_downmix = true;
             internal_buffer_size = buffer_frames * sizeof(float) * 2;
             LOG_INFO(Lib_AudioOut, "Stereo device: using PS4-accurate {}ch->stereo downmix",
@@ -328,8 +336,8 @@ private:
             return false;
         }
 
-        LOG_INFO(Lib_AudioOut, "Opened audio device: {} ({} Hz, {} ch, gain: {:.3f})", device_name,
-                 sample_rate, num_channels, initial_gain);
+        LOG_INFO(Lib_AudioOut, "Opened audio device: {} ({} Hz, {} ch, gain: {:.3f}, {} speakers)",
+                 device_name, sample_rate, num_channels, initial_gain, output_channels);
         return true;
     }
 
@@ -640,6 +648,7 @@ private:
     const bool is_std;
     // Set when the output device is stereo and we fold 5.1/7.1 ourselves.
     bool ps4_downmix{false};
+    u8 output_channels{2};
     const std::array<int, 8> channel_layout;
 
     alignas(64) u64 period_us{0};

@@ -94,7 +94,7 @@ private:
     AVFrame* ConvertAudioFrame(AVFrame* frame);
 
     const AjmFormatEncoding m_format;
-    [[maybe_unused]] const AjmMp3CodecFlags m_flags;
+    const AjmMp3CodecFlags m_flags;
     const AVCodec* m_codec = nullptr;
     AVCodecContext* m_codec_context = nullptr;
     AVCodecParserContext* m_parser = nullptr;

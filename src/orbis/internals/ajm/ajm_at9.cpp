@@ -94,32 +94,44 @@ void AjmAt9Decoder::GetInfo(void* out_info) const {
 u8 g_at9_guid[] = {0xD2, 0x42, 0xE1, 0x47, 0xBA, 0x36, 0x8D, 0x4D,
                    0x88, 0xFC, 0x61, 0x65, 0x4F, 0x8C, 0x83, 0x6C};
 
-void AjmAt9Decoder::ParseRIFFHeader(std::span<u8>& in_buf, AjmInstanceGapless& gapless) {
-    auto* header = reinterpret_cast<RIFFHeader*>(in_buf.data());
+bool AjmAt9Decoder::ParseRIFFHeader(std::span<u8>& in_buf, AjmInstanceGapless& gapless) {
+    if (in_buf.size() < sizeof(RIFFHeader) + sizeof(ChunkHeader)) {
+        return false;
+    }
+    const auto* header = reinterpret_cast<const RIFFHeader*>(in_buf.data());
+    if (header->riff != 'FFIR' || header->wave != 'EVAW') {
+        return false;
+    }
     in_buf = in_buf.subspan(sizeof(RIFFHeader));
 
-    ASSERT(header->riff == 'FFIR');
-    ASSERT(header->wave == 'EVAW');
-
-    auto* chunk = reinterpret_cast<ChunkHeader*>(in_buf.data());
-    in_buf = in_buf.subspan(sizeof(ChunkHeader));
-    while (chunk->tag != 'atad') {
+    bool result = false;
+    while (in_buf.size() >= sizeof(ChunkHeader)) {
+        const auto* chunk = reinterpret_cast<const ChunkHeader*>(in_buf.data());
+        in_buf = in_buf.subspan(sizeof(ChunkHeader));
+        if (chunk->tag == 'atad') {
+            break;
+        }
+        if (in_buf.size() < chunk->length) {
+            return false;
+        }
         switch (chunk->tag) {
         case ' tmf': {
-            ASSERT(chunk->length == sizeof(AudioFormat));
-            auto* fmt = reinterpret_cast<AudioFormat*>(in_buf.data());
-
-            ASSERT(fmt->fmt_type == 0xFFFE);
-            ASSERT(memcmp(fmt->guid, g_at9_guid, 16) == 0);
+            const auto* fmt = reinterpret_cast<const AudioFormat*>(in_buf.data());
+            if (chunk->length != sizeof(AudioFormat) || fmt->fmt_type != 0xFFFE ||
+                std::memcmp(fmt->guid, g_at9_guid, 16) != 0) {
+                return false;
+            }
             AjmDecAt9InitializeParameters init_params = {};
             std::memcpy(init_params.config_data, fmt->config_data, ORBIS_AT9_CONFIG_DATA_SIZE);
             Initialize(&init_params, sizeof(init_params));
+            result = true;
             break;
         }
         case 'tcaf': {
-            ASSERT(chunk->length == sizeof(SampleData));
-            auto* samples = reinterpret_cast<SampleData*>(in_buf.data());
-
+            if (chunk->length != sizeof(SampleData)) {
+                return false;
+            }
+            const auto* samples = reinterpret_cast<const SampleData*>(in_buf.data());
             gapless.init.total_samples = samples->sample_length;
             gapless.init.skip_samples = samples->encoder_delay;
             gapless.Reset();
@@ -128,11 +140,9 @@ void AjmAt9Decoder::ParseRIFFHeader(std::span<u8>& in_buf, AjmInstanceGapless& g
         default:
             break;
         }
-        in_buf = in_buf.subspan(chunk->length);
-
-        chunk = reinterpret_cast<ChunkHeader*>(in_buf.data());
-        in_buf = in_buf.subspan(sizeof(ChunkHeader));
+        in_buf = in_buf.subspan(std::min(in_buf.size(), size_t((chunk->length + 1) & ~1u)));
     }
+    return result;
 }
 
 u32 AjmAt9Decoder::GetMinimumInputSize() const {
@@ -142,14 +152,21 @@ u32 AjmAt9Decoder::GetMinimumInputSize() const {
 DecoderResult AjmAt9Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuffer& output,
                                          AjmInstanceGapless& gapless) {
     DecoderResult result{};
-    if (True(m_flags & AjmAt9CodecFlags::ParseRiffHeader) &&
-        *reinterpret_cast<u32*>(in_buf.data()) == 'FFIR') {
-        ParseRIFFHeader(in_buf, gapless);
+    if (True(m_flags & AjmAt9CodecFlags::ParseRiffHeader) && in_buf.size() >= sizeof(RIFFHeader) &&
+        *reinterpret_cast<const u32*>(in_buf.data()) == 'FFIR') {
+        if (!ParseRIFFHeader(in_buf, gapless)) {
+            LOG_ERROR(Lib_Ajm, "Failed to parse ATRAC9 RIFF header");
+            result.result = ORBIS_AJM_RESULT_CODEC_ERROR | ORBIS_AJM_RESULT_FATAL;
+            return result;
+        }
         result.is_reset = true;
     }
 
     if (!m_is_initialized) {
         result.result = ORBIS_AJM_RESULT_NOT_INITIALIZED;
+        return result;
+    }
+    if (in_buf.empty()) { // the job held only the header
         return result;
     }
 
