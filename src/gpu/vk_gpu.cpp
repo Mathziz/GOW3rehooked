@@ -492,7 +492,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         const VkFormat fmt = ColorFormat(cb[4]);
         if (!cb[0] || fmt == VK_FORMAT_UNDEFINED || !(col_format >> (4 * k) & 0xF) || !(target_mask >> (4 * k) & 0xF)) continue;
         const u32 pitch = ((cb[1] & 0x7FF) + 1) * 8, ph = ((cb[2] & 0x3FFFFF) + 1) * 64 / pitch;
-        color[k] = GetTarget((u64)cb[0] << 8, pitch, ph, fmt, false, false, cb_extent[k], ClampSamples(1u << (cb[5] >> 12 & 7)), cb[5] & 0x1F);  // ATTRIB NUM_SAMPLES, TILE_MODE_INDEX
+        color[k] = GetTarget((u64)cb[0] << 8, pitch, ph, fmt, false, false, cb_extent[k], 1u << (cb[5] >> 12 & 7), cb[5] & 0x1F);  // ATTRIB NUM_SAMPLES, TILE_MODE_INDEX
         if (!color[k]) return Count(stats.skipped), Note("render target allocation failed");
         // Written only when it changes: the target is shared by every recording thread.
         if (const bool bgra = AmdGpu::MrtSwizzle(cb[4] >> 11 & 3, AmdGpu::DataFormat(cb[4] >> 2 & 0x1F)).Map(0) == 2; color[k]->bgra != bgra)
@@ -524,7 +524,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     if (z_fmt && (z_effect || db_clear)) {
         const u32 size = ctx[0x016], w = ((size & 0x7FF) + 1) * 8, h = ((size >> 11 & 0x7FF) + 1) * 8;
         const VkFormat fmt = z_fmt == 1 ? VK_FORMAT_D16_UNORM : s_fmt ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
-        depth = GetTarget((u64)ctx[0x014] << 8, w, h, fmt, true, s_fmt, db_extent, ClampSamples(1u << (ctx[0x010] >> 2 & 3)), ctx[0x010] >> 20 & 7);  // Z_INFO NUM_SAMPLES, TILE_MODE_INDEX
+        depth = GetTarget((u64)ctx[0x014] << 8, w, h, fmt, true, s_fmt, db_extent, 1u << (ctx[0x010] >> 2 & 3), ctx[0x010] >> 20 & 7);  // Z_INFO NUM_SAMPLES, TILE_MODE_INDEX
         if (!depth) return Count(stats.skipped), Note("depth target allocation failed");
         if (samples && (depth->samples != samples || (!z_effect && db_clear && (depth->w < rw || depth->h < rh)))) {
             if (depth->samples != samples && z_effect) return Count(stats.skipped), Note("color/depth sample counts differ, skipped");

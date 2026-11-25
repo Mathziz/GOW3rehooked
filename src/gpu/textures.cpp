@@ -1989,6 +1989,8 @@ static std::pair<u32, u32> PaddingAlign(u32 tile, u32 bits, u32 samples) {
 // it) cut the target they created, and every later pass over it lost the bottom and right.
 const Renderer::Impl::Target* Renderer::Impl::GetTarget(u64 base, u32 pitch, u32 height, VkFormat fmt, bool depth, bool stencil, u32 extent,
                                                         u32 samples, u32 tile) {
+    const u32 guest_samples = samples;
+    samples = ClampSamples(samples);
     // Color formats of one texel size share the image (views per format); depth formats are distinct surfaces.
     const TargetKey k{base, pitch, height, u32(depth || !TexelBytes(fmt) ? fmt : TexelBytes(fmt)), samples};
     const u64 h_key = ::Gpu::PieceHash::TargetKey(&k, sizeof(k)) >> 1;
@@ -2012,7 +2014,7 @@ const Renderer::Impl::Target* Renderer::Impl::GetTarget(u64 base, u32 pitch, u32
     }
     u32 w = extent & 0xFFFF, h = extent >> 16;
     if (!extent) {
-        const auto [aw, ah] = PaddingAlign(tile, depth ? (fmt == VK_FORMAT_D16_UNORM ? 16 : 32) : TexelBytes(fmt) * 8, samples);
+        const auto [aw, ah] = PaddingAlign(tile, depth ? (fmt == VK_FORMAT_D16_UNORM ? 16 : 32) : TexelBytes(fmt) * 8, guest_samples);
         w = ctx[0x00D] & 0x7FFF, h = ctx[0x00D] >> 16 & 0x7FFF;
         if (w * 2 <= pitch || h * 2 <= height || w > pitch || h > height || pitch - w >= aw || height - h >= ah) w = pitch, h = height;
     }
