@@ -1022,6 +1022,10 @@ struct Renderer::Impl {
         std::fill(std::begin(ctx), std::end(ctx), 0u);
         ctx[0x00D] = ctx[0x082] = ctx[0x091] = 0x40004000;  // screen, window, generic scissor BR
         ctx[0x081] = ctx[0x090] = 0x80000000;                // window, generic scissor TL (window offset disabled)
+        ctx[0x083] = 0x0000FFFF;                             // PA_SC_CLIPRECT_RULE
+        ctx[0x08E] = ctx[0x08F] = 0xFFFFFFFF;                // CB_TARGET_MASK, CB_SHADER_MASK
+        ctx[0x205] = 4;                                      // PA_SU_SC_MODE_CNTL (front face CW)
+        ctx[0x30E] = ctx[0x30F] = 0xFFFFFFFF;                // PA_SC_AA_MASK
         for (u32 k = 0; k < 16; ++k) ctx[0x094 + 2 * k] = 0x80000000, ctx[0x095 + 2 * k] = 0x40004000, ctx[0x0B5 + 2 * k] = 0x3F800000;
     }
     static inline thread_local u32 index_size = 2, instances = 1;
