@@ -185,6 +185,20 @@ void Initialize(SDL_Window* window) {
     const VkResult created = Gpu::CreateDevice(context.physical, context.family, device_extensions, &context.device, &context.present_wait,
                                                &context.reflex, &unified_layouts, &requested, &caps);
     Log(std::format("Vulkan device: {} ({} {}); extensions:{}", properties.properties.deviceName, driver.driverName, driver.driverInfo, requested));
+    {  // VRAM: the largest device-local heap (AMD's 256 MB BAR window is another one over the same VRAM)
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(context.physical, &mp);
+        VkDeviceSize vram = 0;
+        for (u32 i = 0; i < mp.memoryHeapCount; ++i)
+            if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram = std::max(vram, mp.memoryHeaps[i].size);
+        std::string available;
+#ifdef _WIN32
+        if (MEMORYSTATUSEX ms{sizeof(ms)}; GlobalMemoryStatusEx(&ms))
+            available = std::format(" ({} MB available, commit limit {} MB)", ms.ullAvailPhys >> 20, ms.ullTotalPageFile >> 20);
+#endif
+        Log(std::format("Memory: RAM {} MB{}, VRAM {} MB{}", SDL_GetSystemRAM(), available, vram >> 20,
+                        properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? " (integrated GPU: part of the RAM)" : ""));
+    }
     Check(created, "Create Vulkan device");
     Log(std::format(
         "Vulkan shader path: {}{} (cache_control {} m5 {} fast_link {} unrestricted_topo {} depth_bounds {} storage_read_nofmt {} | eds3: neg_one {} clamp {} samples {} a2c {} blend_en {} blend_eq {} mask {})",
