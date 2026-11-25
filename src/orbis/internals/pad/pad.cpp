@@ -484,14 +484,6 @@ int PS4_SYSV_ABI scePadReadHistory() {
 int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     LOG_TRACE(Lib_Pad, "handle: {}", handle);
     const int result = scePadRead(handle, pData, 1);
-    // TEMP select hunt: buttons and touches the game reads, on change
-    static u64 last{};
-    const auto& t = pData->touchData;
-    if (const u64 now = u64(pData->buttons) | u64(t.touchNum) << 32 | u64(t.touch[0].x) << 40; result >= 0 && now != last) {
-        LOG_INFO(Lib_Pad, "TEMP read buttons {:#x} touches {} x {} y {} id {} connected {}", u32(pData->buttons), t.touchNum,
-                 t.touch[0].x, t.touch[0].y, t.touch[0].id, pData->connected);
-        last = now;
-    }
     return result < 0 ? result : ORBIS_OK;
 }
 
