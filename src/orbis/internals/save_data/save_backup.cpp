@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <ranges>
@@ -72,6 +73,8 @@ static std::deque<BackupRequest> g_result_queue;
 
 static std::atomic_int g_backup_progress = 0;
 static std::atomic g_backup_status = WorkerStatus::NotStarted;
+static std::mutex g_backup_stop_mutex;
+static std::condition_variable g_backup_stop_cv;
 
 static void backup(const std::filesystem::path& dir_name) {
     std::unique_lock lk{g_backup_running_mutex};
@@ -168,7 +171,12 @@ static void BackupThreadBody() {
                 }
             }
         }
-        std::this_thread::sleep_for(std::chrono::seconds(5)); // Don't backup too often
+        {
+            // Don't backup too often, but wake immediately on StopThread().
+            std::unique_lock lk{g_backup_stop_mutex};
+            g_backup_stop_cv.wait_for(lk, std::chrono::seconds(5),
+                                      [] { return g_backup_status == WorkerStatus::Stopping; });
+        }
     }
     g_backup_status = WorkerStatus::NotStarted;
 }
@@ -187,14 +195,18 @@ void StopThread() {
         return;
     }
     LOG_DEBUG(Lib_SaveData, "Stopping backup thread");
-    g_backup_status = WorkerStatus::Stopping;
+    {
+        std::scoped_lock lk{g_backup_stop_mutex};
+        g_backup_status = WorkerStatus::Stopping;
+    }
+    g_backup_stop_cv.notify_all();
     {
         std::scoped_lock lk{g_backup_queue_mutex};
         g_backup_queue.emplace_back(BackupRequest{});
     }
     g_backup_thread_semaphore.release();
-    while (GetWorkerStatus() != WorkerStatus::NotStarted) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (g_backup_thread.joinable()) {
+        g_backup_thread.join();
     }
 }
 
