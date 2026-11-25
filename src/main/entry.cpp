@@ -2,6 +2,7 @@
 #include "main/api.h"
 #include "main/cpu.h"
 #include "main/host.h"
+#include "ui/translation.h"
 #include "main/config.h"
 #include "orbis/common/elf_info.h"
 #include "orbis/common/path_util.h"
@@ -60,13 +61,6 @@ LONG WINAPI ReportUnhandledCrash(EXCEPTION_POINTERS* info) {
 #endif
 
 thread_local std::basic_string<Gow3PathChar> last_error;
-#ifdef _WIN32
-constexpr auto LogWriteFailure = L"\nCould not write gow3.log.";
-constexpr auto UnexpectedError = L"Unexpected runtime initialization error";
-#else
-constexpr auto LogWriteFailure = "\nCould not write gow3.log.";
-constexpr auto UnexpectedError = "Unexpected runtime initialization error";
-#endif
 std::filesystem::path validation_log;
 void ObserveRuntimeImport(const char* name, const char* nid, void* caller) {
     const std::string_view function(name);
@@ -103,7 +97,7 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
     try {
         if (!executable_directory || !game_directory ||
             (flags != 0 && flags != Gow3Inspect && flags != Gow3ValidateRuntime))
-            throw std::runtime_error("Invalid runtime arguments");
+            throw std::runtime_error(UI::Tr("Invalid runtime arguments"));
         const auto game = std::filesystem::absolute(game_directory);
         if (flags == 0 && !std::filesystem::is_regular_file(game / "eboot.bin")) {
             // A packaged game is only looked for when there is no eboot.bin.
@@ -164,7 +158,9 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
         if (flags == 0) {
             Gpu::Jit::mode = static_cast<Gpu::Jit::Mode>(config.shader_recompilation);
             // A restart after skipping the AOT build runs JIT once; the saved setting (and the menu) stay AOT.
-            const bool aot = config.shader_mechanism == ShaderMechanism::Aot && !Window::TakeJitOnce();
+            const bool jit_once = Window::TakeJitOnce();
+            const bool aot = !jit_once &&
+                (TakeScheduledAotBuild() || config.shader_mechanism == ShaderMechanism::Aot);
             if (config.shader_mechanism == ShaderMechanism::Jit) ResetAotCooldown();
             Gpu::ShaderCache::Instance().Configure(app / PortDir::ShaderCache, aot ? Gpu::CacheKind::Aot : Gpu::CacheKind::Jit);
             Gpu::Recipes::Instance().Configure(app / PortDir::ShaderCache, std::countr_zero(config.msaa));
@@ -180,13 +176,14 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
 #ifdef _WIN32
         Core::WindowsGuestRedZoneProtection::SetActiveMode(WindowsGuestRedZoneProtectionMode::StaticPatching);
 #endif
-        if (linker->LoadModule(game / "eboot.bin") != 0) throw std::runtime_error("Cannot load EBOOT");
+        if (linker->LoadModule(game / "eboot.bin") != 0) throw std::runtime_error(UI::Tr("Cannot load eboot.bin"));
         if (flags == 0) {
             InstallHooks(*linker->GetModule(0), config);
             ApplyGamePatches(*linker->GetModule(0), config);
         }
         for (const auto* name : {"libc.prx", "libSceFios2.prx"})
-            if (linker->LoadModule(game / "sce_module" / name) < 0) throw std::runtime_error("Cannot load game PRX");
+            if (linker->LoadModule(game / "sce_module" / name) < 0)
+                throw std::runtime_error(std::string(UI::Tr("Cannot load game module")) + " · " + name);
         // No system module ships with the Port: Linker::Execute maps libSceLibcInternal only from a user-provided
         // sys_modules directory and otherwise registers the HLE implementation.
         for (s32 i = 0; const auto* module = linker->GetModule(i); ++i)
@@ -234,15 +231,16 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
         Window::RunEventLoop(log_path, game);
     } catch (const std::exception& error) {
         EndLaunch(); // reported to the user: not a crash
-        StoreError(error.what());
+        std::string message = std::string(UI::Tr("Error starting the game")) + "\n\n" + UI::Tr(error.what());
         Log(std::string("STARTUP: ") + error.what());
         if (!log_path.empty()) {
-            try { FlushLog(log_path); } catch (...) { last_error += LogWriteFailure; }
+            try { FlushLog(log_path); } catch (...) { message += "\n" + std::string(UI::Tr("Could not write gow3.log.")); }
         }
+        StoreError(message.c_str());
         return 1;
     } catch (...) {
         EndLaunch();
-        last_error = UnexpectedError;
+        StoreError(UI::Tr("Unexpected error starting the game"));
         return 1;
     }
 }

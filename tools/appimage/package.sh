@@ -48,7 +48,7 @@ done
     for notice in \
         src/externals/{ffmpeg/LICENSE.md,sdl3/LICENSE.txt,sdl3/src/hidapi/LICENSE-orig.txt,imgui/LICENSE.txt,stb/LICENSE,zydis/LICENSE} \
         src/externals/{zydis/dependencies/zycore/LICENSE,xbyak/COPYRIGHT,xxhash/LICENSE,zstd/LICENSE,fmt/LICENSE} \
-        src/externals/{magic_enum/LICENSE,LibAtrac9/LICENSE} src/ui/fonts/OFL.txt src/present/fsr/LICENSE.txt; do
+        src/externals/{magic_enum/LICENSE,LibAtrac9/LICENSE} src/ui/fonts/OFL.txt licenses/OFL-Noto-CJK.txt src/present/fsr/LICENSE.txt; do
         printf '\n=== %s ===\n\n' "$notice"
         cat "$notice"
     done

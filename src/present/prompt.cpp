@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "present/prompt.h"
+#include "ui/translation.h"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <algorithm>
@@ -14,6 +15,7 @@ Answer answer{Answer::Pending};
 class Layer final : public ImGui::Layer {
 public:
     void SetContent(Content next) {
+        selected = next.choice && next.actions[0].empty() ? 2 : 0;
         content = std::move(next);
         answer = Answer::Pending;
         armed = false;
@@ -60,12 +62,22 @@ public:
         struct Button { UI::PS4Symbol symbol; const char* label; Answer result; ImGuiKey pad, key; };
         const bool custom = !content.actions[0].empty();
         const Button buttons[]{
-            {UI::PS4Symbol::Cross, custom ? content.actions[0].c_str() : content.choice ? "YES" : "OK",
+            {UI::PS4Symbol::Cross, custom ? content.actions[0].c_str() : UI::Tr(content.choice ? "Yes" : "OK"),
              Answer::Yes, ImGuiKey_GamepadFaceDown, ImGuiKey_Enter},
             {UI::PS4Symbol::Square, content.actions[1].c_str(), Answer::No, ImGuiKey_GamepadFaceLeft, ImGuiKey_Delete},
-            {UI::PS4Symbol::Circle, custom ? content.actions[2].c_str() : content.choice ? "NO" : "",
+            {UI::PS4Symbol::Circle, custom ? content.actions[2].c_str() : content.choice ? UI::Tr("No") : "",
              custom ? Answer::Back : Answer::No, ImGuiKey_GamepadFaceRight, ImGuiKey_Escape},
         };
+        if (content.navigate && armed) {
+            const bool previous = IsKeyPressed(ImGuiKey_LeftArrow) || IsKeyPressed(ImGuiKey_UpArrow) ||
+                                  IsKeyPressed(ImGuiKey_A) || IsKeyPressed(ImGuiKey_W);
+            const bool next = IsKeyPressed(ImGuiKey_RightArrow) || IsKeyPressed(ImGuiKey_DownArrow) ||
+                              IsKeyPressed(ImGuiKey_D) || IsKeyPressed(ImGuiKey_S);
+            if (previous != next) {
+                constexpr int count = int(std::size(buttons));
+                do { selected = (selected + (next ? 1 : -1) + count) % count; } while (!*buttons[selected].label);
+            }
+        }
         const float gap = 6.0f * cqw, column = 9.0f * label_size;
         float widths[3]{}, total = -gap;
         for (size_t i = 0; i < std::size(buttons); ++i) {
@@ -91,20 +103,31 @@ public:
             } else {
                 UI::DrawHint(list, x, y + radius, radius, b.symbol, b.label, font, label_size);
             }
-            if (armed && (IsKeyPressed(b.pad, false) || IsKeyPressed(b.key, false) || (IsMouseClicked(ImGuiMouseButton_Left) && rect.Contains(GetIO().MousePos))))
+            const bool focused = content.navigate && int(i) == selected;
+            const bool confirm = focused && (IsKeyPressed(ImGuiKey_Enter, false) ||
+                                 IsKeyPressed(ImGuiKey_KeypadEnter, false) || IsKeyPressed(ImGuiKey_Space, false));
+            const bool shortcut = (!content.navigate || b.key != ImGuiKey_Enter) && IsKeyPressed(b.key, false);
+            if (armed && (IsKeyPressed(b.pad, false) || confirm || shortcut ||
+                          (IsMouseClicked(ImGuiMouseButton_Left) && rect.Contains(GetIO().MousePos))))
                 chosen = b.result;
+            if (focused) {
+                rect.Expand(label_size * 0.3f);
+                list->AddRect(rect.Min, rect.Max, UI::Fade(UI::Theme::GoldBronze, 0.65f), label_size * 0.15f);
+            }
             x += widths[i] + gap;
         }
         // A message with nothing to choose is closed by either button.
         if (!custom && !content.choice && armed &&
             (IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || IsKeyPressed(ImGuiKey_Escape, false))) chosen = Answer::Yes;
         // The press that was held when the window opened must not answer it.
-        if (!armed) armed = std::ranges::none_of(buttons, [](const Button& b) { return IsKeyDown(b.pad) || IsKeyDown(b.key); });
+        if (!armed) armed = std::ranges::none_of(buttons, [](const Button& b) { return IsKeyDown(b.pad) || IsKeyDown(b.key); }) &&
+                            (!content.navigate || (!IsKeyDown(ImGuiKey_KeypadEnter) && !IsKeyDown(ImGuiKey_Space)));
         if (chosen != Answer::Pending) answer = chosen;
     }
 
 private:
     Content content;
+    int selected{};
     bool armed{};
 };
 Layer layer;

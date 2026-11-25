@@ -12,6 +12,7 @@
 #include <cmath>
 #include <ctime>
 #include <filesystem>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -67,7 +68,7 @@ static void DrawPlus(ImDrawList* draw, ImVec2 center, float half, ImU32 color) {
 
 namespace Libraries::SaveData::Dialog {
 
-static SaveParsedInfo ParseSaveItem(const SaveDialogState::Item& item) {
+static SaveParsedInfo ParseSaveItem(const SaveDialogState::Item& item, const SaveText& text) {
     SaveParsedInfo info;
     info.size_str = item.size;
     info.date_str = item.date;
@@ -81,63 +82,17 @@ static SaveParsedInfo ParseSaveItem(const SaveDialogState::Item& item) {
     } else if (!item.dir_name.empty()) {
         info.display_title = item.dir_name;
     } else {
-        info.display_title = "Save Game";
+        info.display_title = text.save_game;
     }
 
-    // Auto save check
-    std::string lower_title = info.display_title;
-    for (char& c : lower_title) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (lower_title.find("auto save") != std::string::npos ||
-        lower_title.find("autosave") != std::string::npos ||
-        item.dir_name.find("AUTOSAVE") != std::string::npos) {
-        info.is_auto_save = true;
-    }
+    const auto clean_title = StripAutosavePrefix(info.display_title);
+    info.is_auto_save = clean_title != info.display_title || item.dir_name.starts_with("AUTOSAVE");
+    info.clean_title = clean_title.empty() ? std::string_view{info.display_title} : clean_title;
 
-    // Clean title for preview slab
-    info.clean_title = info.display_title;
-    auto auto_pos = info.clean_title.find("(Auto Save)");
-    if (auto_pos != std::string::npos) {
-        info.clean_title.erase(auto_pos, 11);
-        while (!info.clean_title.empty() && (info.clean_title.front() == ' ' || info.clean_title.front() == '-')) {
-            info.clean_title.erase(0, 1);
-        }
-    }
-    if (info.clean_title.empty()) {
-        info.clean_title = info.display_title;
-    }
-
-    // Parse details (Difficulty and Play time / relog)
-    // Format in GOW3 param.sfo: "Difficulty: God (Normal)\nPlay time: 2:02:30"
-    std::string_view details_view = item.details;
-    size_t start = 0;
-    while (start < details_view.size()) {
-        size_t end = details_view.find('\n', start);
-        if (end == std::string_view::npos) end = details_view.size();
-        std::string_view line = details_view.substr(start, end - start);
-        start = end + 1;
-
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.remove_suffix(1);
-        while (!line.empty() && line.front() == ' ') line.remove_prefix(1);
-
-        auto diff_pos = line.find("Difficulty:");
-        if (diff_pos != std::string_view::npos) {
-            std::string_view val = line.substr(diff_pos + 11);
-            while (!val.empty() && val.front() == ' ') val.remove_prefix(1);
-            info.difficulty = std::string(val);
-        }
-
-        auto play_pos = line.find("Play time:");
-        if (play_pos != std::string_view::npos) {
-            std::string_view val = line.substr(play_pos + 10);
-            while (!val.empty() && val.front() == ' ') val.remove_prefix(1);
-            std::string time_str(val);
-            if (time_str.size() >= 7 && time_str[1] == ':') {
-                time_str.insert(0, 1, '0');
-            }
-            info.play_time = std::move(time_str);
-        }
-    }
-
+    const auto [difficulty, play_time] = ParseSaveMetadata(item.details);
+    info.difficulty = difficulty;
+    info.play_time = play_time;
+    if (info.play_time.size() >= 7 && info.play_time[1] == ':') info.play_time.insert(0, 1, '0');
     return info;
 }
 
@@ -154,7 +109,8 @@ void SaveDialogResult::CopyTo(OrbisSaveDataDialogResult& result) const {
     result.userData = this->user_data;
 }
 
-SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
+SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param)
+    : language(Gow3::UI::TextLanguage()) {
     this->mode = param.mode;
     this->type = param.dispType;
     this->user_data = param.userData;
@@ -189,10 +145,10 @@ SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
         // The slot is empty: a plus where the picture would be, whatever the game passes.
         this->new_item = Item{
             .dir_name = "",
-            .title = "Create a New Save",
+            .title = Text().new_save,
             .is_new = true,
         };
-        this->new_item->info = ParseSaveItem(*this->new_item);
+        this->new_item->info = ParseSaveItem(*this->new_item, Text());
     }
 
     if (item->focusPos != FocusPos::DIRNAME) {
@@ -210,7 +166,7 @@ SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
         this->state = SystemState{*this, param};
         break;
     case SaveDataDialogMode::ERROR_CODE: {
-        this->state = ErrorCodeState{param};
+        this->state = ErrorCodeState{*this, param};
     } break;
     case SaveDataDialogMode::PROGRESS_BAR: {
         this->state = ProgressBarState{*this, param};
@@ -233,7 +189,10 @@ bool SaveDialogState::LoadItem(std::string_view dir_name) {
     if (!param_sfo.Open(param_sfo_path)) return false;
 
     auto last_write = std::chrono::system_clock::to_time_t(param_sfo.GetLastWrite());
-    std::string date_str = fmt::format("{:%d %b %Y · %I:%M %p}", *std::localtime(&last_write));
+    const auto date = *std::localtime(&last_write);
+    std::string date_str = language == Gow3::UI::GameLanguage::English
+                               ? fmt::format("{:%d %b %Y · %I:%M %p}", date)
+                               : fmt::format("{:%Y-%m-%d · %H:%M}", date);
 
     size_t size = Common::FS::GetDirectorySize(dir_path);
     std::string size_str = SpaceSizeToString(size);
@@ -259,7 +218,7 @@ bool SaveDialogState::LoadItem(std::string_view dir_name) {
         .dir_name = std::string{dir_name},
         .icon = icon,
 
-        .title = std::string{param_sfo.GetString(SaveParams::MAINTITLE).value_or("Unknown")},
+        .title = std::string{param_sfo.GetString(SaveParams::MAINTITLE).value_or("")},
         .subtitle = std::string{param_sfo.GetString(SaveParams::SUBTITLE).value_or("")},
         .details = std::string{param_sfo.GetString(SaveParams::DETAIL).value_or("")},
         .date = date_str,
@@ -268,7 +227,7 @@ bool SaveDialogState::LoadItem(std::string_view dir_name) {
         .pfo = param_sfo,
         .is_corrupted = is_corrupted,
     });
-    save_list.back().info = ParseSaveItem(save_list.back());
+    save_list.back().info = ParseSaveItem(save_list.back(), Text());
     return true;
 }
 
@@ -281,111 +240,90 @@ SaveDialogState::UserState::UserState(const OrbisSaveDataDialogParam& param) {
 
 SaveDialogState::SystemState::SystemState(const SaveDialogState& state,
                                           const OrbisSaveDataDialogParam& param) {
-#define M(save, load, del)                                                                         \
-    if (type == DialogType::SAVE)                                                                  \
-        this->msg = save;                                                                          \
-    else if (type == DialogType::LOAD)                                                             \
-        this->msg = load;                                                                          \
-    else if (type == DialogType::DELETE)                                                           \
-        this->msg = del;                                                                           \
-    else                                                                                           \
-        UNREACHABLE()
-
+    const auto& text = state.Text();
     auto type = param.dispType;
+    const auto action = [type](const char* save, const char* load, const char* remove) {
+        return type == DialogType::SAVE ? save : type == DialogType::LOAD ? load : remove;
+    };
+    const auto fallback = action(text.cannot_save, text.cannot_load, text.cannot_delete);
     auto& sys = *param.sysMsgParam;
     this->type = sys.msgType;
     switch (sys.msgType) {
     case SystemMessageType::NODATA: {
         return_cancel = true;
-        this->msg = "There is no saved data.";
+        msg = text.no_data;
     } break;
     case SystemMessageType::CONFIRM:
         show_no = true;
-        M("Do you want to save?", "Do you want to load this saved data?",
-          "Do you want to delete this saved data?");
+        msg = action(text.ask_save, text.ask_load, text.ask_delete);
         break;
     case SystemMessageType::OVERWRITE:
         show_no = true;
-        M("Do you want to overwrite the existing saved data?", "##UNKNOWN##", "##UNKNOWN##");
+        msg = type == DialogType::SAVE ? text.ask_overwrite : fallback;
         break;
     case SystemMessageType::NOSPACE:
+    case SystemMessageType::NOSPACE_CONTINUABLE:
         return_cancel = true;
-        M(fmt::format(
-              "There is not enough space to save the data. To continue {} free space is required.",
-              SpaceSizeToString(sys.value * OrbisSaveDataBlockSize)),
-          "##UNKNOWN##", "##UNKNOWN##");
+        msg = type == DialogType::SAVE
+                  ? fmt::format(fmt::runtime(text.no_space), SpaceSizeToString(sys.value * OrbisSaveDataBlockSize))
+                  : fallback;
         break;
     case SystemMessageType::PROGRESS:
         hide_ok = true;
         show_cancel = state.enable_back.value_or(false);
-        M("Saving...", "Loading...", "Deleting...");
+        msg = action(text.saving, text.loading, text.deleting);
         break;
     case SystemMessageType::FILE_CORRUPTED:
         return_cancel = true;
-        this->msg = "The saved data is corrupted.";
+        msg = text.corrupt_data;
         break;
     case SystemMessageType::FINISHED:
         return_cancel = true;
-        M("Saved successfully.", "Loading complete.", "Deletion complete.");
+        msg = action(text.saved, text.loaded, text.deleted);
         break;
-    case SystemMessageType::NOSPACE_CONTINUABLE:
-        return_cancel = true;
-        M(fmt::format("There is not enough space to save the data. {} free space is required.",
-                      SpaceSizeToString(sys.value * OrbisSaveDataBlockSize)),
-          "##UNKNOWN##", "##UNKNOWN##");
+    case SystemMessageType::CORRUPTED_AND_DELETED:
+        show_cancel = state.enable_back.value_or(true);
+        msg = type == DialogType::DELETE ? fallback : text.corrupt_delete;
         break;
-    case SystemMessageType::CORRUPTED_AND_DELETED: {
+    case SystemMessageType::CORRUPTED_AND_CREATED:
         show_cancel = state.enable_back.value_or(true);
-        const char* msg1 = "The saved data is corrupted and will be deleted.";
-        M(msg1, msg1, "##UNKNOWN##");
-    } break;
-    case SystemMessageType::CORRUPTED_AND_CREATED: {
+        msg = type == DialogType::DELETE ? fallback : text.corrupt_create;
+        break;
+    case SystemMessageType::CORRUPTED_AND_RESTORE:
         show_cancel = state.enable_back.value_or(true);
-        const char* msg2 = "The saved data is corrupted. This saved data will be deleted and a new "
-                           "one will be created.";
-        M(msg2, msg2, "##UNKNOWN##");
-    } break;
-    case SystemMessageType::CORRUPTED_AND_RESTORE: {
-        show_cancel = state.enable_back.value_or(true);
-        const char* msg3 =
-            "The saved data is corrupted. The data that was backed up by the system will be "
-            "restored.";
-        M(msg3, msg3, "##UNKNOWN##");
-    } break;
+        msg = type == DialogType::DELETE ? fallback : text.corrupt_restore;
+        break;
     case SystemMessageType::TOTAL_SIZE_EXCEEDED:
-        M("Cannot create more saved data.", "##UNKNOWN##", "##UNKNOWN##");
+        msg = type == DialogType::SAVE ? text.limit : fallback;
         break;
     default:
-        msg = fmt::format("Unknown message type: {}", magic_enum::enum_name(sys.msgType));
+        msg = fmt::format(fmt::runtime(text.unknown), magic_enum::enum_name(sys.msgType));
         break;
     }
-    // The game asked for a message that does not exist for this kind of dialog.
-    if (msg == "##UNKNOWN##") {
-        msg = fmt::format("The saved data could not be {}.", type == DialogType::SAVE ? "saved" : type == DialogType::LOAD ? "loaded" : "deleted");
-    }
-
-#undef M
 }
 
-SaveDialogState::ErrorCodeState::ErrorCodeState(const OrbisSaveDataDialogParam& param) {
+SaveDialogState::ErrorCodeState::ErrorCodeState(const SaveDialogState& state,
+                                               const OrbisSaveDataDialogParam& param) {
+    const auto& text = state.Text();
     auto& err = *param.errorCodeParam;
     constexpr auto NOT_FOUND = 0x809F0008;
     constexpr auto BROKEN = 0x809F000F;
     switch (err.errorCode) {
     case NOT_FOUND:
-        this->error_msg = "There is no saved data.";
+        this->error_msg = text.no_data;
         break;
     case BROKEN:
-        this->error_msg = "The data is corrupted.";
+        this->error_msg = text.corrupt_data;
         break;
     default:
-        this->error_msg = fmt::format("An error has occurred. ({:X})", err.errorCode);
+        this->error_msg = fmt::format(fmt::runtime(text.error), err.errorCode);
         break;
     }
 }
 
 SaveDialogState::ProgressBarState::ProgressBarState(const SaveDialogState& state,
                                                     const OrbisSaveDataDialogParam& param) {
+    const auto& text = state.Text();
     this->progress = 0;
     auto& bar = *param.progressBarParam;
     if (bar.msg != nullptr) {
@@ -398,18 +336,18 @@ SaveDialogState::ProgressBarState::ProgressBarState(const SaveDialogState& state
         case ProgressSystemMessageType::PROGRESS:
             switch (state.type) {
             case DialogType::SAVE:
-                this->msg = "Saving...";
+                this->msg = text.saving;
                 break;
             case DialogType::LOAD:
-                this->msg = "Loading...";
+                this->msg = text.loading;
                 break;
             case DialogType::DELETE:
-                this->msg = "Deleting...";
+                this->msg = text.deleting;
                 break;
             }
             break;
         case ProgressSystemMessageType::RESTORE:
-            this->msg = "Restoring saved data...";
+            this->msg = text.restoring;
             break;
         }
     }
@@ -628,6 +566,7 @@ void SaveDialogUi::DrawItem(int id, const SaveDialogState::Item& item, bool clic
     if (std::abs(target - focus) < 0.01f) focus = target;
     const float t = focus;
     const auto& info = item.info;
+    const auto& text = state->Text();
 
     // Focused: the card fills the row and grows 8 px; resting: indented and shorter.
     const ImRect card_bb{{outer_pos.x + (1.0f - t) * 8.0f * S, outer_pos.y + (6.0f - 4.0f * t) * S},
@@ -657,13 +596,10 @@ void SaveDialogUi::DrawItem(int id, const SaveDialogState::Item& item, bool clic
     const float text_x = thumb_max.x + 16.0f * S;
     const float text_y = card_bb.Min.y + pad + 4.0f * S;
 
-    // Title (Uppercase)
-    std::string upper_title = info.display_title;
-    for (char& c : upper_title) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-
+    const ImVec4 text_clip{text_x, card_bb.Min.y, card_bb.Max.x - pad, card_bb.Max.y};
     const float title_font_size = (23.0f + 4.0f * t) * S;
-    if (t > 0.0f) draw->AddText(font, title_font_size, {text_x + 1.0f, text_y + 1.0f}, Fade(IM_COL32(0, 0, 0, 200), t), upper_title.c_str());
-    draw->AddText(font, title_font_size, {text_x, text_y}, ImGui::ColorConvertFloat4ToU32(ImLerp(ImGui::ColorConvertU32ToFloat4(Gow3::UI::Theme::TextMain), ImVec4{1, 1, 1, 1}, t)), upper_title.c_str());
+    if (t > 0.0f) draw->AddText(font, title_font_size, {text_x + 1.0f, text_y + 1.0f}, Fade(IM_COL32(0, 0, 0, 200), t), info.display_title.c_str(), nullptr, 0.0f, &text_clip);
+    draw->AddText(font, title_font_size, {text_x, text_y}, ImGui::ColorConvertFloat4ToU32(ImLerp(ImGui::ColorConvertU32ToFloat4(Gow3::UI::Theme::TextMain), ImVec4{1, 1, 1, 1}, t)), info.display_title.c_str(), nullptr, 0.0f, &text_clip);
 
     // Subtitle: kind of save, difficulty and play time, as far as the save says
     const float sub_font_size = (19.0f + 2.0f * t) * S;
@@ -671,18 +607,18 @@ void SaveDialogUi::DrawItem(int id, const SaveDialogState::Item& item, bool clic
 
     std::string sub_text;
     if (item.is_new) {
-        sub_text = "Empty slot";
+        sub_text = text.empty_slot;
     } else if (item.is_corrupted) {
-        sub_text = "Corrupted Save File";
+        sub_text = text.corrupted;
     } else {
-        sub_text = info.is_auto_save ? "Auto Save" : "Manual Save";
-        if (!info.difficulty.empty()) sub_text += " · Difficulty: " + info.difficulty;
+        sub_text = info.is_auto_save ? text.auto_save : text.manual_save;
+        if (!info.difficulty.empty()) fmt::format_to(std::back_inserter(sub_text), " · {}: {}", text.difficulty, info.difficulty);
         if (!info.play_time.empty()) sub_text += " · " + info.play_time;
     }
 
     const ImU32 sub_color = item.is_corrupted ? IM_COL32(239, 68, 68, 255)
                           : ImGui::ColorConvertFloat4ToU32(ImLerp(ImGui::ColorConvertU32ToFloat4(Gow3::UI::Theme::TextMuted), ImGui::ColorConvertU32ToFloat4(Gow3::UI::Theme::GoldLight), t));
-    draw->AddText(font, sub_font_size, {text_x, sub_y}, sub_color, sub_text.c_str());
+    draw->AddText(font, sub_font_size, {text_x, sub_y}, sub_color, sub_text.c_str(), nullptr, 0.0f, &text_clip);
 }
 
 void SaveDialogUi::DrawList(bool interactive) {
@@ -690,6 +626,7 @@ void SaveDialogUi::DrawList(bool interactive) {
     const ImVec2 display_size = ctx.IO.DisplaySize;
     auto* list = GetWindowDrawList();
     auto* font = Gow3::UI::g_font_cinzel ? Gow3::UI::g_font_cinzel : ImGui::GetFont();
+    const auto& text = state->Text();
 
     const float cqw = std::min(display_size.x / 100.0f, display_size.y / 56.25f);
     // The screen is laid out in 100 cqw of width; a wider display (ultrawide) keeps that block centered.
@@ -707,9 +644,9 @@ void SaveDialogUi::DrawList(bool interactive) {
     const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 2.1f);
     Gow3::UI::DrawOmegaSymbol(list, {omega_cx, omega_cy}, omega_r, Gow3::UI::Theme::GoldBronze, pulse, true);
 
-    const char* header_title = state->type == DialogType::SAVE   ? "SAVE GAME"
-                             : state->type == DialogType::DELETE ? "DELETE SAVE"
-                             : "LOAD GAME";
+    const char* header_title = state->type == DialogType::SAVE   ? text.save_game
+                             : state->type == DialogType::DELETE ? text.delete_save
+                             : text.load_game;
 
     const float header_font_size = std::max(22.0f, 2.0f * cqw);
     const float title_x = omega_cx + omega_r + 1.2f * cqw;
@@ -721,7 +658,7 @@ void SaveDialogUi::DrawList(bool interactive) {
     if (state->type == DialogType::LOAD) {
         // The EBOOT patch allows 64 manual slots; only the original AUTOSAVE and USERDATA are reserved.
         const auto used = std::ranges::count_if(state->save_list, [](const auto& item) { return item.dir_name != "AUTOSAVE" && item.dir_name != "USERDATA"; });
-        const auto counter = fmt::format("{}/64 SAVES", used);
+        const auto counter = fmt::format(fmt::runtime(text.save_count), used);
         const float size = header_font_size * 0.65f;
         const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, counter.c_str());
         list->AddText(font, size, {right_edge - extent.x, omega_cy - extent.y * 0.5f}, Gow3::UI::Theme::GoldMuted, counter.c_str());
@@ -790,7 +727,7 @@ void SaveDialogUi::DrawList(bool interactive) {
     if (total_items == 0) {
         auto* body = Gow3::UI::g_font_body ? Gow3::UI::g_font_body : font;
         const float size = std::max(14.0f, 1.1f * cqw);
-        const char* none = "No saved data";
+        const char* none = text.no_data;
         const ImVec2 extent = body->CalcTextSizeA(size, FLT_MAX, 0.0f, none);
         GetWindowDrawList()->AddText(body, size, GetWindowPos() + ImVec2{(left_w - extent.x) * 0.5f, grid_h * 0.4f}, Gow3::UI::Theme::TextMuted, none);
     }
@@ -836,46 +773,46 @@ void SaveDialogUi::DrawList(bool interactive) {
         // Gold border & glow around large preview
         list->AddRect(pv_thumb_pos, pv_thumb_pos + ImVec2{pv_thumb_w, pv_thumb_h}, Gow3::UI::Theme::GoldBronze, 3.0f, 0, 2.0f);
 
-        // Preview Title (Uppercase)
-        std::string pv_title = info.clean_title;
-        for (char& c : pv_title) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-
+        const char* pv_title = info.clean_title.c_str();
         const float pv_title_size = std::max(18.0f, 1.45f * cqw);
         const float pv_title_y = pv_thumb_pos.y + pv_thumb_h + 1.2f * cqw;
+        const float pv_title_h = font->CalcTextSizeA(pv_title_size, FLT_MAX, right_w, pv_title).y;
 
-        list->AddText(font, pv_title_size, {right_x + 1.0f, pv_title_y + 1.0f}, IM_COL32(0, 0, 0, 220), pv_title.c_str());
-        list->AddText(font, pv_title_size, {right_x, pv_title_y}, Gow3::UI::Theme::GoldLight, pv_title.c_str());
+        list->AddText(font, pv_title_size, {right_x + 1.0f, pv_title_y + 1.0f}, IM_COL32(0, 0, 0, 220), pv_title, nullptr, right_w);
+        list->AddText(font, pv_title_size, {right_x, pv_title_y}, Gow3::UI::Theme::GoldLight, pv_title, nullptr, right_w);
 
         // Thin gold divider
-        const float div_y = pv_title_y + pv_title_size + 0.8f * cqw;
+        const float div_y = pv_title_y + pv_title_h + 0.8f * cqw;
         list->AddLine({right_x, div_y}, {right_x + right_w, div_y}, IM_COL32(201, 158, 75, 55), 1.0f);
 
         // Metadata Table (FOLDER, DIFFICULTY, PLAY TIME / Relog, DATE SAVED, FILE SIZE)
         float row_y = div_y + 1.0f * cqw;
         const float lbl_size = std::max(15.0f, 1.08f * cqw);
         const float row_h = lbl_size * 2.0f;
-        const float val_x = right_x + right_w * 0.42f;
+        const float label_width = right_w * 0.42f - cqw;
+        const float val_x = right_x + label_width + cqw;
         const float val_width = right_edge - val_x;
         auto* body = Gow3::UI::g_font_body ? Gow3::UI::g_font_body : font;
 
         // Only what the save tells is listed.
         const std::pair<const char*, const std::string*> stats[] = {
-            {"DIFFICULTY", &info.difficulty},
-            {"PLAY TIME",  &info.play_time},
-            {"DATE SAVED", &info.date_str},
-            {"FILE SIZE",  &info.size_str},
+            {text.difficulty, &info.difficulty},
+            {text.play_time,  &info.play_time},
+            {text.date_saved, &info.date_str},
+            {text.file_size,  &info.size_str},
         };
-        const std::string corrupted = "Corrupted";
 
-        const auto add_row = [&](const char* label, const std::string& value, ImU32 color) {
-            list->AddText(body, lbl_size, {right_x, row_y}, Gow3::UI::Theme::GoldMuted, label);
-            list->AddText(body, lbl_size, {val_x, row_y}, color, value.c_str(), nullptr, val_width);
-            row_y += std::max(row_h, body->CalcTextSizeA(lbl_size, FLT_MAX, val_width, value.c_str()).y + lbl_size * 0.35f);
+        const auto add_row = [&](const char* label, const char* value, ImU32 color) {
+            list->AddText(body, lbl_size, {right_x, row_y}, Gow3::UI::Theme::GoldMuted, label, nullptr, label_width);
+            list->AddText(body, lbl_size, {val_x, row_y}, color, value, nullptr, val_width);
+            const float label_height = body->CalcTextSizeA(lbl_size, FLT_MAX, label_width, label).y;
+            const float value_height = body->CalcTextSizeA(lbl_size, FLT_MAX, val_width, value).y;
+            row_y += std::max(row_h, std::max(label_height, value_height) + lbl_size * 0.35f);
         };
-        if (!selected_item->dir_name.empty()) add_row("FOLDER", selected_item->dir_name, Gow3::UI::Theme::GoldLight);
-        if (selected_item->is_corrupted) add_row("CONDITION", corrupted, IM_COL32(239, 68, 68, 255));
+        if (!selected_item->dir_name.empty()) add_row(text.folder, selected_item->dir_name.c_str(), Gow3::UI::Theme::GoldLight);
+        if (selected_item->is_corrupted) add_row(text.condition, text.corrupted, IM_COL32(239, 68, 68, 255));
         for (const auto& [label, value] : stats)
-            if (!value->empty()) add_row(label, *value, Gow3::UI::Theme::TextMain);
+            if (!value->empty()) add_row(label, value->c_str(), Gow3::UI::Theme::TextMain);
     }
 
     // 7. Footer: Authentic PlayStation 4 Vector Buttons (Cross SELECT, Circle BACK)
@@ -890,11 +827,11 @@ void SaveDialogUi::DrawList(bool interactive) {
     Hint footer[4];
     int count = 0;
     if (can_edit) {
-        footer[count++] = {Gow3::UI::PS4Symbol::Triangle, "DUPLICATE", ActDuplicate};
-        footer[count++] = {Gow3::UI::PS4Symbol::Square, "DELETE", ActDelete};
+        footer[count++] = {Gow3::UI::PS4Symbol::Triangle, text.duplicate, ActDuplicate};
+        footer[count++] = {Gow3::UI::PS4Symbol::Square, text.remove, ActDelete};
     }
-    footer[count++] = {Gow3::UI::PS4Symbol::Cross, selected_item && selected_item->is_new ? "CREATE" : "SELECT", ActSelect};
-    footer[count++] = {Gow3::UI::PS4Symbol::Circle, "BACK", ActBack};
+    footer[count++] = {Gow3::UI::PS4Symbol::Cross, selected_item && selected_item->is_new ? text.create : text.select, ActSelect};
+    footer[count++] = {Gow3::UI::PS4Symbol::Circle, text.back, ActBack};
 
     // Laid out from the right edge inwards
     ImRect rects[4];
@@ -915,7 +852,7 @@ void SaveDialogUi::DrawList(bool interactive) {
         const ImVec2 center{pad_x + w * 0.5f, footer_y};
         if (pad) Gow3::UI::DrawPadGlyph(list, center, h, Gow3::UI::PadGlyph::Options);
         else Gow3::UI::DrawKeyCap(list, center, h, "F", font);
-        constexpr const char* label = "OPEN SAVE FOLDER";
+        const char* label = text.open_folder;
         const float label_x = pad_x + w + btn_font_size * 0.55f;
         list->AddText(font, btn_font_size, {label_x, footer_y - btn_font_size * 0.55f}, Gow3::UI::Theme::GoldLight, label);
         folder_button = {{pad_x, footer_y - btn_radius},
@@ -970,7 +907,7 @@ void SaveDialogUi::DrawList(bool interactive) {
         }
         result->dir_name = selected_item->dir_name;
         result->param = selected_item->pfo;
-        if (state->type == DialogType::SAVE) StartLinger("CREATE A NEW SAVE", "Saving...");
+        if (state->type == DialogType::SAVE) StartLinger(text.new_save, text.saving);
         Finish(ButtonId::INVALID);
     };
     const auto act = [&](Action action) {
@@ -1012,16 +949,19 @@ std::string CopyName(const SaveDialogState::Item& item, const auto& taken) {
     std::string base = item.dir_name;
     if (item.info.is_auto_save) {
         std::string place = item.info.clean_title;
-        if (place.empty() || place == item.dir_name || place == "Save Game") {
+        if (place == item.dir_name) place.clear();
+        for (char& c : place) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        std::erase_if(place, [](unsigned char c) { return c < 32 || std::string_view{"<>:\"/\\|?*"}.find(c) != std::string_view::npos; });
+        if (place.empty()) {
             const std::time_t now = std::time(nullptr);
             place = fmt::format("{:%y%m%d-%H%M%S}", *std::localtime(&now));
         }
-        for (char& c : place) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        std::erase_if(place, [](char c) { return c < 32 || std::string_view{"<>:\"/\\|?*"}.find(c) != std::string_view::npos; });
         base = "AUTOSAVE - " + place;
     }
     const auto fit = [&](const std::string& suffix) {
-        std::string name = base.substr(0, max_length - suffix.size());
+        size_t length = std::min(base.size(), max_length - suffix.size());
+        while (length && length < base.size() && (static_cast<unsigned char>(base[length]) & 0xc0) == 0x80) --length;
+        std::string name = base.substr(0, length);
         while (!name.empty() && name.back() == ' ') name.pop_back();
         return name + suffix;
     };
@@ -1082,6 +1022,7 @@ bool SaveDialogUi::CancelModal() {
 }
 
 void SaveDialogUi::DrawUser() {
+    const auto& text = state->Text();
     const auto& user_state = state->GetState<SaveDialogState::UserState>();
     const auto btn_type = user_state.type;
     const float S = UiScale();
@@ -1098,17 +1039,18 @@ void SaveDialogUi::DrawUser() {
         const bool two = btn_type == ButtonType::YESNO || btn_type == ButtonType::OKCANCEL;
         ModalButtons buttons(S, two ? 2 : 1);
         if (btn_type == ButtonType::YESNO) {
-            if (buttons.Button("Yes")) Finish(ButtonId::YES);
+            if (buttons.Button(text.yes)) Finish(ButtonId::YES);
             // Deleting asks with "No" ready, so a stray Cross cannot destroy a save.
-            if (buttons.Button("No", state->type == DialogType::DELETE && first_render, true)) Finish(ButtonId::NO);
+            if (buttons.Button(text.no, state->type == DialogType::DELETE && first_render, true)) Finish(ButtonId::NO);
         } else {
-            if (buttons.Button("OK")) Finish(ButtonId::OK);
-            if (btn_type == ButtonType::OKCANCEL && buttons.Button("Cancel", false, true)) Finish(ButtonId::INVALID, Result::USER_CANCELED);
+            if (buttons.Button(text.ok)) Finish(ButtonId::OK);
+            if (btn_type == ButtonType::OKCANCEL && buttons.Button(text.cancel, false, true)) Finish(ButtonId::INVALID, Result::USER_CANCELED);
         }
     }
 }
 
 void SaveDialogUi::DrawSystemMessage() {
+    const auto& text = state->Text();
     const auto& sys_state = state->GetState<SaveDialogState::SystemState>();
     const float S = UiScale();
 
@@ -1124,13 +1066,13 @@ void SaveDialogUi::DrawSystemMessage() {
     const int count = (sys_state.hide_ok ? 0 : 1) + (extra ? 1 : 0);
     if (count == 0) return;
     ModalButtons buttons(S, count);
-    if (!sys_state.hide_ok && buttons.Button(sys_state.show_no ? "Yes" : "OK")) Finish(ButtonId::YES);
+    if (!sys_state.hide_ok && buttons.Button(sys_state.show_no ? text.yes : text.ok)) Finish(ButtonId::YES);
     if (sys_state.show_no) {
         // Deleting or overwriting asks with "No" ready, so a stray Cross cannot destroy a save.
         const bool destructive = state->type == DialogType::DELETE || sys_state.type == SystemMessageType::OVERWRITE;
-        if (buttons.Button("No", destructive && first_render, !sys_state.hide_ok)) Finish(ButtonId::NO);
+        if (buttons.Button(text.no, destructive && first_render, !sys_state.hide_ok)) Finish(ButtonId::NO);
     } else if (sys_state.show_cancel) {
-        if (buttons.Button("Cancel", false, !sys_state.hide_ok)) Finish(ButtonId::INVALID, Result::USER_CANCELED);
+        if (buttons.Button(text.cancel, false, !sys_state.hide_ok)) Finish(ButtonId::INVALID, Result::USER_CANCELED);
     }
 }
 
@@ -1147,7 +1089,7 @@ void SaveDialogUi::DrawErrorCode() {
     ModalMessage(err_state.error_msg, Gow3::UI::Theme::TextMain, S);
 
     ModalButtons buttons(S, 1);
-    if (buttons.Button("OK")) Finish(ButtonId::OK);
+    if (buttons.Button(state->Text().ok)) Finish(ButtonId::OK);
 }
 
 void SaveDialogUi::DrawProgressBar() {
@@ -1235,7 +1177,9 @@ SaveDialogUi::Answer SaveDialogUi::DrawNotice(const ImGuiIO& io, const char* tit
         return Answer::None;
     }
     struct Choice { Gow3::UI::PS4Symbol symbol; const char* label; Answer answer; float width; ImRect rect; };
-    Choice choices[2] = {{Gow3::UI::PS4Symbol::Cross, "CONFIRM", Answer::Confirm, 0.0f, {}}, {Gow3::UI::PS4Symbol::Circle, "BACK", Answer::Back, 0.0f, {}}};
+    const auto& text = state->Text();
+    Choice choices[2] = {{Gow3::UI::PS4Symbol::Cross, text.confirm, Answer::Confirm, 0.0f, {}},
+                         {Gow3::UI::PS4Symbol::Circle, text.back, Answer::Back, 0.0f, {}}};
     Choice* shown = confirm ? choices : choices + 1;
     const int count = confirm ? 2 : 1;
     const float gap = button_size * 3.0f;
@@ -1264,12 +1208,13 @@ SaveDialogUi::Answer SaveDialogUi::DrawNotice(const ImGuiIO& io, const char* tit
 
 // A load that cannot happen: the title says it failed, the subtitle says why (no saved data included).
 void SaveDialogUi::DrawLoadFailed(const ImGuiIO& io) {
+    const auto& text = state->Text();
     std::string reason;
     if (state->mode == SaveDataDialogMode::ERROR_CODE) reason = state->GetState<SaveDialogState::ErrorCodeState>().error_msg;
     else if (state->mode == SaveDataDialogMode::USER_MSG) reason = state->GetState<SaveDialogState::UserState>().msg;
     else reason = state->GetState<SaveDialogState::SystemState>().msg;
-    if (reason.empty()) reason = "The saved data could not be loaded.";
-    if (DrawNotice(io, "LOADING FAILED", reason, false, true) == Answer::Back) Finish(ButtonId::OK);
+    if (reason.empty()) reason = text.cannot_load;
+    if (DrawNotice(io, text.load_failed, reason, false, true) == Answer::Back) Finish(ButtonId::OK);
 }
 
 void SaveDialogUi::OpenPrompt(Prompt kind, int index) {
@@ -1280,12 +1225,14 @@ void SaveDialogUi::OpenPrompt(Prompt kind, int index) {
 
 // The question over the list: overwrite the save, or delete it.
 void SaveDialogUi::DrawPrompt(const ImGuiIO& io) {
+    const auto& text = state->Text();
     const bool failed = prompt == Prompt::Failed;
-    const char* title = failed ? failure_title : prompt == Prompt::Delete ? "DELETE SAVE" : prompt == Prompt::Duplicate ? "DUPLICATE SAVE" : "OVERWRITE SAVE";
+    const char* title = failed ? failure_title : prompt == Prompt::Delete ? text.delete_save
+                             : prompt == Prompt::Duplicate ? text.duplicate_save : text.overwrite_save;
     const std::string message = failed                       ? failure
-                              : prompt == Prompt::Delete     ? "Do you wish to delete the save?"
-                              : prompt == Prompt::Duplicate  ? "Do you wish to duplicate the save?"
-                                                             : "Are you sure you want to overwrite this save?";
+                              : prompt == Prompt::Delete     ? text.ask_delete
+                              : prompt == Prompt::Duplicate  ? text.ask_duplicate
+                                                             : text.ask_overwrite;
     const Answer answer = DrawNotice(io, title, message, !failed, GetFrameCount() > prompt_frame);
     if (answer == Answer::None) return;
     if (answer == Answer::Back) {
@@ -1319,7 +1266,7 @@ void SaveDialogUi::DrawPrompt(const ImGuiIO& io) {
         std::filesystem::remove_all(path_of(item.dir_name), error);
         if (error) {
             GOW3_DIAG Gow3::Log(fmt::format("DIALOG_TRACE save delete failed directory={} error={}", item.dir_name, error.message()));
-            return fail("DELETE SAVE", "The saved data could not be deleted.");
+            return fail(text.delete_save, text.cannot_delete);
         }
         GOW3_DIAG Gow3::Log(fmt::format("DIALOG_TRACE save deleted directory={}", item.dir_name));
         state->save_list.erase(state->save_list.begin() + index);
@@ -1328,7 +1275,7 @@ void SaveDialogUi::DrawPrompt(const ImGuiIO& io) {
         const std::string source = item.dir_name;
         const std::string name = CopyName(item, [&](const std::string& candidate) { return std::filesystem::exists(path_of(candidate)); });
         const auto from = path_of(source), to = path_of(name);
-        if (name.empty()) return fail("DUPLICATE SAVE", "The saved data could not be duplicated.");
+        if (name.empty()) return fail(text.duplicate_save, text.cannot_duplicate);
         std::filesystem::copy(from, to, std::filesystem::copy_options::recursive, error);
         if (!error) { // the copy keeps the dates of the original
             for (const auto& entry : std::filesystem::recursive_directory_iterator(from, error)) {
@@ -1339,7 +1286,7 @@ void SaveDialogUi::DrawPrompt(const ImGuiIO& io) {
         if (error || !state->LoadItem(name)) {
             GOW3_DIAG Gow3::Log(fmt::format("DIALOG_TRACE save duplicate failed directory={} error={}", source, error.message()));
             std::filesystem::remove_all(to, error);
-            return fail("DUPLICATE SAVE", "The saved data could not be duplicated.");
+            return fail(text.duplicate_save, text.cannot_duplicate);
         }
         GOW3_DIAG Gow3::Log(fmt::format("DIALOG_TRACE save duplicated directory={} as={}", source, name));
         focused_idx = (state->new_item ? 1 : 0) + static_cast<int>(state->save_list.size()) - 1;
@@ -1507,7 +1454,8 @@ void SaveDialogUi::Draw() {
                 DrawProgressBar();
                 break;
             default:
-                TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Unknown dialog mode");
+                const auto message = fmt::format(fmt::runtime(state->Text().unknown), static_cast<u32>(state->mode));
+                TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "%s", message.c_str());
             }
             EndGroup();
             // Circle or Escape backs out of the prompt, as on the console

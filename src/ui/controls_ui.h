@@ -3,5 +3,5 @@
 
 namespace Gow3::ControlsUi {
 // Opens the Controls and Extras screen over the game (any thread). The pad and the keyboard belong to it until it is closed.
-void Open();
+void Open(bool from_title);
 }

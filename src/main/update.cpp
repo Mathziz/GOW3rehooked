@@ -4,6 +4,7 @@
 // restarts.
 #include "main/update.h"
 #include "main/host.h"
+#include "ui/translation.h"
 #include <windows.h>
 #include <unknwn.h>
 #include <bcrypt.h>
@@ -273,7 +274,7 @@ void Install(std::vector<ZipFile> files, const fs::path& app, const std::functio
 // The update prompt runs in `gow3.exe --update-offer`: it writes Y or N on its stdout and closes when its stdin does.
 class Offer {
 public:
-    Offer(const fs::path& app, const std::string& tag) {
+    Offer(const fs::path& app, const fs::path& game, const std::string& tag) {
         SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
         HANDLE child_input{}, child_output{};
         if (!CreatePipe(&child_input, &input_, &inherit, 0)) Fail(HostError("CreatePipe"));
@@ -290,7 +291,8 @@ public:
         startup.hStdInput = child_input;
         startup.hStdOutput = child_output;
         const auto exe = app / L"gow3.exe";
-        std::wstring command = L"\"" + exe.native() + L"\" --update-offer " + std::wstring(tag.begin(), tag.end());
+        std::wstring command = L"\"" + exe.native() + L"\" --update-offer " + std::wstring(tag.begin(), tag.end()) +
+                               L" --game-dir \"" + (fs::absolute(game) / L".").native() + L"\"";
         const bool started = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process_);
         const auto error = started ? std::string() : HostError("Start the update prompt");
         CloseHandle(child_input);
@@ -385,7 +387,7 @@ bool Check(const fs::path& app, const fs::path& game, const Version& current) {
     const auto version = ParseVersion(release->tag);
     const auto skipped = game / L"_rehooked_" / L"settings" / L"skipped-release.txt";
     if (!version || *version <= current || ReadText(skipped) == release->tag) return false;
-    Offer offer(app, release->tag);
+    Offer offer(app, game, release->tag);
     const auto answer = offer.Answer();
     if (!answer) return offer.ExitCode() == 0; // the player closed the prompt's window
     if (*answer == 'N') {
@@ -412,7 +414,8 @@ bool Check(const fs::path& app, const fs::path& game, const Version& current) {
         error = winrt::to_string(failure.message());
     }
     offer.Close();
-    MessageBoxW(nullptr, winrt::to_hstring(error).c_str(), L"GOW3rehooked update", MB_OK | MB_ICONERROR);
+    MessageBoxW(nullptr, winrt::to_hstring(UI::Tr(error.c_str())).c_str(),
+                winrt::to_hstring(UI::Tr("Could not install the update")).c_str(), MB_OK | MB_ICONERROR);
     return false;
 }
 

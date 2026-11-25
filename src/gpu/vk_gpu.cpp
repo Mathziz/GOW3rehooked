@@ -731,7 +731,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
                               (ColorFormat(info0) == VK_FORMAT_R8G8B8A8_UNORM || ColorFormat(info0) == VK_FORMAT_R8G8B8A8_SRGB) &&
                               std::none_of(color + 1, color + 8, [](const Target* t) { return t != nullptr; }) && !(bc0 >> 30 & 1) &&
                               (!depth || db_clear || !z_effect) && !(ctx[0x2DC] & 1) && instances <= 1 && !pred &&
-                              query_next == ~0u && query_on == ~0u && !query_open && !stats.trace && !boom_on &&
+                              query_next == ~0u && query_on == ~0u && !query_open && !boom_on &&
                               vp.x == 0 && vp.width == rw && ((vp.y == 0 && vp.height == rh) || (vp.y == rh && vp.height == -float(rh))) &&
                               sc.offset.x == 0 && sc.offset.y == 0 && sc.extent.width == rw && sc.extent.height == rh &&
                               prep.in.code.size() >= std::size(kClearPs) && std::equal(std::begin(kClearPs), std::end(kClearPs), prep.in.code.begin()) &&

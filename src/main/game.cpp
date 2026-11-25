@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "main/api.h"
 #include "main/host.h"
+#include "ui/game_language.h"
+#include "ui/translation.h"
 #include <cstdio>
 #include <stdexcept>
 #include <cstdlib>
@@ -13,6 +15,7 @@
 #include "present/window.h"
 #endif
 #include <shellapi.h>
+#include <SDL3/SDL.h>
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 #else
@@ -43,20 +46,27 @@ int main(int count, char** args) {
         auto args = CommandLineToArgvW(GetCommandLineW(), &count);
         if (!args) throw std::runtime_error(Gow3::HostError("Read arguments"));
 #else
-        if (count == 3 && std::string_view(args[1]) == "--update-offer")
-            Gow3::Window::OfferUpdate(args[2]);
         if (const char* image = std::getenv("APPIMAGE"); image && *image)
             game = std::filesystem::path(image).parent_path();
 #endif
-#if defined(_WIN32) && defined(GOW3_RELEASE_TAG)
-        if (count == 3 && std::wstring_view(args[1]) == L"--update-offer") {
-            std::wstring tag(args[2]);
-            LocalFree(args);
-            Gow3::Window::OfferUpdate(std::string(tag.begin(), tag.end()));
+#if !defined(_WIN32) || defined(GOW3_RELEASE_TAG)
+        std::string update_tag;
+#ifdef _WIN32
+        constexpr auto update_option = L"--update-offer";
+#else
+        constexpr auto update_option = "--update-offer";
+#endif
+        int first_option = 1;
+        if (count >= 3 && std::basic_string_view<Gow3PathChar>(args[1]) == update_option) {
+            const std::basic_string_view<Gow3PathChar> tag(args[2]);
+            update_tag.assign(tag.begin(), tag.end());
+            first_option = 3;
         }
+#else
+        constexpr int first_option = 1;
 #endif
         bool valid = true;
-        for (int i = 1; i < count; ++i) {
+        for (int i = first_option; i < count; ++i) {
             const std::basic_string_view<Gow3PathChar> arg(args[i]);
             if (arg == inspect_option) inspect = true;
             else if (arg == validate_option) validate_runtime = true;
@@ -80,6 +90,10 @@ int main(int count, char** args) {
 #endif
         if (!valid || int(inspect) + int(validate_runtime) > 1)
             throw std::runtime_error(usage);
+        Gow3::UI::InitializeTextLanguage(game);
+#if !defined(_WIN32) || defined(GOW3_RELEASE_TAG)
+        if (!update_tag.empty()) Gow3::Window::OfferUpdate(update_tag);
+#endif
 #ifdef _WIN32
         if (parent) {
             if (!SetEvent(ready)) throw std::runtime_error(Gow3::HostError("Prepare restart"));
@@ -117,7 +131,8 @@ int main(int count, char** args) {
         return result;
     } catch (const std::exception& error) {
 #ifdef _WIN32
-        if (!inspect && !validate_runtime) MessageBoxA(nullptr, error.what(), "God of War III", MB_OK | MB_ICONERROR);
+        if (!inspect && !validate_runtime)
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, Gow3::UI::Tr("Error starting the game"), error.what(), nullptr);
 #else
         std::fprintf(stderr, "%s\n", error.what());
 #endif

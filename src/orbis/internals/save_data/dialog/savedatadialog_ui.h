@@ -14,6 +14,7 @@
 #include "orbis/internals/system/commondialog.h"
 #include "ui/imgui_layer.h"
 #include "ui/imgui_texture.h"
+#include "savedatadialog_text.h"
 
 namespace Libraries::SaveData::Dialog {
 
@@ -243,7 +244,7 @@ public:
     struct ErrorCodeState {
         std::string error_msg{};
 
-        ErrorCodeState(const OrbisSaveDataDialogParam& param);
+        ErrorCodeState(const SaveDialogState& state, const OrbisSaveDataDialogParam& param);
     };
     struct ProgressBarState {
         std::string msg{};
@@ -270,6 +271,8 @@ public:
     };
 
 private:
+    Gow3::UI::GameLanguage language{Gow3::UI::GameLanguage::English};
+    const SaveText& Text() const { return GetSaveText(language); }
     SaveDataDialogMode mode{};
     DialogType type{};
     void* user_data{};

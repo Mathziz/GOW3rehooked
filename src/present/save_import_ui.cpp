@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "present/save_import_ui.h"
+#include "ui/translation.h"
+#include <fmt/format.h>
 
 #include <SDL3/SDL.h>
 #include <chrono>
@@ -22,6 +24,7 @@ using Prompt::Answer;
 enum class Page { Closed, Source, Searching, Browse, Picking, Confirm, Existing, Copying, Success, Error };
 
 Page page{};
+bool manual_import{};
 SDL_Window* window{};
 std::filesystem::path game;
 std::filesystem::path browse_start;
@@ -31,11 +34,13 @@ std::future<std::optional<SaveImport::SaveSet>> search;
 std::future<std::filesystem::path> picked;
 std::future<size_t> copy;
 std::chrono::steady_clock::time_point restart_at;
-constexpr auto title = "IMPORT SAVES";
+using UI::Tr;
+const char* Title() { return Tr("Import saves"); }
 
 void Show(Page next, Prompt::Content content) {
     page = next;
     content.step_layout = true;
+    content.navigate = manual_import;
     Prompt::Show(std::move(content));
 }
 
@@ -47,30 +52,32 @@ void Close() {
 }
 
 void Decline() {
-    try { SaveImport::MarkOffered(); }
-    catch (const std::exception& error) { Log(error.what()); }
+    if (!manual_import) {
+        try { SaveImport::MarkOffered(); }
+        catch (const std::exception& error) { Log(error.what()); }
+    }
     Close();
 }
 
 void ChooseSource() {
-    Show(Page::Source, {.title = title, .question = "WHERE DO YOU WANT TO IMPORT FROM?",
-         .actions = {"SHADPS4", "SPARTANPORT", "SKIP"}});
+    Show(Page::Source, {.title = Title(), .question = Tr("Where do you want to import from?"),
+         .actions = {"shadPS4", "SpartanPort", Tr(manual_import ? "Cancel" : "Skip")}});
 }
 
 void Search(std::filesystem::path folder = {}) {
     search = std::async(std::launch::async, SaveImport::Discover, source, game, std::move(folder));
-    Show(Page::Searching, {.title = title, .question = "LOOKING FOR SAVES...", .status = true});
+    Show(Page::Searching, {.title = Title(), .question = Tr("Looking for saves…"), .status = true});
 }
 
 void Browse(const char* reason) {
-    Show(Page::Browse, {.title = title, .question = reason, .notes = {"You can choose the installation or save folder."},
-         .actions = {"CHOOSE FOLDER", "SKIP", "BACK"}});
+    Show(Page::Browse, {.title = Title(), .question = reason, .notes = {Tr("You can choose the installation or save folder.")},
+         .actions = {Tr("Choose folder"), Tr(manual_import ? "Cancel" : "Skip"), Tr("Back")}});
 }
 
 void PickFolder() {
     auto result = std::make_unique<std::promise<std::filesystem::path>>();
     picked = result->get_future();
-    Show(Page::Picking, {.title = title, .question = "CHOOSE A SAVE FOLDER", .status = true});
+    Show(Page::Picking, {.title = Title(), .question = Tr("Choose a save folder"), .status = true});
     const auto location = Common::FS::PathToUTF8String(browse_start.empty() ? game : browse_start);
     SDL_ShowOpenFolderDialog([](void* data, const char* const* files, int) {
         const std::unique_ptr<std::promise<std::filesystem::path>> promise(
@@ -82,44 +89,47 @@ void PickFolder() {
     }, result.release(), window, location.c_str(), false);
 }
 
-std::string Count(size_t count) {
-    return std::format("{} save{}", count, count == 1 ? "" : "s");
-}
-
 std::string Summary(const SaveImport::SaveSet& set) {
+    auto result = fmt::format(fmt::runtime(Tr("Saves found: {}")), set.slots.size());
     const auto recent = std::chrono::system_clock::now() +
                         std::chrono::duration_cast<std::chrono::seconds>(set.slots.front().time - std::chrono::file_clock::now());
     const auto time = std::chrono::system_clock::to_time_t(recent);
     std::tm local{};
 #ifdef _WIN32
-    if (localtime_s(&local, &time)) return Count(set.slots.size()) + " found";
+    if (localtime_s(&local, &time)) return result;
 #else
-    if (!localtime_r(&time, &local)) return Count(set.slots.size()) + " found";
+    if (!localtime_r(&time, &local)) return result;
 #endif
     char date[64];
-    if (!std::strftime(date, sizeof(date), "%d %b %Y, %H:%M", &local)) return Count(set.slots.size()) + " found";
-    return std::format("{} found. Most recent: {}.", Count(set.slots.size()), date);
+    if (std::strftime(date, sizeof(date), "%Y-%m-%d · %H:%M", &local))
+        result += fmt::format(fmt::runtime(Tr(" · Most recent: {}")), date);
+    return result;
 }
 
 void Confirm() {
     const auto& set = candidate;
     if (set.conflicts == set.slots.size()) {
-        Show(Page::Existing, {.title = title, .question = "ALL FOUND SAVES ALREADY EXIST.",
-             .notes = {Summary(set)}, .actions = {"DONE", "", "BACK"}});
+        Show(Page::Existing, {.title = Title(), .question = Tr("All found saves already exist."),
+             .notes = {Summary(set)}, .actions = {Tr("Done"), "", Tr("Back")}});
         return;
     }
-    Show(Page::Confirm, {title, "DO YOU WANT TO IMPORT THESE SAVES?", {Summary(set),
-         set.conflicts ? std::format("{} already present. {} will be imported.",
-                                     Count(set.conflicts), Count(set.slots.size() - set.conflicts)) : ""},
-         true});
+    std::string note;
+    if (set.conflicts)
+        note = fmt::format(fmt::runtime(Tr("Already present: {} · To import: {}")), set.conflicts, set.slots.size() - set.conflicts);
+    if (set.archive_autosave) {
+        if (!note.empty()) note += '\n';
+        note += Tr("The current autosave will be kept as a separate save.");
+    }
+    Show(Page::Confirm, {Title(), Tr("Do you want to import these saves?"), {Summary(set), std::move(note)}, true});
 }
 
 template<class T>
 bool Ready(const std::future<T>& task) { return task.wait_for(0s) == std::future_status::ready; }
 } // namespace
 
-void Offer(SDL_Window* parent, const std::filesystem::path& game_directory) {
-    if (SaveImport::WasOffered()) return;
+void Offer(SDL_Window* parent, const std::filesystem::path& game_directory, bool manual) {
+    if (Active() || (!manual && SaveImport::WasOffered())) return;
+    manual_import = manual;
     window = parent;
     game = game_directory;
     ImGui::Core::AcquireGamepadInputCapture();
@@ -146,7 +156,7 @@ bool Update() {
             if (!Ready(search)) break;
             auto found = search.get();
             if (!found) {
-                Browse("NO COMPATIBLE SAVES FOUND.");
+                Browse(Tr("No compatible saves found."));
             } else {
                 candidate = std::move(*found);
                 Confirm();
@@ -162,7 +172,7 @@ bool Update() {
             if (Ready(picked)) {
                 auto path = picked.get();
                 if (path.empty()) {
-                    Browse("CHOOSE A SAVE FOLDER.");
+                    Browse(Tr("Choose a save folder"));
                 } else {
                     browse_start = path;
                     Search(std::move(path));
@@ -173,7 +183,7 @@ bool Update() {
             if (answer == Answer::No) Decline();
             if (answer == Answer::Yes) {
                 copy = std::async(std::launch::async, SaveImport::Import, source, std::move(candidate));
-                Show(Page::Copying, {.title = title, .question = "IMPORTING SAVES...", .status = true});
+                Show(Page::Copying, {.title = Title(), .question = Tr("Importing saves…"), .status = true});
             }
             break;
         case Page::Existing:
@@ -182,8 +192,8 @@ bool Update() {
             break;
         case Page::Copying:
             if (Ready(copy)) {
-                Show(Page::Success, {.title = "SAVES IMPORTED", .question = Count(copy.get()) + " imported successfully.",
-                     .notes = {"Restarting the game..."}, .status = true});
+                Show(Page::Success, {.title = Tr("Saves imported"), .question = fmt::format(fmt::runtime(Tr("Saves imported: {}")), copy.get()),
+                     .notes = {Tr("Restarting…")}, .status = true});
                 restart_at = std::chrono::steady_clock::now() + 2s;
             }
             break;
@@ -196,8 +206,8 @@ bool Update() {
         }
     } catch (const std::exception& error) {
         Log(std::string("Save import: ") + error.what());
-        Show(Page::Error, {.title = title, .question = "IMPORT COULD NOT BE COMPLETED.", .notes = {error.what()},
-             .actions = {"TRY AGAIN", "", "BACK"}});
+        Show(Page::Error, {.title = Title(), .question = Tr("Import could not be completed."), .notes = {Tr(error.what())},
+             .actions = {Tr("Try again"), "", Tr("Back")}});
     }
     return false;
 }

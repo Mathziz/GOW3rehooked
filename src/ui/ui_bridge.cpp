@@ -164,9 +164,23 @@ void Initialize(SDL_Window* window) {
     }
 #endif
     if (std::filesystem::exists(body)) Gow3::UI::g_font_body = io.Fonts->AddFontFromFileTTF(body.string().c_str());
+    const bool has_body_font = Gow3::UI::g_font_body != nullptr;
     if (!Gow3::UI::g_font_body) Gow3::UI::g_font_body = io.Fonts->AddFontDefaultVector();
     if (std::filesystem::exists(pad)) Gow3::UI::g_font_pad = io.Fonts->AddFontFromFileTTF(pad.string().c_str());
     if (!Gow3::UI::g_font_pad) Gow3::UI::g_font_pad = Gow3::UI::g_font_body;
+
+    // Cover the Rehooked interface and save titles in any supported script.
+    static const unsigned char fallback_font[]{
+#include "ui_font.inc"
+    };
+    cfg.MergeMode = true;
+    for (auto* font : {Gow3::UI::g_font_cinzel, Gow3::UI::g_font_body}) {
+        cfg.DstFont = font;
+        io.Fonts->AddFontFromMemoryTTF((void*)fallback_font, sizeof(fallback_font), 0.0f, &cfg);
+    }
+    if (!has_body_font) {
+        io.Fonts->AddFontFromMemoryTTF((void*)Cinzel_Bold_data, Cinzel_Bold_size, 0.0f, &cfg);
+    }
     StyleColorsDark();
     GetStyle().FontSizeBase = 20.f;
     if (!ImGui_ImplSDL3_InitForVulkan(window)) throw std::runtime_error("Initialize dialog input");
@@ -230,15 +244,18 @@ bool GamepadPrompts() { return gamepad_prompts.load(std::memory_order_relaxed); 
 bool PlayStationPrompts() { return playstation_prompts.load(std::memory_order_relaxed); }
 bool ProcessEvent(const SDL_Event& event) {
     TrackPromptDevice(event);
+    // An overlay can take input before ImGui has drawn its first frame. Keep key releases flowing to the game
+    // so bindings pressed before the overlay opened still get released.
+    const bool key_captured = event.type == SDL_EVENT_KEY_DOWN && captured != 0;
     const bool active = MustKeepDrawing();
     if (!active && event.type != SDL_EVENT_GAMEPAD_ADDED && event.type != SDL_EVENT_GAMEPAD_REMOVED &&
-        event.type != SDL_EVENT_MOUSE_BUTTON_UP) return false;
+        event.type != SDL_EVENT_MOUSE_BUTTON_UP) return key_captured;
     std::scoped_lock lock(ui_mutex);
     ImGui_ImplSDL3_ProcessEvent(&event);
     if (!active) { GetIO().ClearInputKeys(); GetIO().ClearEventsQueue(); }
-    return ui_capture && (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_TEXT_INPUT ||
+    return key_captured || (ui_capture && (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_TEXT_INPUT ||
         event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_WHEEL ||
-        event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+        event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN));
 }
 void NewFrame() {
     std::scoped_lock lock(ui_mutex);

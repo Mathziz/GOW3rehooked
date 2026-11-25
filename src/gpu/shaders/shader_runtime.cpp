@@ -34,7 +34,7 @@ void main() {
                           VK_NULL_HANDLE, VK_NULL_HANDLE};
     } else {
         const VkShaderModule mod = CreateShaderModule(clear_rect_spirv);
-        const VkPipeline lib = (caps.path == ShaderPath::Gpl && mod) ? CreateGplPreRaster(mod, VK_NULL_HANDLE, false, false) : VK_NULL_HANDLE;
+        const VkPipeline lib = (caps.path == ShaderPath::Gpl && mod) ? CreateGplPreRaster(mod, VK_NULL_HANDLE, !caps.depth_clip_negative_one_to_one, false) : VK_NULL_HANDLE;
         clear_rect_ref = {kClearRectVsKey, VK_NULL_HANDLE, mod, lib};
     }
     if (!clear_rect_ref || (caps.path == ShaderPath::Gpl && !clear_rect_ref.pl)) {
@@ -1053,7 +1053,7 @@ VkPipeline Renderer::Impl::GetGplPreRaster(const ShaderRef& vs, const ShaderRef&
     const bool neg_one = !caps.depth_clip_negative_one_to_one && (state.flags & FixedPipelineState::kNegOne);
     const bool depth_clamp = !caps.depth_clamp_enable && (state.flags & FixedPipelineState::kDepthClamp);
     const bool has_gs = (state.flags & FixedPipelineState::kHasGs) != 0;
-    if (!has_gs && !neg_one && !depth_clamp && vs.pl) return vs.pl;
+    if (!has_gs && neg_one == !caps.depth_clip_negative_one_to_one && !depth_clamp && vs.pl) return vs.pl;
     if (!vs.mod || (has_gs && !gs.mod)) return VK_NULL_HANDLE;
     struct PreKey {
         u64 vs, gs;

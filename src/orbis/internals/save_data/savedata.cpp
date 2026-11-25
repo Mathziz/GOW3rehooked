@@ -805,7 +805,7 @@ Error PS4_SYSV_ABI sceSaveDataDirNameSearch(const OrbisSaveDataDirNameSearchCond
     for (const auto& path : fs::directory_iterator{save_path}) {
         std::error_code error;
         if (SaveInstance::IsSearchableSlot(path.path(), error))
-            dir_list.push_back(path.path().filename().string());
+            dir_list.push_back(Common::FS::PathToUTF8String(path.path().filename()));
     }
     if (cond->dirName != nullptr) {
         // Filter names

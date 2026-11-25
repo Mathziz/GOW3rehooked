@@ -63,12 +63,11 @@ static SaveDialogResult ContinueResult(const OrbisSaveDataDialogParam& param) {
     if (param.mode != SaveDataDialogMode::LIST || !param.items || !param.items->dirName) return result;
 
     const auto& items = *param.items;
-    const auto root = SaveInstance::MakeTitleSavePath(items.userId, {});
     std::optional<fs::file_time_type> newest;
     for (u32 i = 0; i < items.dirNameNum; ++i) {
         const auto dir = items.dirName[i].data.to_view();
         if (dir.empty()) continue;
-        const auto path = root / dir;
+        const auto path = SaveInstance::MakeDirSavePath(items.userId, {}, dir);
         const auto time = ContinueSaveTime(path);
         if (!time || (newest && *time <= *newest)) continue;
 

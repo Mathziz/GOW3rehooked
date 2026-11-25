@@ -8,6 +8,8 @@
 #include <fmt/format.h>
 #include "orbis/common/assert.h"
 #include "ui/imgui_std.h"
+#include "ui/gow3_ui_theme.h"
+#include "ui/translation.h"
 #include "msgdialog_ui.h"
 
 #include "main/host.h"
@@ -15,6 +17,7 @@
 using namespace ImGui;
 using namespace Libraries::CommonDialog;
 using namespace Libraries::MsgDialog;
+using Gow3::UI::Tr;
 
 static constexpr ImVec2 BUTTON_SIZE{100.0f, 30.0f};
 static constexpr float PROGRESS_BAR_WIDTH{0.8f};
@@ -104,6 +107,9 @@ void MsgDialogUi::DrawUser() {
         count = 2;
         text1 = btn_param1.c_str();
         text2 = btn_param2.c_str();
+    } else {
+        text1 = Tr(text1);
+        text2 = Tr(text2);
     }
     const bool focus_first = button_type < ButtonType::YESNO_FOCUS_NO;
     SetCursorPos({
@@ -164,7 +170,7 @@ void MsgDialogUi::DrawProgressBar() {
     ProgressBar(static_cast<float>(progress_bar_value) / 100.0f, {bar_width, BUTTON_SIZE.y});
     if (has_cancel) {
         SameLine();
-        if (Button("Cancel", BUTTON_SIZE)) {
+        if (Button(Tr("Cancel"), BUTTON_SIZE)) {
             Finish(ButtonId::INVALID, Result::USER_CANCELED);
         }
         if (first_render) {
@@ -192,13 +198,13 @@ void MsgDialogUi::DrawSystemMessage() {
     const auto& [msg_type] = state->GetState<MsgDialogState::SystemState>();
     ASSERT(msg_type <= SystemMessageType::WARNING_PROFILE_PICTURE_AND_NAME_NOT_SHARED);
     auto [msg] = system_message_texts[static_cast<u32>(msg_type)];
-    DrawCenteredText(msg);
+    if (msg) DrawCenteredText(Tr(msg));
     const auto ws = GetWindowSize();
     SetCursorPos({
         ws.x / 2.0f - BUTTON_SIZE.x / 2.0f,
         ws.y - 10.0f - BUTTON_SIZE.y,
     });
-    if (Button("OK", BUTTON_SIZE)) {
+    if (Button(Tr("OK"), BUTTON_SIZE)) {
         Finish(ButtonId::OK);
     }
     if (first_render) {
@@ -294,6 +300,7 @@ void MsgDialogUi::Draw() {
     KeepNavHighlight();
     if (Begin("Message Dialog##MessageDialog", nullptr,
               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings)) {
+        PushFont(Gow3::UI::g_font_body);
         switch (state->GetMode()) {
         case MsgDialogMode::USER_MSG:
             DrawUser();
@@ -305,6 +312,7 @@ void MsgDialogUi::Draw() {
             DrawSystemMessage();
             break;
         }
+        PopFont();
     }
     End();
 

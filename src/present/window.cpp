@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "present/window.h"
 #include <SDL3/SDL.h>
+#include <fmt/format.h>
 #include <stb_image.h>
 #include <algorithm>
 #include <atomic>
@@ -19,6 +20,7 @@
 #include "orbis/common/elf_info.h"
 #include "orbis/core/emulator_settings.h"
 #include "ui/imgui_core.h"
+#include "ui/translation.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
@@ -41,9 +43,11 @@
 Frontend::WindowSDL* g_window; // read by input/input_mouse.cpp
 
 namespace Gow3::Window {
+using UI::Tr;
 namespace {
 SDL_Window* window;
-Uint32 restart_event, main_menu_event;
+Uint32 restart_event, main_menu_event, tools_event;
+enum class ToolRequest : Sint32 { Import, Reset };
 Frontend::WindowSDL input_window;
 
 void SaveRestartSettings(const std::filesystem::path& game, const Config& config) {
@@ -132,7 +136,7 @@ constexpr const char* JitOnceVariable = "GOW3_JIT_ONCE";
     const auto error = HostError("Start replacement game");
     Log(error);
     try { FlushLog(PortDirectory() / "gow3.log"); } catch (...) {}
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", error.c_str(), window);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, Tr("Could not restart the game"), error.c_str(), window);
     ExitImmediately(1);
 }
 #endif
@@ -244,9 +248,10 @@ void SetDisplayMode(const Config& config) {
 void Open(const Config& config, bool splash) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) throw std::runtime_error(std::string("SDL_Init: ") + SDL_GetError());
     // The input and ImGui code use SDL_EVENT_USER through SDL_EVENT_USER + 15 directly.
-    if (!(restart_event = SDL_RegisterEvents(18))) throw std::runtime_error(std::string("SDL_RegisterEvents: ") + SDL_GetError());
+    if (!(restart_event = SDL_RegisterEvents(19))) throw std::runtime_error(std::string("SDL_RegisterEvents: ") + SDL_GetError());
     restart_event += 16;
     main_menu_event = restart_event + 1;
+    tools_event = restart_event + 2;
     // The window starts at the game resolution, scaled down to fit the desktop work area when windowed.
     const auto& resolution = Resolutions[config.resolution];
     int width = resolution.width, height = resolution.height;
@@ -294,8 +299,8 @@ Prompt::Answer Ask(const Prompt::Content& content) {
 } // namespace
 
 void OfferUpdate(const std::string& tag) {
-    const auto answer = Ask({"UPDATE AVAILABLE", "INSTALL " + tag + "?",
-                             {"Yes downloads the update and restarts the game.", "No skips this release."}, true});
+    const auto answer = Ask({Tr("Update available"), fmt::format(fmt::runtime(Tr("Install {}?")), tag),
+                             {Tr("Yes downloads the update and restarts the game."), Tr("No skips this release.")}, true});
     const char reply = answer == Prompt::Answer::Yes ? 'Y' : 'N';
 #ifdef _WIN32
     DWORD written{};
@@ -305,7 +310,8 @@ void OfferUpdate(const std::string& tag) {
     if (write(STDOUT_FILENO, &reply, 1) != 1) ExitImmediately(1);
 #endif
     if (reply == 'Y')
-        Prompt::Show({"UPDATING", "INSTALLING " + tag, {"The game will reopen automatically."}, false, {}, true});
+        Prompt::Show({Tr("Updating"), fmt::format(fmt::runtime(Tr("Installing {}")), tag),
+                      {Tr("The game will reopen automatically.")}, false, {}, true});
     // The updater closes its pipe when installation finishes or fails.
 #ifdef _WIN32
     while (PeekNamedPipe(GetStdHandle(STD_INPUT_HANDLE), nullptr, 0, nullptr, nullptr, nullptr)) {
@@ -320,7 +326,7 @@ void OfferUpdate(const std::string& tag) {
 #ifndef _WIN32
     char error[1024]{};
     if (read(STDIN_FILENO, error, sizeof(error) - 1) > 0)
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "GOW3rehooked update", error, window);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, Tr("Could not install the update"), Tr(error), window);
 #endif
     ExitImmediately(0);
 }
@@ -328,21 +334,22 @@ void OfferUpdate(const std::string& tag) {
 void ReportStartupError(StartupError error) {
     static constexpr const char* text[][3]{
 #ifdef _WIN32
-        {"EBOOT.BIN NOT FOUND", "Place gow3.exe next to eboot.bin.", ""},
+        {"eboot.bin not found", "Place gow3.exe next to eboot.bin.", ""},
 #else
-        {"EBOOT.BIN NOT FOUND", "Place gow3.AppImage or gow3 next to eboot.bin.", ""},
+        {"eboot.bin not found", "Place gow3.AppImage or gow3 next to eboot.bin.", ""},
 #endif
-        {"YOUR GAME IS COMPRESSED", "Extract it before playing.", ""},
-        {"YOUR GAME IS NOT VERSION 1.02", "Update it to version 1.02 before playing.", "CUSA01715 (Europe) and CUSA01623 (America) are supported."}};
+        {"Your game is compressed", "Extract it before playing.", ""},
+        {"Your game is not version 1.02", "Update it to version 1.02 before playing.", "CUSA01715 (Europe) and CUSA01623 (America) are supported."}};
     const auto& t = text[size_t(error)];
-    Ask({"ERROR STARTING THE GAME", t[0], {t[1], t[2]}, false});
+    Ask({Tr("Error starting the game"), Tr(t[0]), {Tr(t[1]), Tr(t[2])}, false});
     ExitImmediately(1);
 }
 
 void AskAfterCrash(const std::filesystem::path& game_directory) {
     // Closing the window leaves the interrupted session, so the question is asked again.
-    const auto answer = Ask({"THE GAME CRASHED ON ITS LAST RUN", "DO YOU WANT TO RESET THE SETTINGS?",
-                             {"Yes deletes config.cfg and restarts with the default settings.", "No keeps your settings and starts the game normally."}, true});
+    const auto answer = Ask({Tr("The game crashed on its last run"), Tr("Do you want to reset the settings?"),
+                             {Tr("Yes deletes config.cfg and restarts with the default settings."),
+                              Tr("No keeps your settings and starts the game normally.")}, true});
     std::error_code error;
     if (answer == Prompt::Answer::Yes)
         std::filesystem::remove(game_directory / PortDir::Root / PortDir::Settings / "config.cfg", error);
@@ -356,7 +363,7 @@ void AskAfterCrash(const std::filesystem::path& game_directory) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
     } else {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", HostError("Start the game").c_str(), window);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, Tr("Error starting the game"), HostError("Start the game").c_str(), window);
     }
     ExitImmediately(0);
 #else
@@ -375,10 +382,19 @@ bool RequestRestart(const Config& config, bool jit_once) {
     snapshot.release();
     return true;
 }
+
+bool RequestTool(ToolRequest request) {
+    SDL_Event event{};
+    event.type = tools_event;
+    event.user.code = static_cast<Sint32>(request);
+    return SDL_PushEvent(&event);
+}
 } // namespace
 
 bool RequestSettingsRestart(const Config& config) { return RequestRestart(config, false); }
 bool RequestJitRestart() { return RequestRestart(Config{}, true); }
+bool RequestSaveImport() { return RequestTool(ToolRequest::Import); }
+bool RequestResetSettings() { return RequestTool(ToolRequest::Reset); }
 
 void NotifyMainMenuReady() {
     static std::atomic_flag queued;
@@ -412,7 +428,7 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
     for (int i = 0; i < 4; ++i) SDL_AddTimer(4, PollController, controllers[i]);
     SDL_AddTimer(33, Input::MousePolling, controllers[0]);
     Uint64 mouse_time = SDL_GetTicks();
-    bool mouse_hidden = false;
+    bool mouse_hidden = false, reset_prompt = false;
     Splash::Priority priority;  // the hold-to-skip input and the splash's frames keep up with the shader build
     for (SDL_Event event;;) {
         priority.Update();
@@ -423,7 +439,7 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
                 break;
             } catch (const std::exception& error) {
                 Log(std::string("Save import restart failed: ") + error.what());
-                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", error.what(), window);
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, Tr("Could not restart the game"), error.what(), window);
                 SaveImportUi::RestartFailed();
             }
 #else
@@ -431,14 +447,25 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
             break;
 #endif
         }
+        if (reset_prompt) {
+            const auto answer = Prompt::Result();
+            if (answer != Prompt::Answer::Pending) {
+                Prompt::Hide();
+                ImGui::Core::ReleaseGamepadInputCapture();
+                reset_prompt = false;
+                if (answer == Prompt::Answer::Yes && !RequestSettingsRestart(Config{}))
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, Tr("Could not restart the game"), SDL_GetError(), window);
+            }
+        }
+        const bool prompt_active = reset_prompt || SaveImportUi::Active();
         const bool mouse_inside = SDL_GetMouseFocus() == window;
         const Uint64 elapsed = SDL_GetTicks() - mouse_time;
-        if (!SaveImportUi::Active() && mouse_inside && !mouse_hidden && elapsed >= 3000) {
+        if (!prompt_active && mouse_inside && !mouse_hidden && elapsed >= 3000) {
             ImGui::Core::SetMouseCursorHidden(mouse_hidden = true);
         } else if (!mouse_inside && mouse_hidden) {
             ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
         }
-        int timeout = !SaveImportUi::Active() && mouse_inside && !mouse_hidden ? int(3000 - elapsed) : -1;
+        int timeout = !prompt_active && mouse_inside && !mouse_hidden ? int(3000 - elapsed) : -1;
         if (ImGui::Core::MustKeepDrawing()) timeout = timeout < 0 ? 16 : std::min(timeout, 16);
         if (!SDL_WaitEventTimeout(&event, timeout)) {
             if (ImGui::Core::MustKeepDrawing()) ImGui::Core::NewFrame();
@@ -450,9 +477,19 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
             mouse_time = SDL_GetTicks();
             if (mouse_hidden) ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
         }
-        if (event.type == main_menu_event) {
-            SaveImportUi::Offer(window, game_directory);
-            if (SaveImportUi::Active() && mouse_hidden) ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
+        if (event.type == main_menu_event || event.type == tools_event) {
+            if (!prompt_active) {
+                if (event.type == main_menu_event || event.user.code == static_cast<Sint32>(ToolRequest::Import)) {
+                    SaveImportUi::Offer(window, game_directory, event.type == tools_event);
+                } else {
+                    reset_prompt = true;
+                    ImGui::Core::AcquireGamepadInputCapture();
+                    Prompt::Show({.title = Tr("Reset settings"), .question = Tr("Do you want to reset the settings?"),
+                                  .notes = {Tr("The game will restart with the default Rehooked settings. Saves are preserved.")},
+                                  .choice = true, .navigate = true});
+                }
+            }
+            if ((reset_prompt || SaveImportUi::Active()) && mouse_hidden) ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
             continue;
         }
         if (event.type == restart_event) {
@@ -468,7 +505,7 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
                 break;
             } catch (const std::exception& error) {
                 Log(std::string("Settings restart failed: ") + error.what());
-                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "God of War III", error.what(), window);
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, Tr("Could not restart the game"), error.what(), window);
                 continue;
             }
         }

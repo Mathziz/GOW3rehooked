@@ -23,7 +23,7 @@ Compiled Renderer::Impl::Compile(Gcn::Stage stage, u64 prog, u64 key, Gcn::Input
         } else {
             c.mod = CreateShaderModule(words);
             if (caps.path == ShaderPath::Gpl && c.mod) {
-                if (stage == Gcn::Stage::Vertex) c.pl = CreateGplPreRaster(c.mod, VK_NULL_HANDLE, false, false);
+                if (stage == Gcn::Stage::Vertex) c.pl = CreateGplPreRaster(c.mod, VK_NULL_HANDLE, !caps.depth_clip_negative_one_to_one, false);
                 else if (stage == Gcn::Stage::Pixel) c.pl = CreateGplFragShader(c.mod, 1);
             }
         }
@@ -130,7 +130,7 @@ u32 Renderer::Impl::Prepare(u64 key, u64 binary, u32 stage) {
         } else {
             ref.mod = CreateShaderModule(hit->spirv);
             if (caps.path == ShaderPath::Gpl && ref.mod)
-                ref.pl = vertex ? CreateGplPreRaster(ref.mod, VK_NULL_HANDLE, false, false) : CreateGplFragShader(ref.mod, 1);
+                ref.pl = vertex ? CreateGplPreRaster(ref.mod, VK_NULL_HANDLE, !caps.depth_clip_negative_one_to_one, false) : CreateGplFragShader(ref.mod, 1);
         }
         if (!ref) return 2;
         std::unique_lock lock(prog_lock);

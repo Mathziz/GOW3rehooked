@@ -12,6 +12,7 @@ struct Content {
     std::array<std::string, 3> actions; // Custom Cross, Square and Circle labels
     bool status{}; // No buttons
     bool step_layout{};
+    bool navigate{}; // Arrows or WASD select an answer, then Enter accepts it.
 };
 void Show(Content content);
 void Hide();

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "present/dump_toast.h"
+#include "ui/translation.h"
 #include <imgui.h>
 #include <algorithm>
 #include <cfloat>
@@ -62,8 +63,8 @@ public:
         auto* body = UI::g_font_body ? UI::g_font_body : font;
         // The folder only: a large dump is split into several .zip parts.
         static const std::string folder = std::string(PortDir::Root) + "/";
-        const char* title = done ? "DEBUG DUMP SAVED" : "SAVING DEBUG DUMP";
-        const char* note = done ? folder.c_str() : "Don't close the game";
+        const char* title = UI::Tr(done ? "Debug dump saved" : "Saving debug dump");
+        const char* note = done ? folder.c_str() : UI::Tr("Don't close the game");
 
         const float title_px = std::max(12.0f, 0.8f * u), note_px = std::max(11.0f, 0.62f * u);
         const ImVec2 title_size = font->CalcTextSizeA(title_px, FLT_MAX, 0.0f, title);

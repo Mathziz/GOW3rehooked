@@ -107,11 +107,12 @@ const std::filesystem::path& PortDirectory() {
 namespace {
 enum class LaunchPhase : std::uint32_t { Closed, Starting, Ready };
 constexpr std::uint32_t kSessionMagic = 0x534c3347, kSessionFormat = 1; // "G3LS"
+constexpr std::uint32_t kForceAot = 1;
 constexpr auto kAotCooldown = std::chrono::minutes(10);
 struct LaunchSession {
     std::uint32_t magic = kSessionMagic, format = kSessionFormat;
     LaunchPhase phase = LaunchPhase::Closed;
-    std::uint32_t reserved = 0;
+    std::uint32_t flags = 0; // this field was zero in earlier records
     std::int64_t aot_time = 0; // UTC seconds; preserved across skipped launches
 } session;
 std::mutex session_mutex;
@@ -123,20 +124,26 @@ std::int64_t SessionTime() {
 }
 
 // Only lifecycle transitions write; replacement keeps the previous complete record if writing is interrupted.
-void SaveSession() {
-    if (session_path.empty()) return;
+bool SaveSession() {
+    if (session_path.empty()) return false;
     auto temporary = session_path;
     temporary += ".tmp";
     {
         std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
         out.write(reinterpret_cast<const char*>(&session), sizeof(session));
         out.flush();
-        if (!out) return Log("Cannot write launch session");
+        if (!out) {
+            Log("Cannot write launch session");
+            return false;
+        }
     }
-    if (!ReplaceFile(temporary, session_path))
-        return Log("Cannot replace launch session");
+    if (!ReplaceFile(temporary, session_path)) {
+        Log("Cannot replace launch session");
+        return false;
+    }
     std::error_code error;
     std::filesystem::remove(session_path.parent_path() / "launch.flag", error); // retire the old crash marker
+    return true;
 }
 }
 
@@ -200,6 +207,24 @@ void ResetAotCooldown() {
     if (!session.aot_time) return;
     session.aot_time = 0;
     SaveSession();
+}
+
+bool ScheduleAotBuild() {
+    std::scoped_lock lock(session_mutex);
+    const auto previous = session.flags;
+    session.flags |= kForceAot;
+    if (SaveSession()) return true;
+    session.flags = previous;
+    return false;
+}
+
+bool TakeScheduledAotBuild() {
+    std::scoped_lock lock(session_mutex);
+    if (!(session.flags & kForceAot)) return false;
+    session.flags &= ~kForceAot;
+    session.aot_time = 0;
+    SaveSession();
+    return true;
 }
 
 std::vector<unsigned char> ReadFile(const std::filesystem::path& path) {

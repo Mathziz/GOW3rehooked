@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "present/splash.h"
 #include <imgui.h>
+#include <fmt/format.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -17,8 +18,10 @@
 #include "orbis/common/elf_info.h"
 #include "orbis/core/emulator_settings.h"
 #include "ui/gow3_ui_theme.h"
+#include "ui/game_language.h"
 #include "ui/imgui_layer.h"
 #include "ui/imgui_texture.h"
+#include "ui/translation.h"
 #include "main/host.h"
 #include "gpu/shaders/shader_aot.h"
 #include "gpu/shaders/shader_cache.h"
@@ -26,6 +29,8 @@
 
 namespace Gow3::Splash {
 namespace {
+// Before applying its saved preferences the guest opens the console's language WAD.
+const char* StartupTr(const char* english) { return UI::Tr(UI::StartupTextLanguage(), english); }
 std::atomic<bool> start_menu;
 enum class State { Pending, Up, Gone };
 std::atomic<State> state{State::Pending};  // of the layer
@@ -35,16 +40,12 @@ std::atomic<std::chrono::steady_clock::rep> first_frame{};
 std::string Duration(double seconds) {
     unsigned s = unsigned(std::ceil(seconds));
     if (s >= 60) s = (s + 2) / 5 * 5;  // a long wait is not known to the second
-    return s < 60 ? std::format("{} S", s) : std::format("{} MIN {:02} S", s / 60, s % 60);
+    return std::format("{}:{:02}", s / 60, s % 60);
 }
 
 std::string FormatCount(u64 val) {
     std::string s = std::to_string(val);
-    int n = static_cast<int>(s.length()) - 3;
-    while (n > 0) {
-        s.insert(n, ",");
-        n -= 3;
-    }
+    for (int n = static_cast<int>(s.length()) - 3; n > 0; n -= 3) s.insert(n, 1, ' ');
     return s;
 }
 
@@ -121,20 +122,19 @@ private:
         last = elapsed;
 
         const bool counting = measured && total && done < total;
-        const std::string status = !counting ? (stage == Phase::Finalizing ? "SAVING THE CACHE..." : "PREPARING...")
-                                   : finish < 0 ? "ESTIMATING..." : "REMAINING: " + Duration(std::max(0.0, finish - elapsed));
+        const std::string status = !counting ? StartupTr(stage == Phase::Finalizing ? "Saving the cache…" : "Preparing…")
+                                   : finish < 0 ? StartupTr("Estimating…")
+                                   : fmt::format(fmt::runtime(StartupTr("Time remaining: {}")), Duration(std::max(0.0, finish - elapsed)));
         const auto count = measured && total ? std::format("{} / {}", FormatCount(done), FormatCount(total)) : std::string{};
 
-        const char* finalizing_label = Gpu::Aot::has_pipelines_phase.load(std::memory_order_acquire)
-                                           ? "STAGE VI · FINALIZING"
-                                           : "STAGE V · FINALIZING";
-        const char* stage_label = stage == Phase::Index      ? "STAGE I · READING FILES"
-                                : stage == Phase::Recipes    ? "STAGE II · SHADER RECIPES"
-                                : stage == Phase::Catalog    ? "STAGE III · READING THE CATALOG"
-                                : stage == Phase::Variants   ? "STAGE IV · SHADERS"
-                                : stage == Phase::Pipelines  ? "STAGE V · PIPELINES"
-                                : stage == Phase::Finalizing ? finalizing_label
-                                : "STAGE · STARTING";
+        const std::string stage_label = stage == Phase::Index      ? StartupTr("Stage I · Reading files")
+                                      : stage == Phase::Recipes    ? StartupTr("Stage II · Shader recipes")
+                                      : stage == Phase::Catalog    ? StartupTr("Stage III · Reading the catalog")
+                                      : stage == Phase::Variants   ? StartupTr("Stage IV · Shaders")
+                                      : stage == Phase::Pipelines  ? StartupTr("Stage V · Pipelines")
+                                      : stage == Phase::Finalizing ? fmt::format(fmt::runtime(StartupTr("Stage {} · Finalizing")),
+                                            Gpu::Aot::has_pipelines_phase.load(std::memory_order_acquire) ? "VI" : "V")
+                                      : StartupTr("Starting");
 
         const float H = size.y, W = size.x;
         const float cqw = std::min(W / 100.0f, H / 56.25f);
@@ -191,14 +191,14 @@ private:
         UI::DrawOmegaSymbol(list, {W * 0.5f, omega_y}, omega_r, UI::Theme::GoldBronze, pulse, true);
 
         // Draw Title: COMPILING SHADERS
-        const char* title_str = "COMPILING SHADERS";
+        const char* title_str = StartupTr("Compiling shaders");
         const float title_w = calc_w(title_size, title_str);
         // Shadow
         list->AddText(font, title_size, {(W - title_w) * 0.5f + 1.0f, title_y + 1.5f}, IM_COL32(0, 0, 0, 220), title_str);
         list->AddText(font, title_size, {(W - title_w) * 0.5f, title_y}, UI::Theme::GoldLight, title_str);
 
         // Draw Subrow: Stage name on left, count on right
-        list->AddText(body, small_size, {col_left, subrow_y}, UI::Theme::TextMain, stage_label);
+        list->AddText(body, small_size, {col_left, subrow_y}, UI::Theme::TextMain, stage_label.c_str());
         if (!count.empty()) {
             const float count_w = body_w(small_size, count.c_str());
             list->AddText(body, small_size, {col_left + col_w - count_w, subrow_y}, UI::Theme::TextMain, count.c_str());
@@ -259,7 +259,7 @@ private:
     void DrawSkip(ImDrawList* list, ImVec2 size, float cqw, float center_y, float label_size) {
         constexpr float hold_seconds = 1.2f;
         auto* font = UI::g_font_cinzel ? UI::g_font_cinzel : ImGui::GetFont();
-        const char* label = skipping ? "RESTARTING..." : "HOLD TO SKIP";
+        const char* label = StartupTr(skipping ? "Restarting…" : "Hold to skip");
         // The ring goes around Circle, or around the Escape key's cap with the keyboard and mouse.
         const float radius = std::max(11.0f, 0.95f * cqw), glyph_w = UI::HintGlyphWidth(UI::PS4Symbol::Circle, radius, font);
         const float ring = (ImGui::Core::GamepadPrompts() ? radius : std::hypot(glyph_w * 0.5f, radius * 0.85f)) + std::max(3.0f, 0.3f * cqw);

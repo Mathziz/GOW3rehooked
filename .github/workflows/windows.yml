@@ -216,7 +216,8 @@ jobs:
             @('fmt', 'src/externals/fmt/LICENSE'),
             @('magic_enum', 'src/externals/magic_enum/LICENSE'),
             @('LibAtrac9', 'src/externals/LibAtrac9/LICENSE'),
-            @('Cinzel typeface', 'src/ui/fonts/OFL.txt')
+            @('Cinzel typeface', 'src/ui/fonts/OFL.txt'),
+            @('Noto Sans CJK interface font', 'licenses/OFL-Noto-CJK.txt')
           )
           $rule = '=' * 80
           $notices = @("GOW3rehooked is licensed under the GNU General Public License v2.0 or later (GPL-2.0-or-later.txt) and builds on code from the shadPS4 project. Its source code is at $env:SOURCE_URL.", '',

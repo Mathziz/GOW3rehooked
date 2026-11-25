@@ -29,6 +29,7 @@
 #include "orbis/internals/kernel/posix_error.h"
 #include "orbis/internals/libs.h"
 #include "orbis/core/memory.h"
+#include "ui/game_language.h"
 #include "kernel.h"
 #include "patches/hooks.h" // TEMP shadow trace
 #include "present/splash.h"
@@ -252,6 +253,8 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
             LOG_ERROR(Kernel_Fs, "Opening {} failed, backend did not serve the file", raw_path);
             return -1;
         }
+
+        if (read) Gow3::UI::LanguageWadOpened(path);
 
         if (truncate) {
             if (auto* host = file->handle->GetHostFile()) {

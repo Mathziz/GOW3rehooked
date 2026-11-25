@@ -45,6 +45,8 @@ bool AotBuildAllowed(); // false: skip every startup compilation category, keepi
 void BeginAotBuild();
 void EndAotBuild();
 void ResetAotCooldown();
+bool ScheduleAotBuild();
+bool TakeScheduledAotBuild();
 std::vector<unsigned char> ReadFile(const std::filesystem::path& path);
 std::string HostError(std::string_view action);
 // Cold: paths that log are laid out away from the hot code that branches to them.

@@ -2,7 +2,10 @@
 #include "main/save_import.h"
 
 #include <algorithm>
+#include <array>
 #include <fstream>
+#include <format>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #ifdef _WIN32
@@ -37,6 +40,10 @@ constexpr auto system_dir = "sce_sys";
 constexpr auto payload = "SAVEDATA";
 #endif
 enum class Metadata { Sfo, Spartan, Missing };
+
+void LogPath(const fs::path& path, std::string_view reason) {
+    Log(std::format("Save import: {}: {}", Common::FS::PathToUTF8String(path), reason));
+}
 
 fs::path FlagPath() { return PortDirectory() / PortDir::Settings / "saves.flag"; }
 
@@ -292,11 +299,18 @@ std::vector<fs::path> FindTitleFolders(Source source, const fs::path& game, cons
     if (!selected.empty()) {
         AddDirectory(roots, selected);
         AddDirectory(roots, selected / "user");
+        auto folder = selected.lexically_normal();
+        if (folder.filename().empty()) folder = folder.parent_path();
+        const auto is_title = [&](const fs::path& path) {
 #ifdef _WIN32
-        if (_wcsicmp(selected.filename().c_str(), title.c_str()) == 0) AddDirectory(titles, selected);
+            return _wcsicmp(path.filename().c_str(), title.c_str()) == 0;
 #else
-        if (Common::ToLower(selected.filename().string()) == Common::ToLower(title.string())) AddDirectory(titles, selected);
+            return Common::ToLower(path.filename().string()) == Common::ToLower(title.string());
 #endif
+        };
+        if (is_title(folder)) AddDirectory(titles, folder);
+        else if (!roots.empty() && is_title(folder.parent_path())) AddDirectory(titles, folder.parent_path());
+        AddDirectory(titles, folder / title);
     } else {
 #ifdef _WIN32
         const auto app_data = EnvPath(L"APPDATA");
@@ -412,18 +426,22 @@ bool Exists(const fs::path& path) {
 #endif
 }
 
-bool LoadMetadata(const fs::path& path) {
-    if (!PlainEntry(path, false)) return false;
-    const auto size = fs::file_size(path);
+const char* MetadataError(const fs::path& path) {
+    if (!PlainEntry(path, false)) return "sce_sys/param.sfo is missing, unreadable or not a regular file";
+    std::error_code error;
+    const auto size = fs::file_size(path, error);
+    if (error) return "could not read the size of sce_sys/param.sfo";
+    if (size > 1024 * 1024) return "sce_sys/param.sfo exceeds 1 MiB";
     PSF metadata;
-    if (size > 1024 * 1024 || !metadata.Open(path)) return false;
+    if (!metadata.Open(path)) return "sce_sys/param.sfo could not be parsed";
     const auto blocks = metadata.GetBinary(SaveParams::SAVEDATA_BLOCKS);
-    return !blocks || blocks->size() == sizeof(u64);
+    return blocks && blocks->size() != sizeof(u64) ? "invalid SAVEDATA_BLOCKS size in param.sfo" : nullptr;
 }
 
 bool ReadSpartanParam(const fs::path& path, OrbisSaveDataParam& param) {
     static_assert(sizeof(param) == 1328 && offsetof(OrbisSaveDataParam, mtime) == 0x508);
-    if (!PlainEntry(path, false) || fs::file_size(path) != sizeof(param)) return false;
+    std::error_code error;
+    if (!PlainEntry(path, false) || fs::file_size(path, error) != sizeof(param) || error) return false;
     std::ifstream file(path, std::ios::binary);
     if (!file.read(reinterpret_cast<char*>(&param), sizeof(param))) return false;
     return param.title.end() != std::find(param.title.begin(), param.title.end(), '\0') &&
@@ -448,30 +466,48 @@ Metadata SlotMetadata(Source source, const fs::path& slot) {
 }
 
 std::optional<fs::file_time_type> SlotTime(Source source, const fs::path& slot) {
+    const auto reject = [&](std::string_view reason) -> std::optional<fs::file_time_type> {
+        LogPath(slot, reason);
+        return std::nullopt;
+    };
     const auto name = slot.filename().u8string();
 #ifdef _WIN32
     const bool user_data = _wcsicmp(slot.filename().c_str(), L"USERDATA") == 0;
 #else
     const bool user_data = Common::ToLower(slot.filename().string()) == "userdata";
 #endif
-    if (name.empty() || name.size() >= OrbisSaveDataDirnameDataMaxsize || name.starts_with(u8"sce_") ||
-        user_data || !PlainEntry(slot, true) ||
-        !PlainEntry(slot / payload, false) || !fs::file_size(slot / payload)) return std::nullopt;
-    if (Exists(slot / system_dir / "corrupted")) return std::nullopt;
+    if (user_data || name.starts_with(u8"sce_"))
+        return reject("preferences or system metadata; not a gameplay slot");
+    if (name.empty() || name.size() >= OrbisSaveDataDirnameDataMaxsize) return reject("invalid slot name length (maximum 31 UTF-8 bytes)");
+    if (!PlainEntry(slot, true)) return reject("slot is unreadable or not a regular directory");
+    const auto data = slot / payload;
+    if (!PlainEntry(data, false)) return reject("SAVEDATA is missing, unreadable or not a regular file");
+    std::error_code error;
+    const auto size = fs::file_size(data, error);
+    if (error) return reject("could not read the size of SAVEDATA");
+    if (!size) return reject("SAVEDATA is empty");
+    if (Exists(slot / system_dir / "corrupted")) return reject("slot is marked as corrupted");
     switch (SlotMetadata(source, slot)) {
     case Metadata::Sfo:
-        if (!PlainEntry(slot / system_dir, true) || !LoadMetadata(SaveInstance::GetParamSFOPath(slot))) return std::nullopt;
-        return Dialog::ContinueSaveTime(slot);
+        if (source == Source::ShadPS4 && PlainEntry(SpartanMetadata(slot) / "param.bin", false) &&
+            !Exists(SaveInstance::GetParamSFOPath(slot)))
+            return reject("SpartanPort metadata found; select SpartanPort as the source");
+        if (!PlainEntry(slot / system_dir, true)) return reject("sce_sys is missing, unreadable or not a regular directory");
+        if (const auto* reason = MetadataError(SaveInstance::GetParamSFOPath(slot))) return reject(reason);
+        break;
     case Metadata::Spartan: {
         const auto meta = SpartanMetadata(slot);
         OrbisSaveDataParam param{};
-        if (!PlainEntry(meta, true) || !ReadSpartanParam(meta / "param.bin", param)) return std::nullopt;
+        if (!PlainEntry(meta, true)) return reject("SpartanPort .sce_sys metadata directory is unreadable or a link");
+        if (!ReadSpartanParam(meta / "param.bin", param)) return reject("invalid SpartanPort param.bin (expected 1328 bytes and terminated text fields)");
         break;
     }
     case Metadata::Missing:
         break;
     }
-    return fs::last_write_time(slot / payload);
+    const auto time = fs::last_write_time(data, error);
+    if (error) return reject("could not read the modification time of SAVEDATA");
+    return time;
 }
 
 void CopyFile(const fs::path& from, const fs::path& to) {
@@ -499,7 +535,10 @@ void StageSlot(Source source, const fs::path& from, const fs::path& to, const st
         }
         if (PlainEntry(it->path(), true)) fs::create_directory(to / relative);
         else if (PlainEntry(it->path(), false)) CopyFile(it->path(), to / relative);
-        else throw std::runtime_error("A save contains a link or an unreadable file.");
+        else {
+            LogPath(it->path(), "link or unreadable entry inside the slot");
+            throw std::runtime_error("A save contains a link or an unreadable file.");
+        }
     }
     if (metadata == Metadata::Sfo) return;
     PSF sfo;
@@ -523,7 +562,35 @@ void StageSlot(Source source, const fs::path& from, const fs::path& to, const st
 }
 
 bool ReadyToLoad(const fs::path& slot) {
-    return Dialog::ContinueSaveTime(slot) && LoadMetadata(SaveInstance::GetParamSFOPath(slot));
+    return Dialog::ContinueSaveTime(slot) && !MetadataError(SaveInstance::GetParamSFOPath(slot));
+}
+
+bool SameAutosave(const fs::path& from, const fs::path& to) {
+    const auto target = to / payload;
+    if (!PlainEntry(target, false)) return false;
+    std::ifstream left(from / payload, std::ios::binary), right(target, std::ios::binary);
+    std::array<char, 16 * 1024> src, dst;
+    do {
+        left.read(src.data(), src.size());
+        right.read(dst.data(), dst.size());
+        if (left.gcount() != right.gcount() || !std::equal(src.begin(), src.begin() + left.gcount(), dst.begin()))
+            return false;
+    } while (left && right);
+    return left.eof() && right.eof() && !left.bad() && !right.bad();
+}
+
+const char* ConflictReason(const fs::path& from, const fs::path& to) {
+    if (!Exists(to)) return nullptr;
+    if (from.filename() != "AUTOSAVE") return "a destination slot with this name already exists";
+    if (!PlainEntry(to, true)) return "destination AUTOSAVE is not a regular directory";
+    return SameAutosave(from, to) ? "the same AUTOSAVE gameplay data is already present" : nullptr;
+}
+
+fs::path AutosaveArchive(const fs::path& destination, const fs::path& stage) {
+    fs::path name = "AUTOSAVE - OLD";
+    for (unsigned n = 2; Exists(destination / name) || Exists(stage / name); ++n)
+        name = std::format("AUTOSAVE - OLD ({})", n);
+    return destination / name;
 }
 
 bool MoveNoReplace(const fs::path& from, const fs::path& to) {
@@ -556,16 +623,48 @@ void MarkOffered() {
 
 std::optional<SaveSet> Discover(Source source, const fs::path& game, const fs::path& selected) {
     const auto destination = SaveInstance::MakeTitleSavePath(0, {});
+    const auto title = TitleId();
+    auto roots = FindTitleFolders(source, game, selected, title);
+    // Both regional releases use the same gameplay save layout. Prefer the installed release's folder.
+    for (const auto* regional_title : {"CUSA01623", "CUSA01715"}) {
+        if (title == regional_title) continue;
+        for (const auto& root : FindTitleFolders(source, game, selected, regional_title))
+            AddDirectory(roots, root);
+    }
+    if (roots.empty()) {
+        const auto reason = std::format("no {} save folder found (installed save ID: {}; regional folders checked: CUSA01623, CUSA01715)",
+                                        source == Source::ShadPS4 ? "shadPS4" : "SpartanPort", title);
+        if (selected.empty()) Log("Save import: " + reason);
+        else LogPath(selected, reason);
+    }
     std::optional<SaveSet> existing;
-    for (const auto& root : FindTitleFolders(source, game, selected, TitleId())) {
+    for (const auto& root : roots) {
         SaveSet found{.root = root};
-        for (const auto& entry : fs::directory_iterator(root)) {
-            if (const auto time = SlotTime(source, entry.path())) {
-                found.slots.push_back({entry.path().filename(), *time});
-                found.conflicts += Exists(destination / entry.path().filename());
+        std::error_code error;
+        for (fs::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
+            const auto& path = it->path();
+            if (source == Source::SpartanPort && path.filename().u8string().ends_with(u8".sce_sys") &&
+                Exists(path / "param.bin") && !Exists(path / payload)) continue;
+            if (const auto time = SlotTime(source, path)) {
+                const auto name = path.filename();
+                const auto target = destination / name;
+                found.slots.push_back({name, *time});
+                if (const auto* reason = ConflictReason(path, target)) {
+                    ++found.conflicts;
+                    LogPath(path, reason);
+                } else if (name == "AUTOSAVE" && Exists(target)) {
+                    found.archive_autosave = true;
+                }
             }
         }
-        if (found.slots.empty()) continue;
+        if (error) {
+            LogPath(root, "could not list the save folder: " + error.message());
+            continue;
+        }
+        if (found.slots.empty()) {
+            LogPath(root, "no compatible gameplay slots");
+            continue;
+        }
         std::ranges::sort(found.slots, std::greater{}, &Slot::time);
         if (found.conflicts < found.slots.size()) return found;
         if (!existing) existing = std::move(found);
@@ -574,6 +673,8 @@ std::optional<SaveSet> Discover(Source source, const fs::path& game, const fs::p
 }
 
 size_t Import(Source source, const SaveSet& saves) {
+    static std::mutex import_mutex;
+    const std::scoped_lock lock(import_mutex);
     const auto destination = SaveInstance::MakeTitleSavePath(0, {});
 #ifdef _WIN32
     const auto stage = PortDirectory() / (L".save-import-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
@@ -584,22 +685,37 @@ size_t Import(Source source, const SaveSet& saves) {
 #endif
     if (!fs::create_directory(stage)) throw std::runtime_error("Could not prepare the save import folder.");
     std::vector<fs::path> ready;
+    fs::path archived_autosave;
     size_t installed = 0;
     try {
         const auto title = TitleId();
         for (const auto& slot : saves.slots) {
-            if (Exists(destination / slot.name)) continue;
             const auto from = saves.root / slot.name, to = stage / slot.name;
-            if (SlotTime(source, from) != slot.time) throw std::runtime_error("The source saves changed. Search again.");
+            if (const auto* reason = ConflictReason(from, destination / slot.name)) {
+                LogPath(from, reason);
+                continue;
+            }
+            if (SlotTime(source, from) != slot.time) {
+                LogPath(from, "slot changed since discovery");
+                throw std::runtime_error("The source saves changed. Search again.");
+            }
             StageSlot(source, from, to, title);
-            if (!ReadyToLoad(to) || Dialog::ContinueSaveTime(to) != slot.time)
+            if (!ReadyToLoad(to) || Dialog::ContinueSaveTime(to) != slot.time) {
+                LogPath(from, "staged data or metadata failed validation");
                 throw std::runtime_error("A copied save could not be read by the game.");
+            }
             ready.push_back(slot.name);
         }
         if (ready.empty()) throw std::runtime_error("There are no new saves to import.");
         fs::create_directories(destination);
         for (const auto& name : ready) {
             const auto target = destination / name;
+            if (name == "AUTOSAVE" && PlainEntry(target, true)) {
+                auto archive = AutosaveArchive(destination, stage);
+                if (!MoveNoReplace(target, archive)) throw std::runtime_error(HostError("Archive current autosave"));
+                archived_autosave = std::move(archive);
+                LogPath(archived_autosave, "preserved previous AUTOSAVE");
+            }
             if (!MoveNoReplace(stage / name, target))
                 throw std::runtime_error(HostError("Install save"));
             ++installed;
@@ -612,6 +728,8 @@ size_t Import(Source source, const SaveSet& saves) {
             if (!MoveNoReplace(destination / name, stage / name))
                 Log(HostError("Roll back imported save"));
         }
+        if (!archived_autosave.empty() && !MoveNoReplace(archived_autosave, destination / "AUTOSAVE"))
+            LogPath(archived_autosave, HostError("Restore original AUTOSAVE"));
         std::error_code error;
         fs::remove_all(stage, error);
         throw;

@@ -18,6 +18,7 @@ struct SaveSet {
     std::filesystem::path root;
     std::vector<Slot> slots;
     size_t conflicts{};
+    bool archive_autosave{};
 };
 
 bool WasOffered();

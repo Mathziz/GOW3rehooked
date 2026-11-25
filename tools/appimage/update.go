@@ -66,7 +66,7 @@ func newer(tag string) bool {
 func fetch(url string, limit int64, timeout time.Duration) ([]byte, error) {
 	client := http.Client{Timeout: timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if req.URL.Scheme != "https" || len(via) >= 10 {
-			return errors.New("invalid release redirect")
+			return errors.New("Invalid update address.")
 		}
 		return nil
 	}}
@@ -79,11 +79,11 @@ func fetch(url string, limit int64, timeout time.Duration) ([]byte, error) {
 		return nil, errors.New(resp.Status)
 	}
 	if resp.ContentLength > limit {
-		return nil, errors.New("release response too large")
+		return nil, errors.New("The download is larger than expected.")
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if int64(len(data)) > limit {
-		return nil, errors.New("release response too large")
+		return nil, errors.New("The download is larger than expected.")
 	}
 	return data, err
 }
@@ -223,7 +223,7 @@ func install(data []byte, image string, restart func() error) (err error) {
 		files = append(files, f)
 	}
 	if !found[gameImage] || !found[debugImage] {
-		return errors.New("release is missing an AppImage")
+		return errors.New("The release is missing an AppImage.")
 	}
 	sort.SliceStable(files, func(i, j int) bool { return files[i].target != image && files[j].target == image })
 	for i := range files {
@@ -249,7 +249,7 @@ func apply(a asset, tag, image string) error {
 		return err
 	}
 	if int64(len(data)) != a.Size || fmt.Sprintf("sha256:%x", sha256.Sum256(data)) != a.Digest {
-		return errors.New("release ZIP checksum mismatch")
+		return errors.New("The ZIP does not match the release checksum.")
 	}
 	return install(data, image, func() error {
 		cmd := exec.Command(image, os.Args[1:]...)
@@ -263,8 +263,8 @@ func apply(a asset, tag, image string) error {
 }
 
 // Return true if the window was closed or the new game has already started.
-func offer(entry, image, skip, tag string, a asset) bool {
-	cmd := exec.Command(entry, "--update-offer", tag)
+func offer(entry, image, game, skip, tag string, a asset) bool {
+	cmd := exec.Command(entry, "--update-offer", tag, "--game-dir", game)
 	cmd.Stderr = os.Stderr
 	status, err := cmd.StdinPipe()
 	if err != nil {
@@ -298,7 +298,7 @@ func offer(entry, image, skip, tag string, a asset) bool {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Update: %v\n", err)
-		fmt.Fprintf(status, "Update: %.900s", err.Error())
+		fmt.Fprintf(status, "%.900s", err.Error())
 	}
 	return false
 }
@@ -343,7 +343,7 @@ func check(entry string) bool {
 	}
 	for _, a := range latest.Assets {
 		if a.Name == assetName && a.Size > 0 && a.Size <= 128<<20 && digest.MatchString(a.Digest) {
-			return offer(entry, image, skip, latest.Tag, a)
+			return offer(entry, image, game, skip, latest.Tag, a)
 		}
 	}
 	return false

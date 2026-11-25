@@ -88,7 +88,7 @@ The game stores its settings, saves and diagnostics in `_rehooked_`:
 
 | Path | Contents |
 | --- | --- |
-| `settings/config.cfg` | Your settings. Delete it to return to the defaults. |
+| `settings/config.cfg` | Your Rehooked settings. See [Tools](#tools) for the in-game reset. |
 | `saves/` | Your saves |
 | `shader_cache/` | Translated shaders, and the shader recipes from the ZIP, which grow as you play |
 | `gow3.log` | A log, which grows with every launch |
@@ -137,11 +137,14 @@ Both modes are described under [Settings](#settings).
 
 ### Controls and Extras
 
-You can play with a gamepad or with keyboard and mouse. Controls and Extras opens from the title menu and from the game's Options menu, also during play, and has three tabs:
+You can play with a gamepad or with keyboard and mouse. Open **Controls and Extras** from the title menu or from the game's Options menu during play.
 
+- [**Tools**](#tools) schedules shader compilation, imports saves and restores the default Rehooked settings.
 - **Controls** remaps the gamepad and the keyboard and mouse.
 - **Cheats & Patches** holds the controller's vibration strength, cheats and visual patches. They apply as soon as you change them and stay as you left them for the next launch.
 - **Help** explains each Rehooked setting.
+
+On the keyboard, press **W** or **↑** to move up and **S** or **↓** to move down. Use **Page Up** and **Page Down** to switch tabs, **Enter** or **Space** to activate the selected option, and **Esc** to go back.
 
 The added screens show PlayStation symbols for a DualShock 3, DualShock 4 or DualSense, and Xbox-style buttons for other gamepads.
 
@@ -176,13 +179,25 @@ Thanks to the people involved in developing, researching and porting these cheat
   </tr>
 </table>
 
+#### Tools
+
+| Option | What it does |
+| --- | --- |
+| Compile shaders | Choose **Schedule compilation** to start an AOT shader preparation pass on the next launch, including when your saved shader mode is JIT. |
+| Import saves | Choose **Choose source** to import saves from shadPS4 or SpartanPort. Open Controls and Extras from the title menu to use this option. |
+| Reset settings | Choose **Reset to defaults** and confirm to restart with the default Rehooked settings, including vibration, cheats and patches. You can resume from your existing saves. |
+
 ### Menus and saves
 
 Continue appears above New Game once you have a save and directly loads the latest. The game originally has 32 manual save slots. GOW3rehooked raises that to 64. The save and load screens let you duplicate or delete saves. Open Save Folder opens the selected save in your file manager.
 
-On first launch, GOW3rehooked offers to import existing saves from **shadPS4** or **SpartanPort**. It looks in the usual locations automatically and lets you pick a folder if none are found. Existing saves are never overwritten; to see the import prompt again later, delete `_rehooked_/settings/saves.flag`.
+On first launch, GOW3rehooked offers to import existing saves from **shadPS4** or **SpartanPort**. It recognizes both American (`CUSA01623`) and European (`CUSA01715`) save folders. To import later, open **Controls and Extras → Tools → Import saves** from the title menu.
 
-Rehooked holds every setting in the game's own menu style, feel free to tinker. [Controls and Extras](#controls-and-extras) explains each setting, remaps the controls and holds the cheats and patches.
+If the automatic search doesn't find your saves, extract any ZIP you have and choose the `CUSA…` folder, its parent, or a save slot directly inside it. Select the source that made the saves. SpartanPort exports pair each slot with a `<slot>.sce_sys` folder.
+
+If you import a different autosave, the previous one is kept as `AUTOSAVE - OLD` with a numbered suffix if needed. Other saves with the same slot name are skipped. Look for `Save import:` in `_rehooked_/gow3.log` for rejection reasons.
+
+The Rehooked menus, save and load dialogs, and startup screens follow the game's text language. Set it in the game's Options menu.
 
 The opening logos can be skipped, and so can any video or cutscene, by pressing Cross.
 
@@ -250,7 +265,7 @@ Defaults are in bold.
 - “YOUR GAME IS COMPRESSED” means the folder holds a packaged game. Extract it first.
 - “YOUR GAME IS NOT VERSION 1.02” means the game needs its 1.02 update, or is not the European (CUSA01715) or American (CUSA01623) release.
 - If the game crashed before reaching the title menu, the next launch offers to reset your settings. Answer Yes if the crashes began after you changed one.
-- To reset the settings by hand, delete `_rehooked_/settings/config.cfg`.
+- To restore defaults, open **Controls and Extras → Tools → Reset settings**. If you can't reach the menu, delete `_rehooked_/settings/config.cfg`.
 - Windows Security reporting `gow3.exe` as `Trojan:Win32/Wacatac.B!ml` is a false positive that hit the small launchers of v0.1.5 to v0.2.1. Install the latest release, which no longer has them.
 
 ## Reporting bugs

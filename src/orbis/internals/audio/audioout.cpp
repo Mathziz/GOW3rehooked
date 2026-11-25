@@ -148,9 +148,11 @@ static int AllocatePort(OrbisAudioOutPort type) {
 
 static void ApplyVolume(PortOut& port) {
     auto volume = port.volume;
-    // No controller speaker here, and the game also plays the pad's sounds on the main mix (the weapon upgrade, #56).
-    if (port.type == OrbisAudioOutPort::PadSpk) {
-        volume.fill(0);
+    if (port.type == OrbisAudioOutPort::PadSpk && port.is_mix_to_main) {
+        for (auto& channel_volume : volume) {
+            channel_volume = static_cast<s64>(channel_volume) * port.mixLevelPadSpk /
+                             ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_0DB;
+        }
     }
     port.impl->SetVolume(volume);
 }
@@ -344,11 +346,9 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
 
         // Set attributes
         port->is_restricted = is_restricted;
-        port->is_mix_to_main = is_mix_to_main;
-        if (port->type == OrbisAudioOutPort::PadSpk) {
-            const auto device = EmulatorSettings.GetSDLPadSpkOutputDevice();
-            port->is_mix_to_main = device == "None";
-        }
+        // No controller speaker here: the pad's only sound, the weapon upgrade's UI_PUM_PowerUp, has no copy on the
+        // main mix (#84) and plays there at the system's pad level instead of as a second full volume stream (#56).
+        port->is_mix_to_main = is_mix_to_main || port->type == OrbisAudioOutPort::PadSpk;
 
         // Log attributes if present
         if (is_restricted) {

@@ -2,6 +2,8 @@
 // Game engine detours: timing, movement, title menu and optional rendering diagnostics.
 // EBOOT 6E72330E9092E5164049B865E5568F2D450904001A73FE0A2F4B39194C195B3C (VA = 0x01000000 + RVA).
 #include "patches/hooks.h"
+#include "ui/game_language.h"
+#include "ui/translation.h"
 #include "debug/dump_archive.h"
 #include "gpu/device.h"
 #include "gpu/gpu_thread.h"
@@ -927,7 +929,7 @@ namespace TitleMenu {
 constexpr u32 kQuitTarget = 0xffffff00, kBackTarget = 0xfffffe00, kPageNextTarget = 0xfffffd00, kHelpTarget = 0xfffffc00, kSettingTarget = 0xfffe0000,
               kMoveTarget = 0xfffd0000, kFirstItemTarget = 0xfffffb00, kBeforeNewGameTarget = 0xfffffa00, kContinueTarget = 0xfffff900,
               kRefreshContinueTarget = 0xfffff800;
-constexpr u32 kMainShellSize = 0xc1e0, kRows = 10, kRowSize = 128;
+constexpr u32 kMainShellSize = 0xc1e0, kRows = 10, kRowSize = 192, kLabelSize = 96;
 constexpr u32 kResidentSize = 0x132fe, kBrightnessState = 0x193c;
 constexpr u32 kTurnOnState = 0xe4, kMainState = 0xf8, kNewGameState = 0x114, kLoadState = 0x148, kTreasuresState = 0x1c8;
 // Load: X requests the load; 0x14b comes with 1 when it starts and 0 when it ends (the body, from the jz on, runs only for 0);
@@ -938,7 +940,7 @@ constexpr u32 kMainItemSize = 0x34, kRehookedState = kMainShellSize - 4, kHelpSt
               kContinueLoadState = kContinueState + kMainItemSize,
               kSettingsState = kContinueLoadState + 0x40, kFirstRow = kSettingsState + 0x1c;
 enum MainRow : u32 { ContinueRow, NewGameRow, LoadRow, OptionsRow, TreasuresRow, RehookedRow, HelpRow, QuitRow, kMainRows };
-constexpr char kMainLabels[kMainRows][sizeof("Controls and Extras")] = {
+constexpr const char* kMainLabels[kMainRows] = {
     "Continue", "[msg_A[8001]]", "[msg_A[8002]]", "[msg_A[8003]]", "[msg_A[8004]]", "Rehooked", "Controls and Extras", "[msg_A[4012]]",
 };
 constexpr char kSelectClip[] = "menuItem0Select";
@@ -952,8 +954,9 @@ InitFn original_init;
 GotoFn original_goto;
 std::vector<u8> patched;
 std::vector<u8> patched_options;
-u32 main_labels_at{}, main_clips_at{}, main_initial_target{};
+u32 main_labels_at{}, main_clips_at{}, main_initial_target{}, options_label_at{};
 bool continue_available{};
+UI::GameLanguage menu_language{};
 
 enum Option : u32 { Resolution, Fps, DisplayModeOption, Vrr, Vsync, Reflex, Msaa, Filtering, PostEffects, Scaler,
                     SkipIntro, SkipVideos, Cinematics4K, Mechanism, Recompilation, LazyAot, OptionCount, Empty = OptionCount };
@@ -1007,27 +1010,51 @@ float ValueWidth(std::string_view value) {
     const auto it = std::ranges::find(widths, value, &std::pair<std::string_view, float>::first);
     return it != std::end(widths) ? it->second : kMaxValueWidth;
 }
+float LocalizedWidth(std::string_view localized, std::string_view source, float width) {
+    if (localized == source) return width;
+    float result{};
+    for (unsigned char c : localized) {
+        if (c < 0x80) result += c == ' ' ? kSpacePixels : 19.f;
+        else if (c >= 0xe0) result += 31.f;
+        else if (c >= 0xc0) result += 20.f;
+    }
+    return result;
+}
+
+void WriteText(u8* at, size_t capacity, std::string_view text) {
+    size_t length = std::min(text.size(), capacity - 1);
+    while (length && length < text.size() && (static_cast<unsigned char>(text[length]) & 0xc0) == 0x80) --length;
+    std::memcpy(at, text.data(), length);
+    std::memset(at + length, 0, capacity - length);
+}
+
 void WriteRow(u32 row) {
     std::string text;
     if (row == kRows - 1) {
         constexpr float page_center = 210.f, arrow_with_space = 45.f;
         const float left_arrow = page ? arrow_with_space : 0.f;
-        const int padding = std::max(0, int(std::lround((page_center - page_widths[page] * 0.5f - left_arrow) / kSpacePixels)));
-        text = std::format("{:{}}{}{} {}/{}{}", "", padding, page ? "[ArrowSelectionL] " : "", page_names[page], page + 1, kPageCount,
+        const std::string_view page_name = UI::Tr(page_names[page].data());
+        const float width = LocalizedWidth(page_name, page_names[page], page_widths[page]);
+        const int padding = std::max(0, int(std::lround((page_center - width * 0.5f - left_arrow) / kSpacePixels)));
+        text = std::format("{:{}}{}{} {}/{}{}", "", padding, page ? "[ArrowSelectionL] " : "", page_name, page + 1, kPageCount,
                            page + 1 < kPageCount ? " [ArrowSelectionR]" : "");
     } else if (const Option option = pages[page][row]; option != Empty) {
         const Setting& setting = settings[option];
-        if (!Selectable(row)) text = std::string(setting.label) + (option == Reflex ? " (Unavailable)" : option == Vrr ? " (Full Screen only)" : " (AOT only)");
+        const std::string_view label = UI::Tr(setting.label.data());
+        if (!Selectable(row)) {
+            const char* reason = option == Reflex ? "Unavailable" : option == Vrr ? "Full Screen only" : "AOT only";
+            text = std::format("{} ({})", label, UI::Tr(reason));
+        }
         else {
             const auto value = setting.values[setting.index];
-            const float offset = (kMaxValueWidth - ValueWidth(value)) * 0.5f;
-            text = std::string(setting.label) + std::format("{:{}}[ArrowSelectionL] {} [ArrowSelectionR]", "",
-                std::max(1, int(std::lround((kColumnPixels + offset - setting.width) / kSpacePixels))), value);
+            const std::string_view localized = UI::Tr(value.data());
+            const float offset = (kMaxValueWidth - LocalizedWidth(localized, value, ValueWidth(value))) * 0.5f;
+            const float width = LocalizedWidth(label, setting.label, setting.width);
+            text = std::format("{}{:{}}[ArrowSelectionL] {} [ArrowSelectionR]", label, "",
+                std::max(1, int(std::lround((kColumnPixels + offset - width) / kSpacePixels))), localized);
         }
     }
-    u8* const at = &patched[row_at[row]];
-    std::memset(at, 0, kRowSize);
-    std::memcpy(at, text.data(), std::min<size_t>(text.size(), kRowSize - 1));
+    WriteText(&patched[row_at[row]], kRowSize, text);
 }
 void WriteRows() { for (u32 row = 0; row < kRows; ++row) WriteRow(row); }
 Config SelectedConfig() {
@@ -1092,13 +1119,27 @@ void PutBe32(u8* p, u32 v) {
 void WriteMainRows(bool available) {
     continue_available = available;
     const u32 skip = available ? 0 : 1;
-    const size_t labels_size = sizeof(kMainLabels) - skip * sizeof(kMainLabels[0]);
     auto* const labels = patched.data() + main_labels_at;
-    std::memcpy(labels, reinterpret_cast<const char*>(&kMainLabels) + skip * sizeof(kMainLabels[0]), labels_size);
-    std::memset(labels + labels_size, 0, sizeof(kMainLabels) - labels_size);
+    for (u32 i = 0; i < kMainRows; ++i) {
+        const u32 item = i + skip;
+        const char* label = item < kMainRows ? UI::Tr(kMainLabels[item]) : "";
+        WriteText(labels + i * kLabelSize, kLabelSize, label);
+    }
     for (u32 i = NewGameRow; i < kMainRows; ++i)
         patched[main_clips_at + i * sizeof(kSelectClip) + sizeof("menuItem") - 1] = u8('0' + i - skip);
     PutBe32(patched.data() + main_initial_target, available ? kContinueState : kNewGameState);
+}
+
+void RefreshLanguage() {
+    const auto current = UI::TextLanguage();
+    if (current == menu_language) return;
+    menu_language = current;
+    if (!patched.empty()) {
+        WriteMainRows(continue_available);
+        WriteRows();
+    }
+    if (!patched_options.empty())
+        WriteText(patched_options.data() + options_label_at, kLabelSize, UI::Tr("Controls and Extras"));
 }
 
 bool RefreshContinue(u8* script, bool in_main_menu) {
@@ -1154,7 +1195,7 @@ std::vector<u8> Build(const u8* blob) {
     };
     const u32 empty = string("");
     main_labels_at = u32(out.size());
-    out.resize(out.size() + sizeof(kMainLabels));
+    out.resize(out.size() + kMainRows * kLabelSize);
     main_clips_at = u32(out.size());
     for (u32 i = 0; i < kMainRows; ++i) string(kSelectClip);
     const auto main_select = [&](u32 row) { return main_clips_at - code_base + row * u32(sizeof(kSelectClip)); };
@@ -1181,7 +1222,7 @@ std::vector<u8> Build(const u8* blob) {
     Code show;
     show.Raw({0x1a, 0x08, 0xe1, 0x41}).Pop();
     for (u32 i = 0; i < kRows; ++i)
-        slot(show, i < kMainRows ? main_labels_at - code_base + i * u32(sizeof(kMainLabels[0])) : empty, i);
+        slot(show, i < kMainRows ? main_labels_at - code_base + i * kLabelSize : empty, i);
     for (u32 i = 0; i < kMainRows; ++i) clip(show, 8, enable[i], 1);
     main_initial_target = u32(out.size() + show.bytes.size() + 1);
     show.Goto(kNewGameState).Raw({0x4b});
@@ -1325,13 +1366,13 @@ std::vector<u8> BuildPauseOptions(const u8* blob) {
         return {};
 
     // Literals have 16-bit offsets. Insert before the symbols, keeping the last original literal's NUL.
-    constexpr char label[] = "\0Controls and Extras";
     constexpr u32 label_ref = symbols + 1 - code_base;
-    constexpr u32 label_bytes = (sizeof(label) + 3) & ~3u;
+    constexpr u32 label_bytes = (1 + kLabelSize + 3) & ~3u;
     static_assert(label_ref <= 0xffff);
     std::vector<u8> out(blob, blob + symbols);
-    out.insert(out.end(), label, label + sizeof(label));
     out.resize(symbols + label_bytes);
+    options_label_at = symbols + 1;
+    WriteText(out.data() + options_label_at, kLabelSize, UI::Tr("Controls and Extras"));
     out.insert(out.end(), blob + symbols, blob + 4 + kResidentSize);
     out.resize((out.size() + 3) & ~3u);
     const u32 row = u32(out.size()) - 4;
@@ -1401,6 +1442,7 @@ void PS4_SYSV_ABI Goto(u8* script, u32 state) {
     const auto* blob = *reinterpret_cast<const u8* const*>(script + 0x50);
     const bool title_script = blob && blob == patched.data();
     const bool options_script = blob && blob == patched_options.data();
+    if (title_script || options_script) RefreshLanguage();
     if (title_script) {
         if (state == kMainState || state == kLoadState)
             Libraries::SaveData::Dialog::RequestContinue(false);
@@ -1431,7 +1473,7 @@ void PS4_SYSV_ABI Goto(u8* script, u32 state) {
         return;
     }
     if (state == kHelpTarget && (title_script || options_script)) {
-        ControlsUi::Open();
+        ControlsUi::Open(title_script);
         return;
     }
     if (state == kQuitTarget) {

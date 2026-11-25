@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include "ui/imgui_core.h"
+#include "ui/translation.h"
 
 namespace Gow3::UI {
 
@@ -245,7 +246,7 @@ inline void DrawMouseGlyph(ImDrawList* list, ImVec2 c, float h, int button) {
 // A prompt: the gamepad button of radius `radius`, or with the keyboard and mouse the key that does the same in every
 // screen (Enter, Escape, Delete, Insert), then its label. Laid out from its left edge, centered on `y`.
 inline const char* KeyOf(PS4Symbol symbol) {
-    return symbol == PS4Symbol::Cross ? "ENTER" : symbol == PS4Symbol::Circle ? "ESC" : symbol == PS4Symbol::Square ? "DEL" : "INS";
+    return Tr(symbol == PS4Symbol::Cross ? "ENTER" : symbol == PS4Symbol::Circle ? "ESC" : symbol == PS4Symbol::Square ? "DEL" : "INS");
 }
 inline float HintGlyphWidth(PS4Symbol symbol, float radius, ImFont* font) {
     return ImGui::Core::GamepadPrompts() ? radius * 2.0f : KeyCapWidth(KeyOf(symbol), radius * 1.7f, font);
@@ -452,7 +453,7 @@ inline SliderHits DrawDiamondSlider(ImDrawList* draw, ImVec2 box_min, ImVec2 box
     draw->AddTriangleFilled({lx0, mid_y}, {lx1, mid_y - tri_hh}, {lx1, mid_y + tri_hh}, arrow_col);
     draw->AddTriangleFilled({rx1, mid_y}, {rx0, mid_y + tri_hh}, {rx0, mid_y - tri_hh}, arrow_col);
 
-    const std::string val_text = value == 0 ? "OFF" : std::to_string(value) + "%";
+    const std::string val_text = value == 0 ? Tr("Off") : std::to_string(value) + "%";
     const float val_size = 15.0f * S;
     const ImVec2 val_ext = font->CalcTextSizeA(val_size, FLT_MAX, 0.0f, val_text.c_str());
     const ImU32 val_col = value == 0 ? IM_COL32(221, 106, 109, 255) : Theme::GoldLight;
@@ -518,7 +519,7 @@ inline SelectorHits DrawToggleSelector(ImDrawList* draw, ImVec2 box_min, ImVec2 
     draw->AddTriangleFilled({lx0, mid_y}, {lx1, mid_y - tri_hh}, {lx1, mid_y + tri_hh}, arrow_col);
     draw->AddTriangleFilled({rx1, mid_y}, {rx0, mid_y + tri_hh}, {rx0, mid_y - tri_hh}, arrow_col);
 
-    const char* label = on ? "ON" : "OFF";
+    const char* label = Tr(on ? "On" : "Off");
     const float text_size = 16.0f * S;
     const ImVec2 ext = font->CalcTextSizeA(text_size, FLT_MAX, 0.0f, label);
     const ImVec2 center{(lx1 + rx0) * 0.5f, mid_y};

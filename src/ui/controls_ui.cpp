@@ -3,6 +3,7 @@
 
 #include <imgui.h>
 #include <imgui_internal.h>
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <atomic>
@@ -19,13 +20,17 @@
 #include "ui/imgui_core.h"
 #include "ui/imgui_layer.h"
 #include "ui/imgui_std.h"
+#include "ui/translation.h"
 #include "input/input_handler.h"
+#include "main/host.h"
 #include "patches/extras.h"
+#include "present/window.h"
 
 namespace Gow3::ControlsUi {
 namespace {
 using Glyph = UI::PadGlyph;
 using UI::Fade;
+using UI::Tr;
 namespace Theme = UI::Theme;
 using namespace ImGui;
 
@@ -251,11 +256,13 @@ void DrawKey(ImDrawList* list, ImVec2 c, float h, float max_w, const std::string
     const auto key = std::ranges::find(keys, token, &KeyInput::token);
     if (key != keys.end() && key->mouse >= 0) return UI::DrawMouseGlyph(list, c, h * 1.1f, key->mouse);
     if (token.empty()) {
-        const ImVec2 extent = font->CalcTextSizeA(h * 0.5f, FLT_MAX, 0.0f, "NONE");
-        return list->AddText(font, h * 0.5f, c - extent * 0.5f, Theme::TextMuted, "NONE");
+        const auto* none = Tr("None");
+        const ImVec2 extent = font->CalcTextSizeA(h * 0.5f, FLT_MAX, 0.0f, none);
+        return list->AddText(font, h * 0.5f, c - extent * 0.5f, Theme::TextMuted, none);
     }
     const ImVec2 dir = token == "up" ? ImVec2{0, -1} : token == "down" ? ImVec2{0, 1} : token == "left" ? ImVec2{-1, 0} : token == "right" ? ImVec2{1, 0} : ImVec2{0, 0};
-    UI::DrawKeyCap(list, c, h, (key != keys.end() ? key->label : Upper(token)).c_str(), font, max_w, dir);
+    const auto unknown = key == keys.end() ? Upper(token) : std::string{};
+    UI::DrawKeyCap(list, c, h, key != keys.end() ? Tr(key->label.c_str()) : unknown.c_str(), font, max_w, dir);
 }
 
 bool AnyPadButtonHeld() {
@@ -267,7 +274,7 @@ bool AnyPadButtonHeld() {
 // Whether a pad button, a key the list navigates with or a mouse button is down.
 bool AnyInputHeld() {
     for (const ImGuiKey key : {ImGuiKey_UpArrow, ImGuiKey_DownArrow, ImGuiKey_LeftArrow, ImGuiKey_RightArrow, ImGuiKey_Enter, ImGuiKey_KeypadEnter,
-                               ImGuiKey_Space, ImGuiKey_Escape, ImGuiKey_Tab})
+                               ImGuiKey_W, ImGuiKey_A, ImGuiKey_S, ImGuiKey_D, ImGuiKey_Space, ImGuiKey_Escape, ImGuiKey_Tab})
         if (IsKeyDown(key)) return true;
     for (int button = 0; button < 5; ++button)
         if (IsMouseDown(button)) return true;
@@ -276,8 +283,9 @@ bool AnyInputHeld() {
 
 class Screen final : public ImGui::Layer {
 public:
-    void Open() {
+    void Open(bool from_title) {
         if (shown.exchange(true)) return;
+        import_available = from_title;
         ImGui::Core::AcquireGamepadInputCapture(); // the game does not see the pad while this is up
         restart = true;
         AddLayer(this);
@@ -285,13 +293,21 @@ public:
     void Draw() override;
 
 private:
-    enum Tab { ControlsTab, CheatsTab, HelpTab };
-    enum class Act { None, Close, PrevTab, NextTab, Reassign, Reset, ToggleExtra, AdjustExtra, ResetExtras };
+    enum Tab { ToolsTab, ControlsTab, CheatsTab, HelpTab, TabCount };
+    enum class Act { None, Close, PrevTab, NextTab, Reassign, Reset, ToggleExtra, AdjustExtra, ResetExtras, Compile, Import, ResetSettings };
+    struct Tool { const char* name; const char* text; const char* button; Act action; };
+    static constexpr Tool tools[]{
+        {"Compile shaders", "Forces shader precompilation on the next restart to prevent stutters.", "Schedule compilation", Act::Compile},
+        {"Import saves", "Import saves from SpartanPort or shadPS4 to continue playing here.", "Choose source", Act::Import},
+        {"Reset settings", "Resets Rehooked settings. Saves are preserved.", "Reset to defaults", Act::ResetSettings},
+    };
     struct Layout { float cqw, pad_x, right_edge, pad_y, grid_top, grid_h, left_w, right_x, right_w, footer_y; };
     struct Hint { UI::PS4Symbol symbol; const char* label; Act act; bool dpad_horiz = false; };
 
     void Start();
+    void MoveKeyboardFocus();
     void DrawHeader(const Layout& L, ImDrawList* list, ImFont* font);
+    Act DrawTools(const Layout& L, ImDrawList* list, ImFont* font);
     void DrawControls(const Layout& L, ImDrawList* list, ImFont* font);
     void DrawCheats(const Layout& L, ImDrawList* list, ImFont* font);
     void DrawHelp(const Layout& L, ImDrawList* list, ImFont* font);
@@ -308,6 +324,7 @@ private:
     void Bind(int index, std::string_view token);
     void BindKey(int index, const std::string& token);
     void Reset(int index);
+    bool ToolAvailable(Act action) const;
 
     // Where a row puts its card, arrow and the two input boxes (gamepad, then keyboard), from the row's right edge.
     struct Columns { float card_right, pad_min, pad_max, key_min, key_max, glyph_h; };
@@ -321,11 +338,14 @@ private:
     }
 
     std::atomic<bool> shown{}, restart{};
+    bool import_available{}; // set before publishing the layer
     // Only the drawing thread from here on.
     bool closing{}, armed{}, first{}, pin{}, swallow{}, extras_dirty{}, dragging_slider{}; // swallow: the input that ended a capture is still held
-    int tab{ControlsTab}, focus[3]{}, scroll_to{-1}, activated{-1}, capturing{-1};
+    bool compile_scheduled{};
+    Act tool_error{Act::None};
+    int tab{ToolsTab}, focus[TabCount]{}, scroll_to{-1}, activated{-1}, capturing{-1};
     float S{1.0f};
-    ImRect tab_rects[3]{};
+    ImRect tab_rects[TabCount]{};
     std::string bound[action_count];            // the controller input of each action; empty is the default
     std::vector<std::string> keys[action_count]; // its keyboard keys, in the order of the config
 };
@@ -333,7 +353,9 @@ Screen screen;
 
 void Screen::Start() {
     closing = false, armed = false, first = true, pin = true, swallow = false, extras_dirty = false, dragging_slider = false;
-    tab = ControlsTab, focus[0] = focus[1] = focus[2] = 0, scroll_to = -1, activated = -1, capturing = -1;
+    tab = ToolsTab, scroll_to = -1, activated = -1, capturing = -1;
+    std::ranges::fill(focus, 0);
+    tool_error = Act::None;
     for (int i = 0; i < action_count; ++i) {
         bound[i] = Input::ControllerBinding(actions[i].output);
         keys[i] = Input::KeyboardBindings(actions[i].output);
@@ -373,6 +395,20 @@ void Screen::Reset(int index) {
     Input::SetKeyboardBindings(actions[index].output, keys[index]);
 }
 
+void Screen::MoveKeyboardFocus() {
+    if (!armed || capturing >= 0 || swallow || dragging_slider) return;
+    const ImGuiIO& io = GetIO();
+    if (io.KeyCtrl || io.KeyAlt || io.KeySuper || !IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) return;
+    const bool up = IsKeyPressed(ImGuiKey_UpArrow, true) || IsKeyPressed(ImGuiKey_W, true);
+    const bool down = IsKeyPressed(ImGuiKey_DownArrow, true) || IsKeyPressed(ImGuiKey_S, true);
+    // Consume ImGui's move while the list handles the same arrow, including between repeats.
+    if (up || down || IsKeyDown(ImGuiKey_UpArrow) || IsKeyDown(ImGuiKey_DownArrow)) NavMoveRequestCancel();
+    if (up == down) return;
+    constexpr int row_counts[]{int(std::size(tools)), action_count, extra_count, help_count};
+    const int next = std::clamp(focus[tab] + (up ? -1 : 1), 0, row_counts[tab] - 1);
+    if (next != focus[tab]) focus[tab] = next, pin = true;
+}
+
 // The scroll area of a list: the rows stop short of its scrollbar.
 void Screen::BeginList(const char* id, const Layout& L) {
     SetCursorPos({L.pad_x, L.grid_top});
@@ -408,8 +444,8 @@ float Screen::BeginRow(int id, float height, ImRect& bb) {
     const ImGuiID item = GetID(id);
     bb = ImRect{window.DC.CursorPos, window.DC.CursorPos + ImVec2{GetContentRegionAvail().x - 16.0f * S, height}};
     ItemSize(bb.GetSize());
-    if (scroll_to == id) { // the list opens on its row, even when it is far down
-        SetScrollHereY(0.5f);
+    if (scroll_to == id) {
+        ScrollToRect(&window, bb, ImGuiScrollFlags_KeepVisibleEdgeY | ImGuiScrollFlags_NoScrollParent);
         scroll_to = -1;
     }
     if (!ItemAdd(bb, item)) return -1.0f;
@@ -440,7 +476,7 @@ void Screen::Heading(const char* text, ImFont* font, bool spaced, const char* ba
     const float width = GetContentRegionAvail().x - 16.0f * S, size = 19.0f * S, top = spaced ? 41.0f * S : 10.0f * S;
     ItemSize(ImVec2{width, top + size * 1.25f + 1.0f * S});
     auto* draw = GetWindowDrawList();
-    draw->AddText(font, size, {pos.x + 8.0f * S, pos.y + top}, Theme::GoldBronze, Upper(text).c_str());
+    draw->AddText(font, size, {pos.x + 8.0f * S, pos.y + top}, Theme::GoldBronze, text);
     if (badge && *badge) {
         const float badge_size = 14.0f * S;
         const ImVec2 ext = font->CalcTextSizeA(badge_size, FLT_MAX, 0.0f, badge);
@@ -492,7 +528,7 @@ void Screen::ControlRow(int index, ImFont* font) {
     auto* draw = GetWindowDrawList();
 
     const Columns c = ColumnsOf(bb);
-    DrawCard(font, bb, c.card_right, t, Upper(actions[index].name));
+    DrawCard(font, bb, c.card_right, t, Tr(actions[index].name));
 
     // The arrow stays centered between the card's edge and the gamepad box; the focus grows the card and pushes it to the right.
     const float top = bb.Min.y + 6.0f * S, mid_y = top + base * 0.5f, edge = c.card_right - (1.0f - t) * 8.0f * S;
@@ -544,8 +580,8 @@ void Screen::CheatsRow(int index, ImFont* font) {
     const ImVec2 box_max{bb.Max.x, top + base};
     const float card_right = box_min.x - 22.0f * S;
 
-    std::string label = Upper(item.name);
-    if (!avail) label += " (UNAVAILABLE)";
+    std::string label = Tr(item.name);
+    if (!avail) label += fmt::format(" ({})", Tr("Unavailable"));
     DrawCard(font, bb, card_right, t, label, !avail);
 
     draw->AddRectFilled(box_min, box_max, IM_COL32(18, 5, 5, 255), 3.0f * S);
@@ -617,8 +653,8 @@ void Screen::DrawCheats(const Layout& L, ImDrawList* list, ImFont* font) {
     for (int i = 0; i < extra_count; ++i) {
         if (!section || std::strcmp(section, extras[i].section)) {
             const int active = active_in_section(extras[i].section);
-            const std::string badge = active > 0 ? std::to_string(active) + " ACTIVE" : std::string{};
-            Heading(extras[i].section, font, section != nullptr, badge.empty() ? nullptr : badge.c_str());
+            const std::string badge = active > 0 ? fmt::format(fmt::runtime(Tr("Active: {}")), active) : std::string{};
+            Heading(Tr(extras[i].section), font, section != nullptr, badge.empty() ? nullptr : badge.c_str());
             section = extras[i].section;
         }
         CheatsRow(i, font);
@@ -626,12 +662,12 @@ void Screen::DrawCheats(const Layout& L, ImDrawList* list, ImFont* font) {
     EndList();
 
     const ExtraItem& entry = extras[std::clamp(focus[CheatsTab], 0, extra_count - 1)];
-    float y = DrawPaneTitle(L, list, font, Upper(entry.name).c_str());
+    float y = DrawPaneTitle(L, list, font, Tr(entry.name));
     const float body = std::max(17.0f, 1.24f * L.cqw);
     auto* text_font = UI::g_font_body ? UI::g_font_body : font;
-    y = WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted, entry.p1);
+    y = WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted, Tr(entry.p1));
     if (entry.p2) {
-        y = WrapText(list, text_font, body, {L.right_x, y + body * 0.55f}, L.right_w, Theme::TextMuted, entry.p2);
+        y = WrapText(list, text_font, body, {L.right_x, y + body * 0.55f}, L.right_w, Theme::TextMuted, Tr(entry.p2));
     }
     if (entry.meta_key && entry.meta_val) {
         y += body * 0.55f;
@@ -641,7 +677,7 @@ void Screen::DrawCheats(const Layout& L, ImDrawList* list, ImFont* font) {
         const ImU32 sep_col = IM_COL32(201, 158, 75, 31);
         list->AddLine({L.right_x, y}, {L.right_x + L.right_w, y}, sep_col, 1.0f);
         y += row_pad;
-        list->AddText(font, key_size, {L.right_x, y + (val_size * 1.2f - key_size) * 0.5f}, Theme::GoldBronze, Upper(entry.meta_key).c_str());
+        list->AddText(font, key_size, {L.right_x, y + (val_size * 1.2f - key_size) * 0.5f}, Theme::GoldBronze, Tr(entry.meta_key));
         const float val_x = L.right_x + 9.6f * L.cqw;
         const float val_end = WrapText(list, text_font, val_size, {val_x, y}, std::max(60.0f, L.right_w - 9.6f * L.cqw),
                                        IM_COL32(207, 196, 176, 255), entry.meta_val);
@@ -654,22 +690,68 @@ void Screen::DrawCheats(const Layout& L, ImDrawList* list, ImFont* font) {
         const float note_size = std::max(15.0f, 1.1f * L.cqw);
         const float indent = 0.9f * L.cqw;
         const float note_top = y;
-        list->AddText(font, label_size, {L.right_x + indent, y}, Theme::GoldBronze, "NOTE");
+        list->AddText(font, label_size, {L.right_x + indent, y}, Theme::GoldBronze, Tr("Note"));
         y += label_size * 1.35f;
         y = WrapText(list, text_font, note_size, {L.right_x + indent, y}, std::max(60.0f, L.right_w - indent),
-                     IM_COL32(180, 168, 146, 255), entry.note);
+                     IM_COL32(180, 168, 146, 255), Tr(entry.note));
         list->AddLine({L.right_x, note_top}, {L.right_x, y - note_size * 0.35f}, Fade(Theme::GoldBronze, 0.55f),
                       std::max(1.8f, 0.12f * L.cqw));
     }
     y += body * 0.6f;
     WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted,
-             "Cheats and patches apply as soon as you change them, and stay as you left them for the next launch.");
+             Tr("Cheats and patches apply as soon as you change them, and stay as you left them for the next launch."));
 }
 
 void Screen::HelpRow(int index, ImFont* font) {
     ImRect bb;
     const float t = BeginRow(index, (kCard + 12.0f) * S, bb);
-    if (t >= 0.0f) DrawCard(font, bb, bb.Max.x, t, Upper(help[index].name));
+    if (t >= 0.0f) DrawCard(font, bb, bb.Max.x, t, Tr(help[index].name));
+}
+
+bool Screen::ToolAvailable(Act action) const {
+    return (action != Act::Import || import_available) && (action != Act::Compile || !compile_scheduled);
+}
+
+Screen::Act Screen::DrawTools(const Layout& L, ImDrawList* list, ImFont* font) {
+    BeginList("##ToolsList", L);
+    for (int i = 0; i < int(std::size(tools)); ++i) {
+        ImRect row;
+        const float t = BeginRow(i, (kCard + 12.0f) * S, row);
+        if (t >= 0.0f) DrawCard(font, row, row.Max.x, t, Tr(tools[i].name));
+    }
+    EndList();
+
+    const Tool& tool = tools[focus[ToolsTab]];
+    const bool available = ToolAvailable(tool.action);
+    auto* text_font = UI::g_font_body ? UI::g_font_body : font;
+    const float body = std::max(17.0f, 1.24f * L.cqw);
+    float y = DrawPaneTitle(L, list, font, Tr(tool.name));
+    y = WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted, Tr(tool.text));
+
+    const float gap = body * 0.8f;
+    y += gap;
+    list->AddLine({L.right_x, y}, {L.right_edge, y}, Fade(Theme::GoldBronze, 0.23f), S);
+    y += gap;
+
+    const char* label = Tr(tool.action == Act::Compile && compile_scheduled ? "Compilation scheduled" : tool.button);
+    float size = std::max(16.0f, 1.15f * L.cqw);
+    const float padding = 13.0f * S, height = 2.3f * size;
+    const float width = font->CalcTextSizeA(size, FLT_MAX, 0.0f, label).x;
+    const ImRect button{{L.right_x, y}, {L.right_x + std::min(L.right_w, width + padding * 2.0f), y + height}};
+    const ImGuiID id = GetID("##ToolAction");
+    bool hovered = false, held = false, pressed = false;
+    if (available && ItemAdd(button, id, nullptr, ImGuiItemFlags_NoNav))
+        pressed = ButtonBehavior(button, id, &hovered, &held, ImGuiButtonFlags_NoNavFocus);
+    list->AddRectFilled(button.Min, button.Max, available ? (hovered || held ? Theme::BloodMid : Theme::BloodDeep) : Theme::BloodTrenchMid, 2.0f * S);
+    list->AddRect(button.Min, button.Max, Fade(Theme::GoldBronze, available ? 0.75f : 0.32f), 2.0f * S);
+    if (width > button.GetWidth() - padding * 2.0f) size *= std::max(1.0f, button.GetWidth() - padding * 2.0f) / width;
+    list->AddText(font, size, {button.Min.x + padding, button.Min.y + (height - size) * 0.5f},
+                  available ? Theme::GoldLight : Theme::TextMuted, label);
+
+    const char* note = tool.action == Act::Import && !available ? "Available from the title menu." :
+                       tool_error == tool.action ? "Could not complete the action. Try again." : nullptr;
+    if (note) WrapText(list, text_font, body, {L.right_x, button.Max.y + gap}, L.right_w, Theme::TextMuted, Tr(note));
+    return pressed && armed ? tool.action : Act::None;
 }
 
 void Screen::DrawControls(const Layout& L, ImDrawList* list, ImFont* font) {
@@ -680,72 +762,88 @@ void Screen::DrawControls(const Layout& L, ImDrawList* list, ImFont* font) {
         ItemSize(ImVec2{width, size * 1.25f + 6.0f * S});
         const Columns c = ColumnsOf(ImRect{pos, pos + ImVec2{width, 0.0f}});
         auto* draw = GetWindowDrawList();
-        const struct { const char* name; float min, max; } columns[]{{"GAMEPAD", c.pad_min, c.pad_max}, {"M&K", c.key_min, c.key_max}};
-        for (const auto& column : columns)
-            draw->AddText(font, size, {(column.min + column.max - font->CalcTextSizeA(size, FLT_MAX, 0.0f, column.name).x) * 0.5f, pos.y}, Theme::GoldBronze, column.name);
+        const struct { const char* name; float min, max; } columns[]{{Tr("Gamepad"), c.pad_min, c.pad_max}, {Tr("Mouse & keys"), c.key_min, c.key_max}};
+        for (const auto& column : columns) {
+            const float text_width = font->CalcTextSizeA(size, FLT_MAX, 0.0f, column.name).x;
+            const float fit = std::min(1.0f, (column.max - column.min - 4.0f * S) / text_width);
+            draw->AddText(font, size * fit, {(column.min + column.max - text_width * fit) * 0.5f, pos.y},
+                          Theme::GoldBronze, column.name);
+        }
     }
     for (int i = 0; i < action_count; ++i) ControlRow(i, font);
     EndList();
 
     const float body = std::max(17.0f, 1.24f * L.cqw);
     auto* text_font = UI::g_font_body ? UI::g_font_body : font;
-    const float y = DrawPaneTitle(L, list, font, "REASSIGN CONTROLS");
+    const float y = DrawPaneTitle(L, list, font, Tr("Reassign controls"));
     WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted,
-             "Select an action, then press the controller/keyboard/mouse key you want to map.");
+             Tr("Select an action, then press the controller/keyboard/mouse key you want to map."));
 }
 
 void Screen::DrawHelp(const Layout& L, ImDrawList* list, ImFont* font) {
     BeginList("##HelpList", L);
     const char* section = nullptr;
     for (int i = 0; i < help_count; ++i) {
-        if (!section || std::strcmp(section, help[i].section)) Heading(help[i].section, font, section != nullptr);
+        if (!section || std::strcmp(section, help[i].section)) Heading(Tr(help[i].section), font, section != nullptr);
         section = help[i].section;
         HelpRow(i, font);
     }
     EndList();
 
     const Help& entry = help[std::clamp(focus[HelpTab], 0, help_count - 1)];
-    float y = DrawPaneTitle(L, list, font, Upper(entry.name).c_str());
+    float y = DrawPaneTitle(L, list, font, Tr(entry.name));
     const float body = std::max(17.0f, 1.24f * L.cqw);
     auto* text_font = UI::g_font_body ? UI::g_font_body : font;
-    y = WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted, entry.text) + body * 0.6f;
-    WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted, "Settings are applied automatically when you leave the menu, and the game restarts.");
+    y = WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted, Tr(entry.text)) + body * 0.6f;
+    WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted, Tr("Settings are applied automatically when you leave the menu, and the game restarts."));
 }
 
-// Omega, title and the three tabs, each with the shoulder button that switches them.
+// Omega, title and tabs, with shoulder buttons or Page Up and Page Down.
 void Screen::DrawHeader(const Layout& L, ImDrawList* list, ImFont* font) {
     const float omega_r = std::max(16.0f, 1.4f * L.cqw), cy = L.pad_y + omega_r;
     const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(GetTime()) * 2.1f);
     UI::DrawOmegaSymbol(list, {L.pad_x + omega_r, cy}, omega_r, Theme::GoldBronze, pulse, true);
 
     const float size = std::max(22.0f, 2.0f * L.cqw), x = L.pad_x + omega_r * 2.0f + 1.2f * L.cqw;
-    ShadowText(list, font, size, {x, cy - size * 0.5f}, Theme::GoldLight, "CONTROLS AND EXTRAS");
+    const auto* title = Tr("Controls and Extras");
 
-    const char* names[]{"CONTROLS", "CHEATS & PATCHES", "HELP"};
-    const float tab_size = std::max(16.0f, 1.5f * L.cqw), glyph_h = tab_size * 1.3f, gap = tab_size * 0.9f, between = tab_size * 2.0f;
-    const float widths[]{
-        font->CalcTextSizeA(tab_size, FLT_MAX, 0.0f, names[0]).x,
-        font->CalcTextSizeA(tab_size, FLT_MAX, 0.0f, names[1]).x,
-        font->CalcTextSizeA(tab_size, FLT_MAX, 0.0f, names[2]).x,
-    };
+    const char* names[TabCount]{Tr("Tools"), Tr("Controls"), Tr("Cheats & patches"), Tr("Help")};
+    const float base_tab_size = std::max(16.0f, 1.5f * L.cqw);
+    const float base_glyph_h = base_tab_size * 1.3f, base_cap_h = base_glyph_h * 0.85f;
     // The shoulder buttons that switch the tabs, or Page Up and Page Down.
     const bool pad = ImGui::Core::GamepadPrompts();
-    const float cap_h = glyph_h * 0.85f;
-    const float shoulder = pad ? UI::PadGlyphWidth(Glyph::L1, glyph_h) : std::max(UI::KeyCapWidth("PG UP", cap_h, font), UI::KeyCapWidth("PG DN", cap_h, font));
+    const char* page_up = Tr("PG UP");
+    const char* page_down = Tr("PG DN");
+    const float base_shoulder = pad ? UI::PadGlyphWidth(Glyph::L1, base_glyph_h)
+        : std::max(UI::KeyCapWidth(page_up, base_cap_h, font), UI::KeyCapWidth(page_down, base_cap_h, font));
+    float widths[TabCount]{};
+    const float base_gap = base_tab_size * 0.75f, base_between = base_tab_size * 1.2f;
+    float nav_width = base_shoulder * 2.0f + base_gap * 2.0f + base_between * (TabCount - 1);
+    for (int i = 0; i < TabCount; ++i) {
+        widths[i] = font->CalcTextSizeA(base_tab_size, FLT_MAX, 0.0f, names[i]).x;
+        nav_width += widths[i];
+    }
+    const float title_width = font->CalcTextSizeA(size, FLT_MAX, 0.0f, title).x;
+    const float scale = std::min(1.0f, std::max(1.0f, L.right_edge - x) / (title_width + base_gap + nav_width));
+    const float tab_size = base_tab_size * scale, glyph_h = base_glyph_h * scale, cap_h = base_cap_h * scale;
+    const float gap = base_gap * scale, between = base_between * scale, shoulder = base_shoulder * scale;
     const auto shoulder_glyph = [&](float x, bool next) {
         if (pad) UI::DrawPadGlyph(list, {x, cy}, glyph_h, next ? Glyph::R1 : Glyph::L1);
-        else UI::DrawKeyCap(list, {x, cy}, cap_h, next ? "PG DN" : "PG UP", font);
+        else UI::DrawKeyCap(list, {x, cy}, cap_h, next ? page_down : page_up, font);
     };
-    float at = L.right_edge - (shoulder * 2.0f + gap * 2.0f + between * 2.0f + widths[0] + widths[1] + widths[2]);
+    float at = L.right_edge - nav_width * scale;
+    const float fitted = size * scale;
+    ShadowText(list, font, fitted, {x, cy - fitted * 0.5f}, Theme::GoldLight, title);
     shoulder_glyph(at + shoulder * 0.5f, false);
     at += shoulder + gap;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < TabCount; ++i) {
         const bool active = tab == i;
         if (active) ShadowText(list, font, tab_size, {at, cy - tab_size * 0.5f}, Theme::GoldLight, names[i]);
         else list->AddText(font, tab_size, {at, cy - tab_size * 0.5f}, Theme::TextMuted, names[i]);
-        if (active) list->AddLine({at, cy + tab_size * 0.62f}, {at + widths[i], cy + tab_size * 0.62f}, Theme::GoldBronze, 2.0f);
-        tab_rects[i] = ImRect{{at, cy - tab_size * 0.7f}, {at + widths[i], cy + tab_size * 0.8f}};
-        at += widths[i] + between;
+        const float width = widths[i] * scale;
+        if (active) list->AddLine({at, cy + tab_size * 0.62f}, {at + width, cy + tab_size * 0.62f}, Theme::GoldBronze, 2.0f);
+        tab_rects[i] = ImRect{{at, cy - tab_size * 0.7f}, {at + width, cy + tab_size * 0.8f}};
+        at += width + between;
     }
     shoulder_glyph(at - between + gap + shoulder * 0.5f, true);
 
@@ -759,26 +857,31 @@ Screen::Act Screen::DrawFooter(const Layout& L, ImDrawList* list, ImFont* font) 
     const float radius = std::max(11.0f, 0.95f * L.cqw), size = std::max(15.0f, 1.06f * L.cqw);
     if (capturing >= 0) {
         const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(GetTime()) * 7.5f);
-        const std::string message = "PRESS A CONTROLLER BUTTON OR A KEY FOR " + Upper(actions[capturing].name) + "  -  ESC TO CANCEL";
+        const std::string message = fmt::format(fmt::runtime(Tr("Press a button or key for {} · Esc cancels")), Tr(actions[capturing].name));
         list->AddText(font, size, {L.pad_x, L.footer_y - size * 0.55f}, Fade(Theme::GoldLight, 0.55f + 0.45f * pulse), message.c_str());
         return Act::None;
     }
     Hint hints[3];
     int count = 0;
     if (tab == ControlsTab) {
-        hints[count++] = {UI::PS4Symbol::Cross, "REASSIGN", Act::Reassign};
-        hints[count++] = {UI::PS4Symbol::Triangle, "RESET TO DEFAULTS", Act::Reset};
+        hints[count++] = {UI::PS4Symbol::Cross, Tr("Reassign"), Act::Reassign};
+        hints[count++] = {UI::PS4Symbol::Triangle, Tr("Reset to defaults"), Act::Reset};
     } else if (tab == CheatsTab) {
         const bool slider = extras[std::clamp(focus[CheatsTab], 0, extra_count - 1)].slider;
-        if (slider) hints[count++] = {UI::PS4Symbol::Cross, "ADJUST", Act::AdjustExtra, true};
-        else hints[count++] = {UI::PS4Symbol::Cross, "TOGGLE", Act::ToggleExtra};
-        hints[count++] = {UI::PS4Symbol::Triangle, "RESET ALL", Act::ResetExtras};
+        if (slider) hints[count++] = {UI::PS4Symbol::Cross, Tr("Adjust"), Act::AdjustExtra, true};
+        else hints[count++] = {UI::PS4Symbol::Cross, Tr("Toggle"), Act::ToggleExtra};
+        hints[count++] = {UI::PS4Symbol::Triangle, Tr("Reset all"), Act::ResetExtras};
     }
-    hints[count++] = {UI::PS4Symbol::Circle, "BACK", Act::Close};
+    hints[count++] = {UI::PS4Symbol::Circle, Tr("Back"), Act::Close};
 
     const bool pad = ImGui::Core::GamepadPrompts();
+    if (!pad) {
+        const char* keys = "↑ / ↓ · W / S";
+        const float height = radius * 1.7f;
+        UI::DrawKeyCap(list, {L.pad_x + UI::KeyCapWidth(keys, height, font) * 0.5f, L.footer_y}, height, keys, font);
+    }
     const auto glyph_w = [&](const Hint& h) {
-        if (h.dpad_horiz) return pad ? radius * 2.0f : UI::KeyCapWidth("LEFT / RIGHT", radius * 1.7f, font);
+        if (h.dpad_horiz) return pad ? radius * 2.0f : UI::KeyCapWidth("← / →", radius * 1.7f, font);
         return UI::HintGlyphWidth(h.symbol, radius, font);
     };
     const auto hint_w = [&](const Hint& h) {
@@ -795,7 +898,7 @@ Screen::Act Screen::DrawFooter(const Layout& L, ImDrawList* list, ImFont* font) 
         } else {
             const float w = glyph_w(h);
             if (pad) UI::DrawDpadHorizontalGlyph(list, {left + radius, L.footer_y}, radius * 2.0f);
-            else UI::DrawKeyCap(list, {left + w * 0.5f, L.footer_y}, radius * 1.7f, "LEFT / RIGHT", font);
+            else UI::DrawKeyCap(list, {left + w * 0.5f, L.footer_y}, radius * 1.7f, "← / →", font);
             if (h.label && *h.label) list->AddText(font, size, {left + w + size * 0.55f, L.footer_y - size * 0.55f}, Theme::GoldLight, h.label);
         }
         rects[i] = ImRect{{left, L.footer_y - radius}, {right, L.footer_y + radius}};
@@ -810,8 +913,8 @@ Screen::Act Screen::DrawFooter(const Layout& L, ImDrawList* list, ImFont* font) 
 
 void Screen::Draw() {
     if (restart.exchange(false)) Start();
-    if (closing) { // held until the pad is released, so the press that closed it does not reach the menu behind
-        if (AnyPadButtonHeld()) return;
+    if (closing) { // Keep the input that closed this screen from reaching the menu behind it.
+        if (AnyInputHeld()) return;
         closing = false;
         ImGui::Core::ReleaseGamepadInputCapture();
         RemoveLayer(this);
@@ -850,11 +953,13 @@ void Screen::Draw() {
         auto* list = GetWindowDrawList();
         auto* font = UI::g_font_cinzel ? UI::g_font_cinzel : GetFont();
         UI::DrawBasaltBackground(list, {0, 0}, io.DisplaySize);
+        MoveKeyboardFocus();
         DrawHeader(L, list, font);
-        if (tab == ControlsTab) DrawControls(L, list, font);
+        if (tab == ToolsTab) act = DrawTools(L, list, font);
+        else if (tab == ControlsTab) DrawControls(L, list, font);
         else if (tab == CheatsTab) DrawCheats(L, list, font);
         else DrawHelp(L, list, font);
-        act = DrawFooter(L, list, font);
+        if (const Act footer = DrawFooter(L, list, font); footer != Act::None) act = footer;
     }
     End();
     PopStyleColor();
@@ -901,14 +1006,20 @@ void Screen::Draw() {
     }
 
     if (IsMouseClicked(ImGuiMouseButton_Left)) {
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < TabCount; ++i)
             if (tab_rects[i].Contains(io.MousePos) && tab != i) tab = i, pin = true, dragging_slider = false;
     }
+    const bool confirm = IsKeyPressed(ImGuiKey_GamepadFaceDown, false) || IsKeyPressed(ImGuiKey_Enter, false) ||
+                         IsKeyPressed(ImGuiKey_KeypadEnter, false) || IsKeyPressed(ImGuiKey_Space, false);
     if (IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || IsKeyPressed(ImGuiKey_Escape, false)) act = Act::Close; // no repeat: holding Escape after a cancelled capture must not close
     else if (IsKeyPressed(ImGuiKey_GamepadL1, false) || IsKeyPressed(ImGuiKey_PageUp, false)) act = Act::PrevTab;
     else if (IsKeyPressed(ImGuiKey_GamepadR1, false) || IsKeyPressed(ImGuiKey_PageDown, false)) act = Act::NextTab;
+    else if (tab == ToolsTab && act == Act::None && confirm) {
+        const Act action = tools[focus[ToolsTab]].action;
+        if (ToolAvailable(action)) act = action;
+    }
     else if (tab == ControlsTab && (IsKeyPressed(ImGuiKey_GamepadFaceUp, false) || IsKeyPressed(ImGuiKey_Insert, false))) act = Act::Reset;
-    else if (tab == ControlsTab && act == Act::None && (activated >= 0 || IsKeyPressed(ImGuiKey_GamepadFaceDown, false) || IsKeyPressed(ImGuiKey_Enter, false))) act = Act::Reassign;
+    else if (tab == ControlsTab && act == Act::None && (activated >= 0 || confirm)) act = Act::Reassign;
     else if (tab == CheatsTab && (IsKeyPressed(ImGuiKey_GamepadFaceUp, false) || IsKeyPressed(ImGuiKey_Insert, false))) act = Act::ResetExtras;
     else if (tab == CheatsTab && act == Act::None) {
         const int idx = std::clamp(focus[CheatsTab], 0, extra_count - 1);
@@ -916,8 +1027,10 @@ void Screen::Draw() {
         const bool horiz_held = IsKeyDown(ImGuiKey_LeftArrow) || IsKeyDown(ImGuiKey_RightArrow) ||
                                 IsKeyDown(ImGuiKey_GamepadDpadLeft) || IsKeyDown(ImGuiKey_GamepadDpadRight);
         if (horiz_held) NavMoveRequestCancel();
-        const bool step_left = IsKeyPressed(ImGuiKey_LeftArrow, focused.slider) || IsKeyPressed(ImGuiKey_GamepadDpadLeft, focused.slider);
-        const bool step_right = IsKeyPressed(ImGuiKey_RightArrow, focused.slider) || IsKeyPressed(ImGuiKey_GamepadDpadRight, focused.slider);
+        const bool step_left = IsKeyPressed(ImGuiKey_LeftArrow, focused.slider) || IsKeyPressed(ImGuiKey_A, focused.slider) ||
+                               IsKeyPressed(ImGuiKey_GamepadDpadLeft, focused.slider);
+        const bool step_right = IsKeyPressed(ImGuiKey_RightArrow, focused.slider) || IsKeyPressed(ImGuiKey_D, focused.slider) ||
+                                IsKeyPressed(ImGuiKey_GamepadDpadRight, focused.slider);
         if (focused.slider && (step_left || step_right)) {
             const u32 cur = Extras::Vibration();
             Extras::SetVibration(step_left ? (cur >= 10u ? cur - 10u : 0u) : std::min(100u, cur + 10u));
@@ -930,9 +1043,7 @@ void Screen::Draw() {
                     extras_dirty = true;
                 }
             }
-        } else if (!focused.slider && (activated >= 0 || IsKeyPressed(ImGuiKey_GamepadFaceDown, false) ||
-                                       IsKeyPressed(ImGuiKey_Enter, false) || IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
-                                       IsKeyPressed(ImGuiKey_Space, false))) {
+        } else if (!focused.slider && (activated >= 0 || confirm)) {
             act = Act::ToggleExtra;
         }
     }
@@ -947,7 +1058,7 @@ void Screen::Draw() {
         closing = true;
         break;
     case Act::PrevTab: case Act::NextTab: {
-        const int next = std::clamp(tab + (act == Act::NextTab ? 1 : -1), 0, 2);
+        const int next = std::clamp(tab + (act == Act::NextTab ? 1 : -1), 0, TabCount - 1);
         if (next != tab) tab = next, pin = true, dragging_slider = false;
         break;
     }
@@ -974,10 +1085,23 @@ void Screen::Draw() {
         Extras::ResetAll();
         extras_dirty = true;
         break;
+    case Act::Compile:
+        compile_scheduled = ScheduleAotBuild();
+        tool_error = compile_scheduled ? Act::None : act;
+        break;
+    case Act::Import: case Act::ResetSettings:
+        if (act == Act::Import ? Window::RequestSaveImport() : Window::RequestResetSettings()) {
+            if (extras_dirty) Extras::Save();
+            extras_dirty = false;
+            closing = true;
+        } else {
+            tool_error = act;
+        }
+        break;
     case Act::None: break;
     }
 }
 } // namespace
 
-void Open() { screen.Open(); }
+void Open(bool from_title) { screen.Open(from_title); }
 } // namespace Gow3::ControlsUi

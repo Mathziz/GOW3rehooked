@@ -52,7 +52,8 @@ fs::path SaveInstance::MakeTitleSavePath(Libraries::UserService::OrbisUserServic
 }
 
 fs::path SaveInstance::MakeDirSavePath(OrbisUserServiceUserId, std::string_view, std::string_view dir_name) {
-    return Common::FS::GetUserPath(Common::FS::PathType::SaveDataDir) / dir_name;
+    return Common::FS::GetUserPath(Common::FS::PathType::SaveDataDir) /
+           std::u8string(dir_name.begin(), dir_name.end());
 }
 
 uint64_t SaveInstance::GetMaxBlockFromSFO(const PSF& psf) {
