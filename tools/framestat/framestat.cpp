@@ -220,6 +220,18 @@ int main(int argc, char** argv) {
             break;
         }
     const auto sec = [&](u64 t) { return double(t - t0) * 1e-9; };
+    // FRAMESTAT_CSV=path: every frame's metrics, for plots and correlations.
+    if (const char* csv = std::getenv("FRAMESTAT_CSV"); FILE* out = csv ? std::fopen(csv, "w") : nullptr) {
+        std::fprintf(out, "n,t");
+        for (int m = 0; m < kMetrics; ++m) std::fprintf(out, ",%s", kName[m]);
+        std::fprintf(out, ",xfer_gpu\n");
+        for (size_t i = 1; i < frames.size(); ++i) {
+            std::fprintf(out, "%llu,%.4f", (unsigned long long)frames[i].n, sec(frames[i].submit));
+            for (int m = 0; m < kMetrics; ++m) std::fprintf(out, ",%.3f", Value(frames, i, m));
+            std::fprintf(out, ",%.3f\n", frames[i].ms[10]);
+        }
+        std::fclose(out);
+    }
 
     // Display intervals and their running median (the 240 flips before).
     std::vector<double> gap(flips.size()), med(flips.size());
@@ -295,24 +307,25 @@ int main(int argc, char** argv) {
         }
         std::printf("\n");
     }
-    // Timeline, 10 s per row: how the run changes (counts are sums over the row, times means or maxima).
+    // Timeline, 10 s per row (FRAMESTAT_ROW=seconds): how the run changes (counts are sums over the row, times means or maxima).
+    const u64 row = std::getenv("FRAMESTAT_ROW") ? std::max(1, std::atoi(std::getenv("FRAMESTAT_ROW"))) : 10;
     std::printf("timeline        frames  game  gpu  busy  fps  late_max stale_max flip_max event_max  drops | binds evicts reaped compiles faults texup MBstaged draws\n");
-    for (u64 t = 0; sec(flips.back().at) >= double(t); t += 10) {
+    for (u64 t = 0; sec(flips.back().at) >= double(t); t += row) {
         double game = 0, gpu = 0, busy = 0, staged = 0, draws = 0, late = 0, stale = 0, flip_work = 0, event_work = 0;
         u64 n = 0, binds = 0, evicts = 0, reaped = 0, compiles = 0, faults = 0, uploads = 0, slow = 0, flips_n = 0;
         for (size_t i = 1; i < frames.size(); ++i)
-            if (sec(frames[i].submit) >= double(t) && sec(frames[i].submit) < double(t + 10)) {
+            if (sec(frames[i].submit) >= double(t) && sec(frames[i].submit) < double(t + row)) {
                 ++n, game += Value(frames, i, Game), gpu += Value(frames, i, Gpu), busy += Value(frames, i, Busy), staged += frames[i].ms[14],
                     draws += frames[i].draws, binds += frames[i].binds, evicts += frames[i].evicts, reaped += frames[i].reaped,
                     compiles += frames[i].compiles, faults += frames[i].faults, uploads += u64(frames[i].ms[15]);
             }
         for (size_t i = 1; i < flips.size(); ++i)
-            if (sec(flips[i].at) >= double(t) && sec(flips[i].at) < double(t + 10)) {
+            if (sec(flips[i].at) >= double(t) && sec(flips[i].at) < double(t + row)) {
                 ++flips_n, late = std::max(late, double(flips[i].late_ns) * 1e-6), slow += drop[i], stale = std::max(stale, flips[i].stale_us * 1e-3),
                     flip_work = std::max(flip_work, flips[i].flip_us * 1e-3), event_work = std::max(event_work, flips[i].event_us * 1e-3);
             }
         if (n) std::printf("%4llu-%4llus  %7llu %5.2f %4.2f %5.2f %4.0f %9.1f %9.1f %8.1f %9.1f %6llu | %5llu %6llu %6llu %8llu %6llu %5llu %8.1f %5.0f\n", (unsigned long long)t,
-                           (unsigned long long)t + 10, (unsigned long long)n, game / double(n), gpu / double(n), busy / double(n), double(flips_n) / 10, late,
+                           (unsigned long long)t + row, (unsigned long long)n, game / double(n), gpu / double(n), busy / double(n), double(flips_n) / double(row), late,
                            stale, flip_work, event_work, (unsigned long long)slow, (unsigned long long)binds, (unsigned long long)evicts, (unsigned long long)reaped,
                            (unsigned long long)compiles, (unsigned long long)faults, (unsigned long long)uploads, staged / double(n), draws / double(n));
     }

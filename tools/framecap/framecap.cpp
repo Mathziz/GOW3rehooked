@@ -3183,6 +3183,7 @@ static int Run(const char* path, u64 from, u64 to, const char* out_dir, bool val
     Gpu::Renderer gpu;
     std::string err;
     if (!gpu.Init(validation, err)) return std::printf("vulkan: %s\n", err.c_str()), 1;
+    if (const char* a = std::getenv("GOW3_ANISO")) gpu.SetAnisotropy(unsigned(std::atoi(a)));  // the menu's texture filtering (live: 4/8/16)
     // --live: the live game's callbacks, so their costs show offline. The tracker scans page states lock-free and locks
     // only for new pages (as GuestMemory::Track); the frame's GPU writes are copied back into host memory.
     static const std::unique_ptr<std::atomic<u8>[]> known(new std::atomic<u8>[1ull << 23]{});
