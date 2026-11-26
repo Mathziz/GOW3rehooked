@@ -264,6 +264,11 @@ static void* RunThread(void* arg) {
     Core::InitializeTLS();
 
     curthread->native_thr->Initialize();
+    if (const auto& name = curthread->name;
+        name == "brbDriver" || name == "brbClient" || name == "snd_stream_parsing_thread" ||
+        name == "snd_stream_reader_thread") {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+    }
 
 #ifndef _WIN32
     UnblockPthreadCancelSignal();

@@ -105,7 +105,8 @@ inline const Plan plan = [] {
     p.recorders = forced ? std::clamp(std::atoi(forced), 1, 32) : std::clamp(p.cores, 2u, 8u);
     p.shader_threads = p.logical;  // independent programs: every processor
     // A frame thread costs a picture of latency, which the game's 24-30 slot queue has to absorb.
-    p.decode_threads = std::clamp(p.logical, 2u, 16u);
+    // On <=4-core CPUs, keep one frame thread per physical core so cutscenes do not starve audio and game threads.
+    p.decode_threads = std::clamp(p.cores <= 4 ? p.cores : p.logical, 2u, 16u);
     const auto off = [](const char* name) { const char* e = std::getenv(name); return e && !std::strcmp(e, "0"); };
     p.priority = !off("GOW3_CPU_PRIORITY");
 #ifdef _WIN32

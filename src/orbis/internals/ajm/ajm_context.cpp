@@ -62,6 +62,7 @@ s32 AjmContext::ModuleRegister(AjmCodecType type) {
 
 void AjmContext::WorkerThread(const std::stop_token& stop) {
     Common::SetCurrentThreadName("shadPS4:AjmWorker");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
     while (!stop.stop_requested()) {
         auto batch = batch_queue.PopWait(stop);
         if (batch != nullptr && !batch->canceled) {

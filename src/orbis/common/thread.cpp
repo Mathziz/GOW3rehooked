@@ -32,6 +32,7 @@
 #include <sched.h>
 #endif
 #ifndef _WIN32
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -210,6 +211,11 @@ void InterruptSleep(void* thread) {
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     const sched_param params{};
     pthread_setschedparam(pthread_self(), new_priority == ThreadPriority::Low ? SCHED_BATCH : SCHED_OTHER, &params);
+    if (new_priority == ThreadPriority::High) {
+        setpriority(PRIO_PROCESS, 0, -5);
+    } else if (new_priority >= ThreadPriority::VeryHigh) {
+        setpriority(PRIO_PROCESS, 0, -10);
+    }
 }
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,

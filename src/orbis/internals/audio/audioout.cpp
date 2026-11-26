@@ -178,6 +178,7 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
         const auto thread_name = fmt::format("shadPS4:AudioOutputThread:{}", fmt::ptr(port.get()));
         Common::SetCurrentThreadName(thread_name.c_str());
     }
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
 
     // The hardware consumes a block every period, so blocks missed while this thread was late are
     // still owed to the game. Owing at most a few keeps the host queue latency bounded.
