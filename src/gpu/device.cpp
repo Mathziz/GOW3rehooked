@@ -283,7 +283,18 @@ DynamicCaps QueryDynamicCaps(VkPhysicalDevice pd, std::span<const VkExtensionPro
     c.storage_image_read_without_format = f2_q.features.shaderStorageImageReadWithoutFormat != VK_FALSE;
     c.maintenance5 = SupportsMaintenance5(pd, available);
 
-    const bool has_objects = SupportsShaderObject(pd, available);
+    const bool has_eds3 = HasExtension(available, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+    VkPhysicalDeviceDriverProperties driver_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceExtendedDynamicState3PropertiesEXT eds3_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT, &driver_p};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, has_eds3 ? static_cast<void*>(&eds3_p) : &driver_p};
+    vkGetPhysicalDeviceProperties2(pd, &p2);
+
+    // Pre-Turing NVIDIA (Maxwell/Pascal/Volta) on the proprietary driver: VK_EXT_shader_object triggers intermittent SM
+    // WRITE_INVALID device-lost faults (e.g. GTX 1080 Ti on R580); Turing+ exposes mesh shaders. Fall back to GPL/monolithic.
+    const bool avoid_objects = driver_p.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+                               !HasExtension(available, VK_NV_MESH_SHADER_EXTENSION_NAME) &&
+                               !HasExtension(available, VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    const bool has_objects = !avoid_objects && SupportsShaderObject(pd, available);
     bool fast_link = false;
     const bool has_gpl = SupportsGraphicsPipelineLibrary(pd, available, &fast_link);
 
@@ -307,15 +318,10 @@ DynamicCaps QueryDynamicCaps(VkPhysicalDevice pd, std::span<const VkExtensionPro
         c.color_write_mask = true;
     } else {
         c.gpl_fast_link = (c.path == ShaderPath::Gpl) && fast_link;
-        if (HasExtension(available, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME)) {
+        if (has_eds3) {
             VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3_q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
             VkPhysicalDeviceFeatures2 q2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &eds3_q};
             vkGetPhysicalDeviceFeatures2(pd, &q2);
-
-            VkPhysicalDeviceDriverProperties driver_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-            VkPhysicalDeviceExtendedDynamicState3PropertiesEXT eds3_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT, &driver_p};
-            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &eds3_p};
-            vkGetPhysicalDeviceProperties2(pd, &p2);
 
             // AMD proprietary/AMDVLK (XGL/PAL): dynamic rasterizationSamples corrupts 2x MSAA in 8x8 tiles, and PAL gfx6 (Polaris)
             // clobbers DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE on pipeline switches with dynamic alphaToCoverageEnable.
