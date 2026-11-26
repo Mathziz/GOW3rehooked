@@ -189,7 +189,6 @@ public:
     // frame bound, mip 0 at most 2048 texels wide or high, alpha kept; one that cannot be read comes without pixels.
     std::vector<Image> ReadTextures(bool traced = false);
     Stats& GetStats();
-    std::vector<std::string> FlushMemTelemetry();  // TEMP diagnostics: per-second upload/eviction/regrow lines (empty outside debug runs)
 
 private:
     struct Impl;

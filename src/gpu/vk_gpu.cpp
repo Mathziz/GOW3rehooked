@@ -1392,12 +1392,12 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     // for a few frames go now: a failed allocation skips its texture, upload or copy (stale or garbage images).
     if (const u32 pressed = r.PressureAge(); r.frame % 64 == 0 || r.evict_soon || pressed)
         Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] {
-            if (!r.evict_soon) return r.EvictTextures(pressed ? pressed : 64, false, pressed ? Impl::TempEvict::Pressure : Impl::TempEvict::Age64);
+            if (!r.evict_soon) return r.EvictTextures(pressed ? pressed : 64);
             const u32 cap = r.evict_binding >= kStorageBinding ? kStorage : kTextures;
             if (r.free_elements[r.evict_binding].size() < cap / 8)
                 for (u32 age : {16u, 4u, 1u})
-                    if (r.EvictTextures(age, false, Impl::TempEvict::Bindless), r.free_elements[r.evict_binding].size() >= cap / 8) break;
-            if (pressed) r.EvictTextures(pressed, false, Impl::TempEvict::Pressure);
+                    if (r.EvictTextures(age), r.free_elements[r.evict_binding].size() >= cap / 8) break;
+            if (pressed) r.EvictTextures(pressed);
         }), r.evict_soon = false;
     if (r.frame % (r.Pressed() ? 32 : 128) == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
     if (r.regrow) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
