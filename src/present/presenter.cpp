@@ -65,6 +65,7 @@ PFN_vkReleaseFullScreenExclusiveModeEXT release_exclusive;
 #endif
 u64 flipped_frame{};
 std::atomic<u64> rendered_frame{};
+std::atomic<float> output_gamma{1.f};  // sceVideoOutAdjustColor: the game's brightness option
 thread_local u64 render_frame{};
 u64 display; // guest address of the flipped display buffer
 bool display_bgra; // its memory order (VideoOut A8R8G8B8), held as is by the renderer's RGBA image
@@ -496,6 +497,8 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
                                          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image};
         vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         push_descriptor(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &write);
+        const float exponent = output_gamma.load(std::memory_order_relaxed);
+        vkCmdPushConstants(frame.cmd, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(exponent), &exponent);
         vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
         vkCmdSetScissor(frame.cmd, 0, 1, &area);
         vkCmdDraw(frame.cmd, 3, 1, 0, 0);
@@ -586,9 +589,10 @@ vec4 filtered(vec2 uv) {
 })";
     const std::string fragment = std::string(R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D game;
+layout(push_constant) uniform Output { float gamma; };
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 color;)") + (config.scaling_filter == ScalingFilter::Fsr1 ? lanczos : "\nvec4 filtered(vec2 uv) { return texture(game, uv); }") + R"(
-void main() { color = vec4(filtered(uv).rgb, 1.0); }
+void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
 )";
     Gcn::Compiler compiler;
     std::string error;
@@ -609,7 +613,10 @@ void main() { color = vec4(filtered(uv).rgb, 1.0); }
     const VkDescriptorSetLayoutCreateInfo set_info{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = 1, .pBindings = &binding};
     Check(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &set_layout), "Create presentation descriptor layout");
-    const VkPipelineLayoutCreateInfo layout_info{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &set_layout};
+    // VideoOut gamma on the encoded output values: out = in ^ gamma (the PS4 curve is not documented; 0.8 brightens, as the game expects).
+    const VkPushConstantRange output_constants{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float)};
+    const VkPipelineLayoutCreateInfo layout_info{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &set_layout,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &output_constants};
     Check(vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout), "Create presentation pipeline layout");
     push_descriptor = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR"));
     if (!push_descriptor) throw std::runtime_error("vkCmdPushDescriptorSetKHR is missing");
@@ -739,6 +746,8 @@ void Flipped(u64 address, bool bgra, u64 frame_id) {
     { std::scoped_lock lock(flip_mutex); flipped = true; display = address; display_bgra = bgra; flip_time = PresentationTiming::Now(); flipped_frame = frame_id; }
     flip_cv.notify_one();
 }
+
+void SetGamma(float value) { output_gamma.store(value, std::memory_order_relaxed); }
 
 void BeforeInput() { if (auto* t = timing.load(std::memory_order_acquire)) t->BeginInput(); }
 u64 EndSimulation() { if (auto* t = timing.load(std::memory_order_acquire)) return t->EndSimulation(); return 0; }

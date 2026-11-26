@@ -10,6 +10,8 @@ namespace Gow3::Presenter {
 void Initialize(SDL_Window* window, const Config& config);
 // Guest address of the display buffer now on screen (0: none); `bgra` when its memory order is B, G, R, A.
 void Flipped(u64 address, bool bgra, u64 frame_id);
+// VideoOut gamma (sceVideoOutAdjustColor, 0.1 to 2; 1: none), applied from the next presented frame.
+void SetGamma(float gamma);
 void BeforeInput();
 u64 EndSimulation();
 void BeginRender(u64 frame_id);

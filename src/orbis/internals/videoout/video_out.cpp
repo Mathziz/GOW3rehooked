@@ -11,6 +11,7 @@
 #include "orbis/internals/videoout/video_out.h"
 #include "orbis/internals/videoout/videoout_error.h"
 #include "orbis/core/platform.h"
+#include "present/presenter.h"
 
 namespace Libraries::VideoOut {
 
@@ -391,6 +392,8 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
     if (!port) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
+    // The game's brightness option (0 to 100) sends 1.2 to 0.8 (FUN_011f07d0); it draws nothing for it itself.
+    Gow3::Presenter::SetGamma(settings->gamma);
     return ORBIS_OK;
 }
 
