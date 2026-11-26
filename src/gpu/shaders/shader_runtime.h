@@ -53,6 +53,7 @@ struct ProgMemo {
 inline constexpr u64 kMotionBlurPassOrbHash = 0x107d87f9d56574cfULL;
 inline constexpr u64 kMotionBlurCompositeOrbHash = 0xabd418f2b4587d5dULL;
 inline constexpr u64 kDofCompositeOrbHash = 0x1b4f84d1cc5f5f9eULL;
+inline constexpr u64 kLinearCopyCsOrbHash = 0xccdebd80f02a77aaULL;
 struct Compiled {
     VkShaderEXT s = VK_NULL_HANDLE;        // Tier 1 (Objects)
     VkShaderModule mod = VK_NULL_HANDLE;   // Tiers 2/3 graphics stage

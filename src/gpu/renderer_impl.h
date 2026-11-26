@@ -532,6 +532,7 @@ struct Renderer::Impl {
     // Image of the T#s over one memory layout (Describe): as big as the largest of them.
     struct Surface {
         std::weak_ptr<Tex> t;
+        VkImage img = VK_NULL_HANDLE;
         u32 w = 0, h = 0, users = 0;
         bool cube = false;
         bool foreign = false;  // read through another layout once: its writes go back to the mirror at once
@@ -542,6 +543,8 @@ struct Renderer::Impl {
     std::map<std::tuple<u64, u32, u32, u32, u32, u32, u32>, Surface> surfaces;  // base, tile, bits, pitch, layers, levels, extent if mipped
     bool regrow = false;  // a surface's image grew this frame
     void Regrow();
+    enum class TempEvict : u8 { None = 0, Age64 = 1, Compact = 2, Pressure = 3, Bindless = 4 };
+    enum class TempFresh : u8 { New = 0, Age64 = 1, Compact = 2, Pressure = 3, Bindless = 4, LinCsSrc = 5, LinCsDst = 6 };
     struct GuestTex {
         Tex t;  // its image's handles (shared: the surface's)
         std::shared_ptr<Tex> shared;
@@ -555,6 +558,10 @@ struct Renderer::Impl {
         bool block = false, volume = false, storage = false, fresh = true;
         bool flat = false;    // single-sampled 2D (array): can be the top-left part of a bigger image
         bool reload = false;  // in an image other T#s filled: its part uploaded at the next Check
+        TempFresh temp_fresh = TempFresh::New;  // TEMP telemetry: classification when fresh
+        u8 temp_lin_cs = 0;                     // TEMP telemetry: 1 linear compute src, 2 linear compute dst
+        bool temp_regrow_reload = false;        // TEMP telemetry: reload triggered by Regrow
+        u32 temp_gone = 0;                      // TEMP telemetry: frames since last eviction (when recreated)
         VkComponentMapping map{};
         Layout mips[16]{};
         VkImageView mip_views[16]{};
@@ -569,6 +576,8 @@ struct Renderer::Impl {
     std::vector<VkImageView> owned_views;
     u32 next_element[kStorageBinding + 18]{};
     std::vector<u32> free_elements[kStorageBinding + 18];  // released by EvictTextures
+    std::vector<std::pair<u32, u32>> pending_elements;     // {binding, element} freed while `flight` may still use them; drained on Retire()
+    void DrainRetiredElements();
     bool evict_soon = false;  // a bindless array (evict_binding) filled up on a worker thread: evictions at the next Submit start
     u32 evict_binding = 0;
     std::vector<std::pair<u64, u64>> dirty;  // guest ranges written for this frame, sorted
@@ -578,13 +587,13 @@ struct Renderer::Impl {
     u32 frame = 0;
     // Guest textures unused for more than `age` frames: bindless elements freed (no frame samples them), views and images
     // destroyed by Reap once the frame being recorded has retired (it and the frame in flight may still copy from them).
-    void EvictTextures(u32 age);
+    void EvictTextures(u32 age, bool defer_elements = false, TempEvict reason = TempEvict::None);
     // Texture blocks left mostly empty (a level's textures went, a few survivors hold each one): the textures of the emptiest
     // are evicted, loaded again from guest memory on their next use into the fuller blocks, and the emptied blocks go back.
     void CompactImageBlocks();
     std::vector<const GuestTex*> doomed;  // CompactImageBlocks' picks for EvictTextures, sorted
-    void Bury(const ViewKey& k, ViewEntry& v);  // element freed, view (then image) to Reap
-    void PruneSurfaceViews();
+    void Bury(const ViewKey& k, ViewEntry& v, bool defer_elements = false);  // element freed (or deferred), view (then image) to Reap
+    void PruneSurfaceViews(bool defer_elements = false);
     // Evicted textures' handles: this frame's, then older ones (`dying`), which go once their frames retired.
     struct Graves {
         std::vector<VkImageView> views;
@@ -600,6 +609,37 @@ struct Renderer::Impl {
     std::future<void> reaping;
     std::atomic<u32> reaped{0};        // objects destroyed (frame recorder)
     std::atomic<u64> reap_max_ns{0};   // the longest of them
+    // TEMP upload/eviction/regrow telemetry (debug runs only; guarded by res_lock except atomics).
+    struct TempEvictedEntry {
+        TempEvict reason = TempEvict::None;
+        u32 frame = 0;
+    };
+    struct TempTopFresh {
+        u64 base = 0, bytes = 0;
+        u32 w = 0, h = 0, tile = 0, bits = 0, count = 0, gone_max = 0;
+        TempFresh bucket = TempFresh::New;
+        u8 lin_cs = 0;
+    };
+    struct TempMemStats {
+        u64 fresh_bytes[7]{}, fresh_count[7]{};        // indexed by TempFresh (0..6)
+        u64 fresh_gone_sum[5]{}, fresh_gone_max[5]{};  // indexed by TempEvict (1..4)
+        u64 lin_cs_evicted_bytes = 0, lin_cs_evicted_count = 0;
+        u64 regrow_bytes = 0, regrow_count = 0;
+        u64 other_reload_bytes = 0, other_reload_count = 0;
+        u64 other_reload_top_base = 0, other_reload_top_bytes = 0;
+        u32 other_reload_top_w = 0, other_reload_top_h = 0, other_reload_top_tile = 0;
+        u64 cpu_bytes = 0, cpu_count = 0;
+        u64 video_bytes = 0, video_count = 0;
+        u64 gpu_write_bytes = 0, gpu_write_count = 0;
+        u64 resync_bytes = 0, resync_count = 0;
+        u64 evicted_bytes[5]{}, evicted_count[5]{};    // indexed by TempEvict (1..4)
+        u64 compact_runs = 0, regrow_runs = 0, regrow_moved = 0, regrow_mipviews = 0, deferred_elements = 0;
+        u64 lin_copy_hits = 0, lin_copy_bytes = 0, lin_copy_fallbacks = 0;
+        std::vector<TempTopFresh> top_fresh;
+    } temp_mem;
+    std::unordered_map<u64, TempEvictedEntry> temp_evicted;
+    std::atomic<u64> temp_ded_allocs{0}, temp_ded_bytes{0};
+    void NoteFreshTop(const GuestTex& g);
     // After the wait for the frame in flight: the textures evicted while it was recorded go to another thread (destroying an
     // image, or freeing memory of its own, is a kernel call), one object at a time with a pause: destroyed at once, a batch
     // held the frame's queue submit or recording for up to 5 ms. While that thread is busy they wait for a later frame.
@@ -780,6 +820,7 @@ struct Renderer::Impl {
         bool motion_blur = false;
         bool stencil_resolve = false;
         bool dof_composite = false;
+        bool linear_copy = false;
         std::vector<Gcn::SlotSpec> spec;
         std::vector<const u32*> desc;   // descriptor of each slot (null: unreadable)
         std::vector<const u32*> fdesc;  // V# of each format load (null: unreadable)
@@ -798,7 +839,13 @@ struct Renderer::Impl {
     static inline thread_local u32 inputs[kInputs];                  // Shader's: what makes its variant and slot elements
     static inline thread_local std::vector<MemoTex> slot_used;       // Shader's: each slot's, for Recent
     ShaderRef Shader(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, u64& out_mask,
-                     bool rect, std::vector<u32>& table, u32 blend = 0);
+                     bool rect, std::vector<u32>& table, u32 blend = 0, bool identified = false);
+    static const u32* Locate(const Gcn::Path& path, u32 n, const u32* user, const CpuRead& cpu) {
+        const u32* w = path.reg + (path.depth ? 2 : n) <= 16 ? user + path.reg : nullptr;
+        for (u32 d = 0; d < path.depth && w; ++d)
+            w = (const u32*)cpu(((u64)(w[1] & 0xFFFF) << 32 | w[0]) + path.offset[d], d + 1 < path.depth ? 8 : n * 4);
+        return w;
+    }
     // Prepare in two halves: the program's code, key and slots with their descriptors (Identify), then the input's
     // registers, the slots' specs and the translation key (Specify), which a repeated input skips.
     bool Identify(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, Prepared& p);
@@ -1205,6 +1252,7 @@ struct Renderer::Impl {
     void RecordBlocks(u32 rec);
     void Draw(u32 op, const u32* b, const CpuRead& cpu);
     void Dispatch(const u32* b, const CpuRead& cpu);
+    bool TryLinearCopyDispatch(const u32* b, const CpuRead& cpu);
 
     // ---- Diagnostics: stats, notes, traced probes and exploded vertices (vk_gpu.cpp) ----
     Stats stats;

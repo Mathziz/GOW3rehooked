@@ -1733,7 +1733,10 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t, bool las
         }
     }
     t.mem = Alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
-    if (t.mem) t.alloc_size = r.size, dedicated_images += r.size;
+    if (t.mem) {
+        t.alloc_size = r.size, dedicated_images += r.size;
+        GOW3_DIAG temp_ded_allocs.fetch_add(1, std::memory_order_relaxed), temp_ded_bytes.fetch_add(r.size, std::memory_order_relaxed);
+    }
 }
 
 void Renderer::Impl::FreeImage(const Tex& t) {
@@ -1798,7 +1801,10 @@ u32 Renderer::Impl::Bindless(u32 binding, VkImageView view, VkSampler smp) {
     auto& freed = free_elements[binding];
     if (freed.empty() && n >= (is_sampler ? kSamplers : storage ? kStorage : kTextures)) {
         // Bursts of new images (texture-pool defrag moves): free everything this frame has not used.
-        if (!is_sampler && !in_worker) Retire(), Stalled(stall_evicts, stall_evict_ns, [&] { EvictTextures(0); });
+        if (!is_sampler && !in_worker)
+            Retire(), Stalled(stall_evicts, stall_evict_ns, [&] {
+                if (freed.empty()) EvictTextures(0, false, TempEvict::Bindless);
+            });
         else if (!is_sampler) evict_soon = true, evict_binding = binding;
         if (freed.empty()) return Note(std::format("bindless array {} full", binding)), 0;
     }
@@ -1814,7 +1820,7 @@ u32 Renderer::Impl::Bindless(u32 binding, VkImageView view, VkSampler smp) {
 
 // Guest textures unused for more than `age` frames: bindless elements freed (no frame samples them), views and images
 // destroyed by Reap once the frame being recorded has retired (it and the frame in flight may still copy from them).
-void Renderer::Impl::EvictTextures(u32 age) {
+void Renderer::Impl::EvictTextures(u32 age, bool defer_elements, TempEvict reason) {
     const auto old = [&](const GuestTex& g) { return g.checked == ~0u || frame - g.checked > age || std::binary_search(doomed.begin(), doomed.end(), &g); };
     std::vector<const GuestTex*> gone;
     for (auto& [h, g] : textures)
@@ -1829,15 +1835,23 @@ void Renderer::Impl::EvictTextures(u32 age) {
     std::erase_if(textures, [&](auto& e) {
         GuestTex& g = e.second;
         if (!old(g)) return false;
+        GOW3_DIAG if (reason != TempEvict::None && g.t.img) {
+            ++temp_mem.evicted_count[u32(reason)], temp_mem.evicted_bytes[u32(reason)] += g.size;
+            temp_evicted[e.first] = {reason, frame};
+        }
         graves.views.insert(graves.views.end(), g.owned.begin(), g.owned.end());
-        for (auto& [k, v] : g.views) Bury(k, v);
+        for (auto& [k, v] : g.views) Bury(k, v, defer_elements);
         if (g.surf) --g.surf->users, graves.shared.push_back(std::move(g.shared));
         else if (g.t.img) graves.own.push_back(g.t);
         return true;
     });
     doomed.clear();
-    if (!gone.empty()) std::atomic_ref(epoch).fetch_add(1, std::memory_order_release), PruneSurfaceViews();
+    if (!gone.empty()) std::atomic_ref(epoch).fetch_add(1, std::memory_order_release), PruneSurfaceViews(defer_elements);
     std::erase_if(surfaces, [](auto& s) { return !s.second.users; });
+    GOW3_DIAG if (temp_evicted.size() > 65536) {
+        std::erase_if(temp_evicted, [&](const auto& kv) { return frame - kv.second.frame > 4096; });
+        if (temp_evicted.size() > 65536) temp_evicted.clear();
+    }
     // Targets, at a frame's start only (never age 0: a frame being recorded holds its targets). A long age: a target's
     // content, unlike a texture's, cannot be loaded again. Under the lock: FindTarget marks the displayed one used.
     if (std::scoped_lock lock(targets_lock); age && std::erase_if(targets, [&](auto& e) {
@@ -1864,7 +1878,7 @@ void Renderer::Impl::EvictTextures(u32 age) {
 }
 
 void Renderer::Impl::CompactImageBlocks() {
-    // Integrated GPUs, or a discrete one at its VRAM budget: its Retire costs a frame's overlap, and otherwise a discrete GPU's idle blocks take no system RAM.
+    // Integrated GPUs, or a discrete one at its VRAM budget: otherwise a discrete GPU's idle blocks take no system RAM.
     if (!uma_single_heap && !uma_budget && !budget_pressure) return;
     constexpr u64 kBudget = 32ull << 20;  // texture bytes moved per call
     const auto idle = [](const ImageBlock& b) { VkDeviceSize n = 0; for (auto& [lo, s] : b.free) n += s; return n; };
@@ -1911,17 +1925,31 @@ void Renderer::Impl::CompactImageBlocks() {
     for (auto& [h, g] : textures)
         if (g.t.mem_size && std::find(taken.begin(), taken.end(), g.t.mem) != taken.end()) doomed.push_back(&g);
     std::sort(doomed.begin(), doomed.end());
-    Retire();  // the frame in flight may still sample them
-    EvictTextures(~0u);  // only doomed and never-checked textures go
+    GOW3_DIAG ++temp_mem.compact_runs;
+    EvictTextures(~0u, true, TempEvict::Compact);  // only doomed and never-checked textures go; bindless slots wait for Retire
 }
 
-void Renderer::Impl::Bury(const ViewKey& k, ViewEntry& v) {
-    graves.views.push_back(v.view), free_elements[std::get<1>(k)].push_back(v.element);
+void Renderer::Impl::DrainRetiredElements() {
+    if (pending_elements.empty()) return;
+    std::scoped_lock res(res_lock);
+    for (auto [binding, el] : pending_elements) free_elements[binding].push_back(el);
+    pending_elements.clear();
+}
+
+void Renderer::Impl::Bury(const ViewKey& k, ViewEntry& v, bool defer_elements) {
+    graves.views.push_back(v.view);
+    const u32 binding = std::get<1>(k);
+    if (defer_elements && flight.busy) {
+        pending_elements.push_back({binding, v.element});
+        GOW3_DIAG ++temp_mem.deferred_elements;
+    } else {
+        free_elements[binding].push_back(v.element);
+    }
     if (v.image) graves.shared.push_back(std::move(v.image));
 }
 
 // Surface views of images none of its T#s holds any more (evicted, or moved to a grown image by Regrow).
-void Renderer::Impl::PruneSurfaceViews() {
+void Renderer::Impl::PruneSurfaceViews(bool defer_elements) {
     std::vector<std::pair<const Surface*, VkImage>> live;
     for (const auto& [h, g] : textures)
         if (g.surf) live.push_back({g.surf, g.t.img});
@@ -1929,7 +1957,7 @@ void Renderer::Impl::PruneSurfaceViews() {
     for (auto& [key, s] : surfaces)
         std::erase_if(s.views, [&](auto& e) {
             if (std::binary_search(live.begin(), live.end(), std::pair<const Surface*, VkImage>{&s, std::get<0>(e.first)})) return false;
-            return Bury(e.first, e.second), true;
+            return Bury(e.first, e.second, defer_elements), true;
         });
 }
 
@@ -2311,7 +2339,7 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
                                        (s->cube && s->w == s->h ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0)));
         if (!t->img) return delete t, fail(s->w, s->h);
         cur = std::shared_ptr<Tex>(t, [this](Tex* x) { FreeImage(*x), delete x; });
-        s->t = cur;
+        s->t = cur, s->img = cur->img;
         Count(stats.textures);
     } else {
         // The image is live (no layout change) and holds this part unless the CPU wrote it since the surface was last current.
@@ -2325,21 +2353,33 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
     return true;
 }
 
-// Start of a frame, the last one retired: the T#s of a surface whose image grew move to the new image.
+// Start of a frame: the T#s of a surface whose image grew move to the new image (old views, images and bindless slots wait for Retire).
 void Renderer::Impl::Regrow() {
     regrow = false;
+    std::vector<const GuestTex*> moved;
+    u64 mipviews = 0;
     for (auto& [h, g] : textures) {
         if (!g.surf) continue;
         Surface& s = *g.surf;
         s.growing = false;
         const std::shared_ptr<Tex> cur = s.t.lock();
-        if (!cur) s.t = g.shared, s.w = g.iw, s.h = g.ih, s.current = ~0u;  // the grown image's T#s are gone: this one's is the surface's again
+        if (!cur) s.t = g.shared, s.img = g.shared ? g.shared->img : VK_NULL_HANDLE, s.w = g.iw, s.h = g.ih, s.current = ~0u;  // the grown image's T#s are gone: this one's is the surface's again
         if (!cur || cur == g.shared || g.w > s.w || g.h > s.h || (!g.flat && (g.w != s.w || g.h != s.h))) continue;
-        for (auto v : g.owned) vkDestroyImageView(dev, v, nullptr);
+        mipviews += g.owned.size();
+        graves.views.insert(graves.views.end(), g.owned.begin(), g.owned.end());
         g.owned.clear(), std::fill_n(g.mip_views, 16, VK_NULL_HANDLE);
-        g.shared = cur, g.t = *cur, g.iw = s.w, g.ih = s.h, g.fresh = false, g.reload = true;
+        if (g.shared) graves.shared.push_back(std::move(g.shared));
+        g.shared = cur, g.t = *cur, g.iw = s.w, g.ih = s.h, g.fresh = false, g.reload = true, g.temp_regrow_reload = true;
+        moved.push_back(&g);
     }
-    PruneSurfaceViews();
+    if (!moved.empty()) {
+        std::sort(moved.begin(), moved.end());
+        for (auto* list : {&gpu_writes, &last_writes})
+            for (auto& w : *list)
+                if (w.by && std::binary_search(moved.begin(), moved.end(), w.by)) w.by = nullptr, w.lazy = false;
+    }
+    GOW3_DIAG ++temp_mem.regrow_runs, temp_mem.regrow_moved += moved.size(), temp_mem.regrow_mipviews += mipviews;
+    PruneSurfaceViews(true);
     std::atomic_ref(epoch).fetch_add(1, std::memory_order_release);
 }
 
@@ -2362,6 +2402,7 @@ void Renderer::Impl::Check(GuestTex& g) {
     // drawn in turns, each written while the other is drawn, and one kept an old grade (the title menu's brightness flicker).
     if (const u32* at = staged_table.get(); !cpu && g.checked != ~0u && frame - g.checked > 1)
         for (u64 p = g.base >> 12, end = std::min((g.base + g.size + 0xFFF) >> 12, kPieces); !cpu && p < end; ++p) cpu = at[p] > g.checked;
+    bool video_changed = false;
 #ifndef GOW3_OFFLINE
     if (video_serial && video_serial != g.video_serial && Gow3::GuestMemory::Readable(g.base, g.size)) {
         Gow3::GpuThread::TraceVideoCopy(g.base, frame, false);
@@ -2369,6 +2410,7 @@ void Renderer::Impl::Check(GuestTex& g) {
             Gow3::GpuThread::TraceVideoCopy(g.base, frame, true);
             g.video_serial = video_serial;
             cpu = true;
+            video_changed = true;
         }
     }
 #endif
@@ -2378,6 +2420,37 @@ void Renderer::Impl::Check(GuestTex& g) {
 #endif
     if (upload) {
         uploads.push_back(&g), g.synced = frame_seq;
+        GOW3_DIAG {
+            if (g.fresh) {
+                const u32 idx = u32(g.temp_fresh);
+                ++temp_mem.fresh_count[idx], temp_mem.fresh_bytes[idx] += g.size;
+                if (idx >= u32(TempFresh::Age64) && idx <= u32(TempFresh::Bindless)) {
+                    temp_mem.fresh_gone_sum[idx] += g.temp_gone;
+                    temp_mem.fresh_gone_max[idx] = std::max<u64>(temp_mem.fresh_gone_max[idx], g.temp_gone);
+                    if (g.temp_lin_cs) ++temp_mem.lin_cs_evicted_count, temp_mem.lin_cs_evicted_bytes += g.size;
+                }
+                NoteFreshTop(g);
+            } else if (g.reload) {
+                if (g.temp_regrow_reload) {
+                    ++temp_mem.regrow_count, temp_mem.regrow_bytes += g.size;
+                } else {
+                    ++temp_mem.other_reload_count, temp_mem.other_reload_bytes += g.size;
+                    if (g.size >= temp_mem.other_reload_top_bytes) {
+                        temp_mem.other_reload_top_bytes = g.size;
+                        temp_mem.other_reload_top_base = g.base;
+                        temp_mem.other_reload_top_w = g.w;
+                        temp_mem.other_reload_top_h = g.h;
+                        temp_mem.other_reload_top_tile = g.tile;
+                    }
+                }
+            } else if (video_changed) {
+                ++temp_mem.video_count, temp_mem.video_bytes += g.size;
+            } else if (cpu) {
+                ++temp_mem.cpu_count, temp_mem.cpu_bytes += g.size;
+            } else {
+                ++temp_mem.gpu_write_count, temp_mem.gpu_write_bytes += g.size;
+            }
+        }
         // Those reach the mirror in the prologue, before the uploads; a CPU write over one replaces it.
         auto by_cpu = [&](const GpuWrite& w) {
             auto c = std::upper_bound(dirty.begin(), dirty.end(), std::pair{w.hi, 0ull});
@@ -2394,9 +2467,9 @@ void Renderer::Impl::Check(GuestTex& g) {
                 if (w.lo < g.base + g.size && w.hi > g.base) why += TempWriter(w, g);
             TempCopy("UP", g, why);
         }
-        g.reload = false;
+        g.reload = false, g.temp_regrow_reload = false;
     }
-    if (g.surf && !g.surf->growing && g.w == g.surf->w && g.h == g.surf->h) g.surf->current = frame;
+    if (g.surf && g.t.img == g.surf->img && g.w == g.surf->w && g.h == g.surf->h) g.surf->current = frame;
     std::atomic_ref(g.checked).store(frame, std::memory_order_release);
 }
 
@@ -2531,6 +2604,19 @@ u32 Renderer::Impl::Texture(const u32* t, const Gcn::SlotSpec& spec, bool storag
     GuestTex& g = it->second;
     if (fresh && !Describe(g, t)) g.t = {};
     if (!g.t.img) return 0;
+    GOW3_DIAG if (fresh) {
+        const bool lin_cs = dispatching && (g.tile == 8 || g.tile == 31);
+        g.temp_lin_cs = lin_cs ? (storage ? 2 : 1) : 0;
+        if (auto ev = temp_evicted.find(hash); ev != temp_evicted.end()) {
+            g.temp_fresh = TempFresh(ev->second.reason);
+            g.temp_gone = frame - ev->second.frame;
+            temp_evicted.erase(ev);
+        } else if (lin_cs) {
+            g.temp_fresh = storage ? TempFresh::LinCsDst : TempFresh::LinCsSrc;
+        } else {
+            g.temp_fresh = TempFresh::New;
+        }
+    }
     if (stats.trace && !stats.trace_lines.empty()) {  // share of the guest bytes (4 KB pieces) that reached the mirror
         u64 have = 0, n = 0;
         for (u64 a = g.base & ~0xFFFull; a < g.base + g.size; a += 0x1000, ++n) have += a >> 12 < kPieces && written[a >> 12];
@@ -2693,6 +2779,8 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
     std::vector<Job> jobs;
     u64 need = 0;
     const bool prologue = &list == &uploads;
+    GOW3_DIAG if (!prologue)
+        for (GuestTex* g : list) ++temp_mem.resync_count, temp_mem.resync_bytes += g->size;
     for (GuestTex* g : list) {
         Job j{g, ~0ull, 0, false};
         if (g->tile != 8 && g->tile != 31) {
@@ -2703,6 +2791,8 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
             ti.image_width = g->w, ti.image_height = g->h, ti.range_end = ~0u, ti.block_scale = g->block ? 4 : 1, ti.is_volume = g->volume;
             const u64 at = TableAt(sizeof(ti), 256);
             if (at == ~0ull) {
+                g->reload = true;
+                if (g->surf && g->t.img == g->surf->img) g->surf->current = ~0u;
                 Note("draw tables full (tiling info)");
                 continue;
             }
@@ -2755,6 +2845,7 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
         if (j.scratch == ~0ull && !j.direct) continue;
         if (j.scratch != ~0ull && !dst_buf) {
             j.g->reload = true;
+            if (j.g->surf && j.g->t.img == j.g->surf->img) j.g->surf->current = ~0u;
             continue;
         }
         GuestTex& g = *j.g;
@@ -2919,6 +3010,130 @@ void Renderer::Impl::WriteBack() {
     Barrier(cmd, !shared);
 }
 
+bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
+    Prepared& p = prep;
+    auto fallback = [&]() -> bool {
+        GOW3_DIAG {
+            std::scoped_lock res(res_lock);
+            ++temp_mem.lin_copy_fallbacks;
+        }
+        return false;
+    };
+    if (sh[0x207] != 8 || sh[0x208] != 8 || sh[0x209] != 1) return fallback();
+    if (!p.slots || p.slots->size() != 2 || (*p.slots)[0].kind != Gcn::SlotKind::Texture || (*p.slots)[1].kind != Gcn::SlotKind::Storage)
+        return fallback();
+    if (p.desc.size() != 2 || !p.desc[0] || !p.desc[1] || !p.fdesc.empty() || p.stored) return fallback();
+    if (!p.consts || p.consts->empty()) return fallback();
+    const Gcn::Const& c = (*p.consts)[0];
+    if (!c.buffer || c.lo != 0 || c.hi < 24) return fallback();
+    const u32* cb_v = Locate(c.path, 4, &sh[0x240], cpu);
+    if (!cb_v) return fallback();
+    const u64 cb_addr = (u64)(cb_v[1] & 0xFFFF) << 32 | cb_v[0], cb_stride = cb_v[1] >> 16 & 0x3FFF;
+    const u64 cb_lim = cb_stride ? cb_stride * cb_v[2] : cb_v[2];
+    if (cb_lim < 24) return fallback();
+    const u32* cb = static_cast<const u32*>(cpu(cb_addr, 24));
+    if (!cb) return fallback();
+    const u32 dst_x = cb[0], dst_y = cb[1], src_x = cb[2], src_y = cb[3], copy_w = cb[4], copy_h = cb[5];
+    if (!copy_w || !copy_h || b[2] != 1 || (u64)b[0] * 8 < copy_w || (u64)b[1] * 8 < copy_h) return fallback();
+
+    struct LinearT {
+        u64 base = 0;
+        u32 w = 0, h = 0, pitch = 0, tile = 0, bits = 0, comps = 0;
+        AmdGpu::DataFormat raw_dfmt{};
+        AmdGpu::NumberFormat raw_nfmt{};
+    };
+    auto parse = [&](const u32* t, LinearT& out) -> bool {
+        if (!(t[3] >> 31)) return false;
+        out.base = ((u64)t[0] | (u64)(t[1] & 0x3F) << 32) << 8;
+        if (!out.base) return false;
+        const u32 type = t[3] >> 28, base_level = t[3] >> 12 & 0xF, last_level = t[3] >> 16 & 0xF;
+        const u32 depth = (t[4] & 0x1FFF) + 1, base_array = t[5] & 0x1FFF;
+        const bool pow2 = t[3] >> 25 & 1;
+        out.tile = t[3] >> 20 & 0x1F;
+        if (type != 9 || base_level || last_level || depth != 1 || base_array || pow2) return false;
+        if (out.tile != 8 && out.tile != 31) return false;
+        out.raw_dfmt = AmdGpu::DataFormat(t[1] >> 20 & 0x3F);
+        out.raw_nfmt = AmdGpu::NumberFormat(t[1] >> 26 & 0xF);
+        const auto dfmt = AmdGpu::RemapDataFormat(out.raw_dfmt);
+        const auto nfmt = AmdGpu::RemapNumberFormat(out.raw_nfmt, out.raw_dfmt);
+        if (out.raw_nfmt == AmdGpu::NumberFormat::Srgb || AmdGpu::IsBlockCoded(dfmt)) return false;
+        if (SurfaceFormat(u32(dfmt), u32(nfmt)) == VK_FORMAT_UNDEFINED) return false;
+        out.bits = AmdGpu::NumBitsPerBlock(dfmt);
+        out.comps = AmdGpu::NumComponents(dfmt);
+        if (out.bits < 8 || out.bits > 128 || (out.bits & 7) || !out.comps || out.comps > 4) return false;
+        const auto sel = DstSel(t);
+        for (u32 k = 0; k < out.comps; ++k)
+            if (sel.array[k] != AmdGpu::CompSwizzle(u8(AmdGpu::CompSwizzle::Red) + k)) return false;
+        out.w = (t[2] & 0x3FFF) + 1;
+        out.h = (t[2] >> 14 & 0x3FFF) + 1;
+        out.pitch = (t[4] >> 13 & 0x3FFF) + 1;
+        return out.w <= out.pitch;
+    };
+    LinearT src, dst;
+    if (!parse(p.desc[0], src) || !parse(p.desc[1], dst)) return fallback();
+    if (src.raw_dfmt != dst.raw_dfmt || src.raw_nfmt != dst.raw_nfmt) return fallback();
+    if ((u64)src_x + copy_w > src.w || (u64)src_y + copy_h > src.h || (u64)dst_x + copy_w > dst.w || (u64)dst_y + copy_h > dst.h)
+        return fallback();
+    if ((copy_h > 1 || src_y > 0) && std::get<0>(VideoCore::ImageSizeLinearAligned(src.pitch, src.h, src.bits, 1)) != src.pitch)
+        return fallback();
+    if ((copy_h > 1 || dst_y > 0) && std::get<0>(VideoCore::ImageSizeLinearAligned(dst.pitch, dst.h, dst.bits, 1)) != dst.pitch)
+        return fallback();
+    if (copy_h > 1 && copy_w != dst.pitch) return fallback();
+
+    const u64 bpp = src.bits / 8, row_bytes = (u64)copy_w * bpp;
+    const u64 src_stride = (u64)src.pitch * bpp, dst_stride = (u64)dst.pitch * bpp;
+    const u64 src_lo = src.base + (u64)src_y * src_stride + (u64)src_x * bpp;
+    const u64 src_hi = src.base + ((u64)(src_y + copy_h - 1) * src.pitch + src_x + copy_w) * bpp;
+    const u64 dst_lo = dst.base + (u64)dst_y * dst_stride + (u64)dst_x * bpp;
+    const u64 dst_hi = dst.base + ((u64)(dst_y + copy_h - 1) * dst.pitch + dst_x + copy_w) * bpp;
+    if (src_hi <= src_lo || src_hi > mirror_size || dst_hi <= dst_lo || dst_hi > mirror_size) return fallback();
+    if (src_lo < dst_hi && dst_lo < src_hi) return fallback();
+#ifndef GOW3_OFFLINE
+    if (Gow3::GpuThread::VideoFrameVersion(src.base) || Gow3::GpuThread::VideoFrameVersion(dst.base)) return fallback();
+#endif
+
+    FlushStores();
+    {
+        std::scoped_lock res(res_lock);
+        auto blocked_range = [&](u64 a) { return (a >= src_lo && a < src_hi) || (a >= dst_lo && a < dst_hi); };
+        if (target_at.contains(src.base) || target_at.contains(dst.base) || stencil_at.contains(src.base) || stencil_at.contains(dst.base) ||
+            std::any_of(target_at.begin(), target_at.end(), blocked_range))
+            return fallback();
+        auto has_lazy = [&](const std::vector<GpuWrite>& list) {
+            return std::any_of(list.begin(), list.end(), [&](const GpuWrite& w) {
+                return w.lazy && ((w.lo < src_hi && w.hi > src_lo) || (w.lo < dst_hi && w.hi > dst_lo));
+            });
+        };
+        if (has_lazy(lazy_writes) || has_lazy(gpu_writes) || has_lazy(own_writes)) return fallback();
+    }
+
+    Track(src_lo, src_hi), NoteRead(src_lo, src_hi);
+    EndRendering();
+    BindPages(src_lo, src_hi), BindPages(dst_lo, dst_hi);
+    Barrier(cmd);
+    const u64 copy_bytes = (u64)copy_h * row_bytes;
+    std::vector<VkBufferCopy> regions;
+    if (copy_h == 1 || (copy_w == src.pitch && copy_w == dst.pitch)) {
+        regions.push_back({src_lo, dst_lo, copy_bytes});
+    } else {
+        regions.reserve(copy_h);
+        for (u32 y = 0; y < copy_h; ++y) regions.push_back({src_lo + (u64)y * src_stride, dst_lo + (u64)y * dst_stride, row_bytes});
+    }
+    vkCmdCopyBuffer(cmd, mirror, mirror, (u32)regions.size(), regions.data());
+    Barrier(cmd);
+    const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
+    (in_worker ? own_writes : gpu_writes).push_back({dst_lo, dst_hi, seq, nullptr});
+    if (temp_copylog)
+        std::fprintf(stderr, "COPY LIN-BUF %llx -> %llx %ux%u (%.2f MB)\n", (unsigned long long)src_lo, (unsigned long long)dst_lo, copy_w, copy_h,
+                     copy_bytes / 1048576.0);
+    GOW3_DIAG {
+        std::scoped_lock res(res_lock);
+        ++temp_mem.lin_copy_hits, temp_mem.lin_copy_bytes += copy_bytes;
+    }
+    Count(stats.dispatches);
+    return true;
+}
+
 // ---- Debug and offline readback ----
 
 std::vector<Image> Renderer::ReadTextures(bool traced) {
@@ -3053,6 +3268,90 @@ std::vector<Image> Renderer::ReadTargets() {
         }
         r.FreeBuffer(buf);
         out.push_back(std::move(img));
+    }
+    return out;
+}
+
+void Renderer::Impl::NoteFreshTop(const GuestTex& g) {
+    for (auto& e : temp_mem.top_fresh)
+        if (e.base == g.base && e.w == g.w && e.h == g.h && e.tile == g.tile && e.bits == g.bits && e.bucket == g.temp_fresh && e.lin_cs == g.temp_lin_cs) {
+            e.bytes += g.size, ++e.count, e.gone_max = std::max(e.gone_max, g.temp_gone);
+            return;
+        }
+    if (temp_mem.top_fresh.size() < 128)
+        temp_mem.top_fresh.push_back({g.base, g.size, g.w, g.h, g.tile, g.bits, 1, g.temp_gone, g.temp_fresh, g.temp_lin_cs});
+}
+
+std::vector<std::string> Renderer::FlushMemTelemetry() {
+    if (!DebugEnabled()) return {};
+    Impl::TempMemStats m;
+    u64 ded_n = 0, ded_bytes = 0;
+    {
+        std::scoped_lock res(d->res_lock);
+        m = std::exchange(d->temp_mem, {});
+        ded_n = d->temp_ded_allocs.exchange(0, std::memory_order_relaxed);
+        ded_bytes = d->temp_ded_bytes.exchange(0, std::memory_order_relaxed);
+    }
+    constexpr double kMb = 1.0 / (1024.0 * 1024.0);
+    u64 fresh_b = 0, fresh_n = 0, ev_fresh_b = 0, ev_fresh_n = 0;
+    for (u32 i = 0; i < 7; ++i) fresh_b += m.fresh_bytes[i], fresh_n += m.fresh_count[i];
+    for (u32 i = 1; i <= 4; ++i) ev_fresh_b += m.fresh_bytes[i], ev_fresh_n += m.fresh_count[i];
+    const u64 lincs_b = m.fresh_bytes[u32(Impl::TempFresh::LinCsSrc)] + m.fresh_bytes[u32(Impl::TempFresh::LinCsDst)];
+    const u64 lincs_n = m.fresh_count[u32(Impl::TempFresh::LinCsSrc)] + m.fresh_count[u32(Impl::TempFresh::LinCsDst)];
+    const u64 total_up_b = fresh_b + m.regrow_bytes + m.other_reload_bytes + m.cpu_bytes + m.video_bytes + m.gpu_write_bytes + m.resync_bytes;
+    const u64 total_up_n = fresh_n + m.regrow_count + m.other_reload_count + m.cpu_count + m.video_count + m.gpu_write_count + m.resync_count;
+
+    std::vector<std::string> out;
+    if (total_up_b > 0 || total_up_n > 0) {
+        auto ev_part = [&](const char* name, u32 idx) {
+            const double avg = m.fresh_count[idx] ? double(m.fresh_gone_sum[idx]) / double(m.fresh_count[idx]) : 0.0;
+            return std::format("{} {:.1f}/{}({:.0f}/{})", name, m.fresh_bytes[idx] * kMb, m.fresh_count[idx], avg, m.fresh_gone_max[idx]);
+        };
+        std::string line = std::format(
+            "TEMP upload buckets: total {:.1f}MB({}) | fresh {:.1f}MB({}): A-evicted {:.1f}MB({}) [{} {} {} {} lin-cs-in-A {:.1f}/{}], "
+            "B-lin-cs {:.1f}MB({}) [src {:.1f}/{} dst {:.1f}/{}], C-new {:.1f}MB({}) | regrow {:.1f}/{} other-reload {:.1f}/{}",
+            total_up_b * kMb, total_up_n, fresh_b * kMb, fresh_n, ev_fresh_b * kMb, ev_fresh_n,
+            ev_part("age64", u32(Impl::TempFresh::Age64)), ev_part("compact", u32(Impl::TempFresh::Compact)),
+            ev_part("press", u32(Impl::TempFresh::Pressure)), ev_part("bind", u32(Impl::TempFresh::Bindless)),
+            m.lin_cs_evicted_bytes * kMb, m.lin_cs_evicted_count,
+            lincs_b * kMb, lincs_n,
+            m.fresh_bytes[u32(Impl::TempFresh::LinCsSrc)] * kMb, m.fresh_count[u32(Impl::TempFresh::LinCsSrc)],
+            m.fresh_bytes[u32(Impl::TempFresh::LinCsDst)] * kMb, m.fresh_count[u32(Impl::TempFresh::LinCsDst)],
+            m.fresh_bytes[u32(Impl::TempFresh::New)] * kMb, m.fresh_count[u32(Impl::TempFresh::New)],
+            m.regrow_bytes * kMb, m.regrow_count, m.other_reload_bytes * kMb, m.other_reload_count);
+        if (m.other_reload_top_bytes)
+            line += std::format(" (top {:x} {}x{} t{} {:.1f}MB)", m.other_reload_top_base, m.other_reload_top_w, m.other_reload_top_h,
+                                m.other_reload_top_tile, m.other_reload_top_bytes * kMb);
+        line += std::format(" cpu {:.1f}/{} video {:.1f}/{} gpu-write {:.1f}/{} resync {:.1f}/{}",
+                            m.cpu_bytes * kMb, m.cpu_count, m.video_bytes * kMb, m.video_count,
+                            m.gpu_write_bytes * kMb, m.gpu_write_count, m.resync_bytes * kMb, m.resync_count);
+        out.push_back(std::move(line));
+    }
+    u64 ev_b = 0, ev_n = 0;
+    for (u32 i = 1; i <= 4; ++i) ev_b += m.evicted_bytes[i], ev_n += m.evicted_count[i];
+    if (ev_n || m.compact_runs || m.regrow_runs || m.deferred_elements || ded_n || m.lin_copy_hits || m.lin_copy_fallbacks || !m.top_fresh.empty()) {
+        std::string line = std::format(
+            "TEMP evict/regrow: evicted {:.1f}MB({}) [age64 {:.1f}/{} compact {:.1f}/{} press {:.1f}/{} bind {:.1f}/{}]; "
+            "compact {} regrow {} (moved {}, mipviews {}), deferred_el {}, ded-img-allocs {}/{:.1f}MB, lin-copy {:.1f}MB({}/fb {})",
+            ev_b * kMb, ev_n,
+            m.evicted_bytes[1] * kMb, m.evicted_count[1], m.evicted_bytes[2] * kMb, m.evicted_count[2],
+            m.evicted_bytes[3] * kMb, m.evicted_count[3], m.evicted_bytes[4] * kMb, m.evicted_count[4],
+            m.compact_runs, m.regrow_runs, m.regrow_moved, m.regrow_mipviews, m.deferred_elements, ded_n, ded_bytes * kMb,
+            m.lin_copy_bytes * kMb, m.lin_copy_hits, m.lin_copy_fallbacks);
+        if (!m.top_fresh.empty()) {
+            static constexpr const char* kBucket[]{"new", "age64", "compact", "press", "bind", "lin-src", "lin-dst"};
+            std::sort(m.top_fresh.begin(), m.top_fresh.end(), [](const auto& a, const auto& b) { return a.bytes > b.bytes; });
+            line += "; top fresh:";
+            for (size_t i = 0; i < std::min<size_t>(5, m.top_fresh.size()); ++i) {
+                const auto& t = m.top_fresh[i];
+                line += std::format(" [{:x} {}x{} t{} b{} {}{} x{} {:.2f}MB{}]",
+                                    t.base, t.w, t.h, t.tile, t.bits, kBucket[u32(t.bucket)],
+                                    t.lin_cs && u32(t.bucket) <= 4 ? (t.lin_cs == 2 ? "/dst" : "/src") : "",
+                                    t.count, t.bytes * kMb,
+                                    t.gone_max ? std::format(" gone<={}", t.gone_max) : "");
+            }
+        }
+        out.push_back(std::move(line));
     }
     return out;
 }

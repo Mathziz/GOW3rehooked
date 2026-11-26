@@ -359,6 +359,7 @@ void LogTempStats() {
         const auto& s = r->GetStats();
         Log(std::format("TEMP vram MB: mirror {:.0f}, image blocks {:.0f} (free {:.0f}, targets {:.0f}, draining {:.0f}), dedicated images {:.0f}, device buffers {:.0f}, host buffers {:.0f}; {} guest textures held",
                         s.vram_mb[0], s.vram_mb[1], s.vram_mb[2], s.vram_mb[5], s.vram_mb[6], s.vram_mb[3], s.vram_mb[4], s.vram_mb[7], s.vram_textures));
+        for (const auto& line : r->FlushMemTelemetry()) Log(line);
     }
     std::fill(std::begin(temp_render_ms), std::end(temp_render_ms), 0.0);
     temp_t = {}, temp_waits = {};

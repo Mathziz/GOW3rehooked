@@ -142,13 +142,7 @@ bool Renderer::Impl::ShouldSkipMotionBlur(const CpuRead& cpu) {
     mb_seen_blur = false;
     return skip;
 }
-// Where a descriptor or pointer of `n` dwords lies: user data, then 64-bit pointers loaded from memory (null: unreadable).
-static const u32* Locate(const Gcn::Path& path, u32 n, const u32* user, const CpuRead& cpu) {
-    const u32* w = path.reg + (path.depth ? 2 : n) <= 16 ? user + path.reg : nullptr;
-    for (u32 d = 0; d < path.depth && w; ++d)
-        w = (const u32*)cpu(((u64)(w[1] & 0xFFFF) << 32 | w[0]) + path.offset[d], d + 1 < path.depth ? 8 : n * 4);
-    return w;
-}
+// Where a descriptor or pointer of `n` dwords lies: Renderer::Impl::Locate (renderer_impl.h).
 static std::span<const u32> FetchProgram(u64 addr, const CpuRead& cpu) {
     for (u32 i = 0; i < 0x100; ++i) {
         const u32* w = (const u32*)cpu(addr + i * 4ull, 4);
@@ -160,10 +154,10 @@ static std::span<const u32> FetchProgram(u64 addr, const CpuRead& cpu) {
 
 // Translated program for a draw stage; fills `table` with user data and the slots' bindless indices.
 ShaderRef Renderer::Impl::Shader(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, u64& out_mask,
-                                 bool rect, std::vector<u32>& table, u32 blend) {
+                                 bool rect, std::vector<u32>& table, u32 blend, bool identified) {
     RenderProbe::Scope shader_time(RenderProbe::Shader);
     Prepared& p = prep;
-    if (!Identify(stage, prog, user, cpu, rsrc1, rsrc2, rect, p)) return {};
+    if (!identified && !Identify(stage, prog, user, cpu, rsrc1, rsrc2, rect, p)) return {};
     p.in.blend_interlock = blend;
     if (track)  // live: the memory of every V# the program loads through, and of the pointers leading to it
         for (const Gcn::Path& bp : *p.paths) {
@@ -422,6 +416,7 @@ bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const
     p.motion_blur = stage == Gcn::Stage::Pixel && pm.hash == Gcn::MotionBlurCodeHash();
     p.stencil_resolve = stage == Gcn::Stage::Pixel && pm.hash == Gcn::MotionVectorResolveCodeHash();
     p.dof_composite = stage == Gcn::Stage::Pixel && pm.orb_hash == kDofCompositeOrbHash;
+    p.linear_copy = stage == Gcn::Stage::Compute && pm.orb_hash == kLinearCopyCsOrbHash;
     Gcn::Input& in = p.in;
     in.stage = stage, in.code = code, in.fetch = fetch, in.rsrc1 = rsrc1, in.rsrc2 = rsrc2, in.probe = stats.trace && stage == Gcn::Stage::Vertex;
     in.boom = boom_on && !in.probe && stage == Gcn::Stage::Vertex;

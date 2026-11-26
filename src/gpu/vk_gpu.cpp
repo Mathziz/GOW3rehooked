@@ -1134,10 +1134,13 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     if (stats.trace) stats.trace_lines.push_back(std::format("dispatch {} {} {} threads {} {} {} cs {:x}", b[0], b[1], b[2], sh[0x207], sh[0x208], sh[0x209], addr));
     if (draw_seq++ > stats.stop) return;
     draw_rts.clear(), reads.clear(), twins.clear();
+    if (!Identify(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], false, prep))
+        return stores.clear(), Count(stats.skipped), Note("dispatch without CS skipped");
+    if (!stats.trace && prep.linear_copy && TryLinearCopyDispatch(b, cpu)) return;
     std::vector<u32> table;
     u64 unused = 0;
     dispatching = true;
-    const ShaderRef cs = Shader(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], unused, false, table);
+    const ShaderRef cs = Shader(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], unused, false, table, 0, true);
     dispatching = false;
     if (!cs) return stores.clear(), Count(stats.skipped), Note("dispatch without CS skipped");
     const u64 n = table.size() * 4, at = TableAt(n, table_align);
@@ -1261,12 +1264,16 @@ void Renderer::Impl::RecordBlocks(u32 rec) {
 }
 
 void Renderer::Impl::Retire() {
-    if (!flight.busy) return;
+    if (!flight.busy) {
+        DrainRetiredElements();
+        return;
+    }
     const auto temp_t0 = DiagNow();
     temp_call = "fence", TempLost("fence", vkWaitForFences(dev, 1, &flight.fence, VK_TRUE, ~0ull)), temp_call = nullptr;
     GOW3_DIAG temp_fence_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - temp_t0).count();
     vkResetFences(dev, 1, &flight.fence);
     flight.busy = false;
+    DrainRetiredElements();
     query_counts.assign(flight.queries, 0);  // what the next Submit writes into its query blocks
     if (flight.queries)
         vkGetQueryPoolResults(dev, query_pool, flight.slot * kQueries, flight.queries, flight.queries * 8, query_counts.data(), 8, VK_QUERY_RESULT_64_BIT);
@@ -1385,14 +1392,15 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     // for a few frames go now: a failed allocation skips its texture, upload or copy (stale or garbage images).
     if (const u32 pressed = r.PressureAge(); r.frame % 64 == 0 || r.evict_soon || pressed)
         Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] {
-            if (!r.evict_soon) return r.EvictTextures(pressed ? pressed : 64);
+            if (!r.evict_soon) return r.EvictTextures(pressed ? pressed : 64, false, pressed ? Impl::TempEvict::Pressure : Impl::TempEvict::Age64);
             const u32 cap = r.evict_binding >= kStorageBinding ? kStorage : kTextures;
-            for (u32 age : {16u, 4u, 1u})
-                if (r.EvictTextures(age), r.free_elements[r.evict_binding].size() >= cap / 8) break;
-            if (pressed) r.EvictTextures(pressed);
+            if (r.free_elements[r.evict_binding].size() < cap / 8)
+                for (u32 age : {16u, 4u, 1u})
+                    if (r.EvictTextures(age, false, Impl::TempEvict::Bindless), r.free_elements[r.evict_binding].size() >= cap / 8) break;
+            if (pressed) r.EvictTextures(pressed, false, Impl::TempEvict::Pressure);
         }), r.evict_soon = false;
-    if (r.frame % 16 == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
-    if (r.regrow) r.Retire(), Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
+    if (r.frame % 128 == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
+    if (r.regrow) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
     if (r.stats.trace) r.BeginTraceProbes();
     // Guest ranges the CPU wrote since the last frame, and the last frame's GPU writes: textures over them are uploaded again.
     r.dirty.clear();
@@ -1410,6 +1418,9 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     r.dirty.resize(merged);
     for (auto [lo, hi] : r.dirty)
         for (u64 p = lo >> 12, end = std::min((hi + 0xFFF) >> 12, Impl::kPieces); p < end; ++p) r.staged_table.get()[p] = r.frame;
+    for (const auto& w : r.last_writes)
+        if (!w.lazy && !w.by)
+            for (u64 p = w.lo >> 12, end = std::min((w.hi + 0xFFF) >> 12, Impl::kPieces); p < end; ++p) r.staged_table.get()[p] = r.frame;
     // Targets whose memory the CPU rewrote, and single-sampled ones a texture's storage write went over: textures again
     // until drawn again (`rendered` ~0u). A base leaves `target_at` with its last drawn target.
     if (!r.target_at.empty() && (!r.dirty.empty() || !r.last_writes.empty())) {
