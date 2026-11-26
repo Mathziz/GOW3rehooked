@@ -811,6 +811,16 @@ void Renderer::Impl::AotBuild() {
     give_hot();  // again, with the binaries this build made
     if (caps.path != ShaderPath::Objects) SavePipelineCache();
     cache.Finish();
+    // The game waited for the build, so the WADs it opened meanwhile warmed their shaders but not their pipelines (the WAD
+    // thread warms those only from here on): made now, before the first frames draw with them.
+    if (caps.path != ShaderPath::Objects) {
+        const auto warm_start = std::chrono::steady_clock::now();
+        const auto made = [&] { std::shared_lock lock(prog_lock); return pipelines.size(); };
+        const size_t before = made();
+        WarmPipelines();
+        Say("AOT: %zu pipelines made for the first frames (%.1f s)\n", made() - before,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_start).count());
+    }
     Say("AOT: done (%.1f s)\n", seconds());
 }
 } // namespace Gpu
