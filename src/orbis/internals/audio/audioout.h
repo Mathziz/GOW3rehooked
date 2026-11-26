@@ -124,6 +124,8 @@ struct PortOut {
     void* output_buffer = nullptr;
     std::condition_variable_any output_cv;
     bool output_ready = false;
+    bool externally_paced = false;
+    bool follower_ready = false;
     bool closing = false;
     Kernel::Thread output_thread{};
 

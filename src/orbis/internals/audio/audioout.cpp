@@ -189,6 +189,7 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
     while (true) {
         timer.Start();
         Gow3::GpuThread::TraceAudioFlow(7, (u64)port.get(), timer.GetTotalWait().count());
+        bool parked = false;
 
         {
             std::unique_lock lock{port->mutex};
@@ -197,9 +198,22 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                 break;
             }
 
+            // Follower ports in sceAudioOutOutputs are paced by the leader port's cadence.
+            // Park until the port closes or receives independent sceAudioOutOutput calls.
+            if (!port->output_ready && port->externally_paced) {
+                parked = true;
+                port->output_cv.wait(lock, [&] {
+                    return port->output_ready || !port->externally_paced || port->closing ||
+                           stop.stop_requested();
+                });
+                if (!port->impl || port->closing || stop.stop_requested()) {
+                    break;
+                }
+            }
+
             // An owed block runs right after the previous one, before the game can mix the next,
             // so wait up to a period for it instead of letting the owed tick pass empty.
-            if (!port->output_ready && timer.GetTotalWait() < -period / 2) {
+            if (!parked && !port->output_ready && timer.GetTotalWait() < -period / 2) {
                 const bool woken = port->output_cv.wait_for(lock, period, [&] {
                     return port->output_ready || port->closing || stop.stop_requested();
                 });
@@ -228,7 +242,11 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
             break;
         }
 
-        timer.End();
+        if (parked) {
+            timer.Reset();
+        } else {
+            timer.End();
+        }
     }
 
     {
@@ -443,6 +461,7 @@ s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
         std::unique_lock port_lock{port->mutex};
         port->closing = true;
         port->output_ready = false;
+        port->follower_ready = false;
     }
     port->output_cv.notify_all();
 
@@ -607,6 +626,12 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
+        port->externally_paced = false;
+        if (port->follower_ready && port->impl) {
+            port->impl->Output(port->output_buffer);
+            port->follower_ready = false;
+            port->last_output_time = Kernel::sceKernelGetProcessTime();
+        }
         port->output_cv.wait(lock, [&] { return !port->output_ready || port->closing; });
 
         if (port->closing) {
@@ -653,9 +678,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
     }
 
     SmallVector<std::shared_ptr<PortOut>, 8> ports;
-    SmallVector<std::unique_lock<std::mutex>, 8> locks;
     ports.reserve(num);
-    locks.reserve(num);
 
     u32 buffer_frames = 0;
 
@@ -698,9 +721,6 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
             }
 
             ports.push_back(port);
-            Gow3::GpuThread::TraceAudioFlow(3, (u64)port.get());
-            locks.emplace_back(port->mutex);
-            Gow3::GpuThread::TraceAudioFlow(4, (u64)port.get());
 
             // Check consistent buffer size
             if (i == 0) {
@@ -712,25 +732,60 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         }
     }
 
-    // Wait for all ports to be ready
-    for (u32 i = 0; i < num; i++) {
-        Gow3::GpuThread::TraceAudioFlow(5, (u64)ports[i].get(), ports[i]->output_ready);
-        ports[i]->output_cv.wait(locks[i],
-                                 [&] { return !ports[i]->output_ready || ports[i]->closing; });
-        Gow3::GpuThread::TraceAudioFlow(6, (u64)ports[i].get());
-
-        if (ports[i]->closing) {
+    // Pace the batch from the leader port only, so out-of-phase follower timers (e.g. PadSpk)
+    // never block the leader's mutex or shrink the main audio budget.
+    {
+        auto& leader = ports[0];
+        Gow3::GpuThread::TraceAudioFlow(3, (u64)leader.get());
+        std::unique_lock lock{leader->mutex};
+        Gow3::GpuThread::TraceAudioFlow(4, (u64)leader.get());
+        leader->externally_paced = false;
+        if (leader->follower_ready && leader->impl) {
+            leader->impl->Output(leader->output_buffer);
+            leader->follower_ready = false;
+            leader->last_output_time = Kernel::sceKernelGetProcessTime();
+        }
+        Gow3::GpuThread::TraceAudioFlow(5, (u64)leader.get(), leader->output_ready);
+        leader->output_cv.wait(lock, [&] { return !leader->output_ready || leader->closing; });
+        Gow3::GpuThread::TraceAudioFlow(6, (u64)leader.get());
+        if (leader->closing) {
             LOG_DEBUG(Lib_AudioOut, "Port closed while waiting for drain");
             return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
         }
+        if (param[0].ptr != nullptr) {
+            std::memcpy(leader->output_buffer, param[0].ptr, leader->BufferSize());
+            leader->output_ready = true;
+        }
     }
+    ports[0]->output_cv.notify_all();
 
-    // Copy data to all ports
-    for (u32 i = 0; i < num; i++) {
+    // Flush each follower's previous block on the leader's tick and stage the new block.
+    for (u32 i = 1; i < num; i++) {
+        auto& follower = ports[i];
+        Gow3::GpuThread::TraceAudioFlow(3, (u64)follower.get());
+        std::unique_lock lock{follower->mutex};
+        Gow3::GpuThread::TraceAudioFlow(4, (u64)follower.get());
+        if (follower->output_ready) {
+            Gow3::GpuThread::TraceAudioFlow(5, (u64)follower.get(), follower->output_ready);
+            follower->output_cv.wait(lock,
+                                     [&] { return !follower->output_ready || follower->closing; });
+            Gow3::GpuThread::TraceAudioFlow(6, (u64)follower.get());
+        }
+        if (follower->closing || !follower->impl) {
+            LOG_DEBUG(Lib_AudioOut, "Port closed while waiting for drain");
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+        }
+        follower->externally_paced = true;
+        if (follower->follower_ready) {
+            Gow3::GpuThread::TraceAudioFlow(9, (u64)follower.get());
+            follower->impl->Output(follower->output_buffer);
+            Gow3::GpuThread::TraceAudioFlow(10, (u64)follower.get());
+            follower->follower_ready = false;
+            follower->last_output_time = Kernel::sceKernelGetProcessTime();
+        }
         if (param[i].ptr != nullptr) {
-            std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
-            ports[i]->output_ready = true;
-            ports[i]->output_cv.notify_all();
+            std::memcpy(follower->output_buffer, param[i].ptr, follower->BufferSize());
+            follower->follower_ready = true;
         }
     }
 
