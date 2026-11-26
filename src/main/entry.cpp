@@ -113,6 +113,14 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
         }
         const auto app = PreparePortDirectory(game);
         log_path = app / "gow3.log";
+        // The processes this one starts again (after a crash, a settings change) get no --debug: the variable carries the mode.
+        if (DebugEnabled()) {
+#ifdef _WIN32
+            SetEnvironmentVariableA("GOW3_DEBUG", DebugLevel() == 2 ? "2" : "1");
+#else
+            setenv("GOW3_DEBUG", DebugLevel() == 2 ? "2" : "1", 1);
+#endif
+        }
         if (DebugEnabled()) FlushLog(log_path); // debug lines are written through from here on
         if (DebugEnabled()) Log(std::format("GOW3 Orbis runtime initialization; debug mode {}", DebugLevel()));
 #ifdef _WIN32
