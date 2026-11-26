@@ -581,9 +581,20 @@ void Renderer::Impl::AotBuild() {
         std::atomic<u32> pl_cached{0}, pl_compiled{0}, pl_skipped{0}, pl_failed{0};
         std::atomic<size_t> wad_compiled{0};
 
+        // A compute pipeline the renderer already holds (made ready for an open WAD) is not asked of the driver again: the Intel
+        // UHD 620 driver (101.2145) crashes looking up a pipeline while one made from the same cache entry is alive.
+        std::unordered_set<u64> held;
+        {
+            std::shared_lock lock(prog_lock);
+            for (const auto& [k, ref] : shaders)
+                if (ref.pl) held.insert(cache.ContentOf(k));
+        }
+        held.erase(0);
         parallel(compute_keys.size(), [&](size_t i) {
             const u64 key = compute_keys[i];
-            if (const auto hit = cache.Find(key); hit && !hit->spirv.empty()) {
+            if (held.contains(cache.ContentOf(key))) {
+                ++cs_cached;
+            } else if (const auto hit = cache.Find(key); hit && !hit->spirv.empty()) {
                 VkPipeline pl = caps.cache_control ? CreateComputePipeline(hit->spirv, true) : VK_NULL_HANDLE;
                 if (pl) {
                     vkDestroyPipeline(dev, pl, nullptr);
