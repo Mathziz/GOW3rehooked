@@ -34,6 +34,9 @@ constexpr u64 VOLUME_CHECK_INTERVAL_US = 50000; // Check every 50ms
 
 // Queue management
 constexpr u32 QUEUE_MULTIPLIER = 4;
+constexpr u32 CUSHION_WARMUP_OUTPUTS = 16;   // Ignore startup underruns (~85 ms at 5.33 ms/block)
+constexpr u32 MAX_CUSHION_BLOCKS = 3;        // Cap adaptive jitter cushion at +16 ms (256-frame blocks)
+constexpr u32 CUSHION_DECAY_OUTPUTS = 1875;  // Reclaim a cushion block on silence after ~10 s clean
 // Memory alignment for SIMD
 constexpr size_t AUDIO_BUFFER_ALIGNMENT = 32;
 
@@ -56,7 +59,7 @@ enum ChannelPos : u8 {
 class SDLPortBackend : public PortBackend {
 public:
     explicit SDLPortBackend(const PortOut& port)
-        : frame_size(port.format_info.FrameSize()), guest_buffer_size(port.BufferSize()),
+        : frame_size(port.format_info.FrameSize()),
           buffer_frames(port.buffer_frames), sample_rate(port.sample_rate),
           num_channels(port.format_info.num_channels), is_float(port.format_info.is_float),
           is_std(port.format_info.is_std), channel_layout(port.format_info.channel_layout) {
@@ -90,11 +93,34 @@ public:
                                           queue_threshold, internal_buffer_size, sample_rate, num_channels);
         }
 
-        if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
+        const u32 current_output = output_count++;
+        if ((current_output & 0xF) == 0) { // Check every 16 outputs
             ManageAudioQueue();
         }
 
-        if (!SDL_PutAudioStreamData(stream, internal_buffer, internal_buffer_size)) [[unlikely]] {
+        const u32 cur_underruns = underrun_count.load(std::memory_order_relaxed);
+        bool skip_silent_block = false;
+        if (current_output < CUSHION_WARMUP_OUTPUTS) {
+            seen_underruns = cur_underruns;
+        } else if (cur_underruns != seen_underruns) {
+            seen_underruns = cur_underruns;
+            stable_outputs = 0;
+            if (cushion_blocks < MAX_CUSHION_BLOCKS) {
+                if (!silence_buffer) {
+                    silence_buffer = std::make_unique<u8[]>(internal_buffer_size);
+                }
+                SDL_PutAudioStreamData(stream, silence_buffer.get(), internal_buffer_size);
+                ++cushion_blocks;
+            }
+        } else if (cushion_blocks > 0 && ++stable_outputs >= CUSHION_DECAY_OUTPUTS &&
+                   IsSilentBlock()) {
+            --cushion_blocks;
+            stable_outputs = 0;
+            skip_silent_block = true;
+        }
+
+        if (!skip_silent_block &&
+            !SDL_PutAudioStreamData(stream, internal_buffer, internal_buffer_size)) [[unlikely]] {
             LOG_ERROR(Lib_AudioOut, "Failed to output to SDL audio stream: {}", SDL_GetError());
         }
 
@@ -180,6 +206,7 @@ private:
 
     void Cleanup() {
         if (stream) {
+            SDL_SetAudioStreamGetCallback(stream, nullptr, nullptr);
             SDL_DestroyAudioStream(stream);
             stream = nullptr;
         }
@@ -221,6 +248,25 @@ private:
         }
     }
 
+    static void SDLCALL StreamGetCallback(void* userdata, SDL_AudioStream*, int additional_amount,
+                                          int) {
+        if (additional_amount > 0) {
+            static_cast<SDLPortBackend*>(userdata)->underrun_count.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+
+    bool IsSilentBlock() const {
+        const auto* samples = static_cast<const float*>(internal_buffer);
+        const u32 count = internal_buffer_size / sizeof(float);
+        for (u32 i = 0; i < count; ++i) {
+            if (std::abs(samples[i]) > 1e-6f) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void ManageAudioQueue() {
         const auto queued = SDL_GetAudioStreamQueued(stream);
 
@@ -228,6 +274,9 @@ private:
             LOG_DEBUG(Lib_AudioOut, "Clearing backed up audio queue ({} >= {})", queued,
                       queue_threshold);
             SDL_ClearAudioStream(stream);
+            cushion_blocks = 0;
+            stable_outputs = 0;
+            seen_underruns = underrun_count.load(std::memory_order_relaxed);
             CalculateQueueThreshold();
         }
     }
@@ -292,6 +341,9 @@ private:
         if (!SDL_SetAudioStreamGain(stream, initial_gain)) {
             LOG_WARNING(Lib_AudioOut, "Failed to set initial audio gain: {}", SDL_GetError());
         }
+
+        // Detect true host underruns without polling queue depth.
+        SDL_SetAudioStreamGetCallback(stream, &StreamGetCallback, this);
 
         // Start playback
         if (!SDL_ResumeAudioStreamDevice(stream)) {
@@ -474,8 +526,10 @@ private:
             LOG_WARNING(Lib_AudioOut, "Failed to get SDL buffer size: {}", SDL_GetError());
         }
 
-        const u32 sdl_buffer_size = sdl_buffer_frames * sizeof(float) * num_channels;
-        queue_threshold = std::max(guest_buffer_size, sdl_buffer_size) * QUEUE_MULTIPLIER;
+        const u32 stream_channels = ps4_downmix ? 2u : num_channels;
+        const u32 sdl_buffer_size =
+            static_cast<u32>(std::max(sdl_buffer_frames, 0)) * sizeof(float) * stream_channels;
+        queue_threshold = std::max(internal_buffer_size, sdl_buffer_size) * QUEUE_MULTIPLIER;
 
         LOG_DEBUG(Lib_AudioOut, "Audio queue threshold: {} bytes (SDL buffer: {} frames)",
                   queue_threshold, sdl_buffer_frames);
@@ -605,7 +659,6 @@ private:
 
     // Audio format parameters
     const u32 frame_size;
-    const u32 guest_buffer_size;
     const u32 buffer_frames;
     const u32 sample_rate;
     const u32 num_channels;
@@ -634,6 +687,13 @@ private:
     // SDL audio stream
     SDL_AudioStream* stream{nullptr};
     u32 queue_threshold{0};
+
+    // Adaptive jitter cushion (0 ms on underrun-free systems)
+    std::atomic<u32> underrun_count{0};
+    u32 seen_underruns{0};
+    u32 cushion_blocks{0};
+    u32 stable_outputs{0};
+    std::unique_ptr<u8[]> silence_buffer;
 };
 
 std::unique_ptr<PortBackend> SDLAudioOut::Open(PortOut& port) {
