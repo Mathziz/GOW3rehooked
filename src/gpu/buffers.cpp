@@ -339,17 +339,22 @@ const u8* Renderer::Impl::Stage(u64 addr, const u8* src, u64 n, u64* hash) {
 void Renderer::Impl::RecordSend(VkCommandBuffer c) {
     if (!use_stage_dev) return;
     std::vector<VkBufferCopy> copies;
-    for (size_t i = sent, j; i < pending.size(); i = j) {
-        for (j = i; j < pending.size() && pending[j].chunk == pending[i].chunk;) ++j;
-        copies.clear();
-        for (size_t k = i; k < j; ++k) {
-            const auto& p = pending[k];
-            if (!copies.empty() && copies.back().srcOffset + copies.back().size == p.src) copies.back().size += p.size;
-            else copies.push_back({p.src, p.src, p.size});
+    auto send_span = [&](std::span<const Pending> src) {
+        for (size_t i = 0, j; i < src.size(); i = j) {
+            for (j = i; j < src.size() && src[j].chunk == src[i].chunk;) ++j;
+            copies.clear();
+            for (size_t k = i; k < j; ++k) {
+                const auto& p = src[k];
+                if (!copies.empty() && copies.back().srcOffset + copies.back().size == p.src) copies.back().size += p.size;
+                else copies.push_back({p.src, p.src, p.size});
+            }
+            vkCmdCopyBuffer(c, stage[src[i].chunk].buf, stage_dev[src[i].chunk].buf, (u32)copies.size(), copies.data());
         }
-        vkCmdCopyBuffer(c, stage[pending[i].chunk].buf, stage_dev[pending[i].chunk].buf, (u32)copies.size(), copies.data());
-    }
+    };
+    send_span(std::span(pending).subspan(sent));
     sent = pending.size();
+    send_span(stage_sends);
+    stage_sends.clear();
 }
 
 void Renderer::Impl::Send() {
@@ -557,7 +562,7 @@ u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
     u64 rb_total = 0;
     if (readback)
         for (auto& w : gpu_writes)  // a write left in its image has not reached the mirror (tiled: the CPU does not read it)
-            if (!w.lazy) {
+            if (!w.lazy && !w.guest_synced) {
 #ifndef GOW3_OFFLINE
                 // The game's 4K Video image is rendered and sampled on the GPU.
                 const bool video_output = Gow3::GpuThread::IsVideoOutput(w.lo, w.hi - w.lo);
@@ -1069,6 +1074,42 @@ u64 Store(u64 addr, const void* data, u64 size) {
 }
 
 char PageKind(u64 addr) { return addr / kPage < kPages ? "UCDYFR"[KindOf(addr / kPage)] : '?'; }
+
+bool AllUnknown(u64 lo, u64 hi) {
+    if (hi <= lo) return true;
+    const u64 p0 = lo / kPage, p1 = (hi + kPage - 1) / kPage;
+    if (p1 > kPages) return false;
+    for (u64 p = p0; p < p1; ++p)
+        if (KindOf(p) != Unknown) return false;
+    return true;
+}
+
+bool HasBacking(u64 lo, u64 hi) {
+    if (hi <= lo || ((hi - 1) >> 40)) return false;
+    constexpr u64 kBacking = 0x4000;
+    const auto& backing = Core::Memory::Instance()->GetAddressSpace().BackingPages();
+    for (u64 p = lo / kBacking, end = (hi - 1) / kBacking; p <= end; ++p) {
+        const auto* e = backing.find(p);
+        if (!e || !*e) return false;
+    }
+    return true;
+}
+
+u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash) {
+    if (!size) return 0;
+    constexpr u64 kBacking = 0x4000;
+    const auto& backing = Core::Memory::Instance()->GetAddressSpace().BackingPages();
+    const u8* s = static_cast<const u8*>(src);
+    u64 out_hash = 0;
+    for (u64 o = 0; o < size;) {
+        const u64 a = dst + o, n = std::min(kBacking - (a & (kBacking - 1)), size - o);
+        u8* p = *backing.find(a / kBacking) + (a & (kBacking - 1));
+        if (hash && size == n) out_hash = Gpu::PieceHash::Copy(p, s + o, n);
+        else std::memcpy(p, s + o, n);
+        o += n;
+    }
+    return out_hash ? out_hash : (hash ? Gpu::PieceHash::Hash(src, size) : 0);
+}
 
 bool Readable(u64 addr, u64 size) {
     if (!size) return true;

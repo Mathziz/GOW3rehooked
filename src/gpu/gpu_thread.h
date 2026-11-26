@@ -35,6 +35,7 @@ void TraceDecodedVideo(u64 address, u32 width, u32 height, u64 tag);
 u64 VideoFrameVersion(u64 address);
 void ResetVideoFrameVersions();
 bool IsVideoOutput(u64 address, u64 size);
+bool InTextureHeap(u64 lo, u64 hi);
 bool CinematicActive();
 
 // ---- Frame timing recorder & video/audio trace (debug/frame_recorder.cpp, debug/video_trace.cpp) ----

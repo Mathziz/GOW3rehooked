@@ -565,6 +565,15 @@ bool IsVideoOutput(u64 address, u64 size) {
            VideoVersions::Serial(base);
 }
 
+bool InTextureHeap(u64 lo, u64 hi) {
+    const auto* eboot = Common::Singleton<Core::Linker>::Instance()->GetModule(0);
+    if (!eboot || hi <= lo) return false;
+    const u64 delta = eboot->GetBaseAddress() - kGhidraBase;
+    const u64 base = *reinterpret_cast<const u64*>(delta + 0x024f7228);
+    const u32 size = *reinterpret_cast<const u32*>(delta + 0x024f7234);
+    return base && size && lo >= base && hi <= base + size;
+}
+
 bool CinematicActive() { return cinematic_active.load(std::memory_order_acquire); }
 
 } // namespace Gow3::GpuThread

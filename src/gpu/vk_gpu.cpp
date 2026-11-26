@@ -1365,7 +1365,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkResetCommandBuffer(r.primary, 0);
     vkBeginCommandBuffer(r.primary, &bi);
-    r.cmd = r.primary, r.tables_used = 0, r.draw_seq = 0, r.dyn = {}, Impl::hz.Reset(), Impl::pass_w.clear();
+    r.cmd = r.primary, r.tables_used = 0, r.draw_seq = 0, r.dyn = {}, r.lin_syncs.clear(), r.stage_sends.clear(), Impl::hz.Reset(), Impl::pass_w.clear();
     for (auto& w : r.recorders) vkResetCommandPool(r.dev, w.pool[r.slot], 0), w.used[r.slot] = 0;
     ++r.frame;
     GOW3_DIAG Impl::temp_bars[0] = Impl::temp_bars[1] = 0;
@@ -1399,7 +1399,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
                     if (r.EvictTextures(age, false, Impl::TempEvict::Bindless), r.free_elements[r.evict_binding].size() >= cap / 8) break;
             if (pressed) r.EvictTextures(pressed, false, Impl::TempEvict::Pressure);
         }), r.evict_soon = false;
-    if (r.frame % 128 == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
+    if (r.frame % (r.Pressed() ? 32 : 128) == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
     if (r.regrow) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
     if (r.stats.trace) r.BeginTraceProbes();
     // Guest ranges the CPU wrote since the last frame, and the last frame's GPU writes: textures over them are uploaded again.
@@ -1635,6 +1635,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         Impl::Barrier(r.primary);  // the next frame starts after this one (its prologue fences only its own uploads)
         r.gpu_writes.insert(r.gpu_writes.end(), r.block_writes.begin(), r.block_writes.end()), r.block_writes.clear();
     }
+    r.FlushLinearSyncs();
     for (auto& [op, u] : unhandled)  // once per opcode (first frame that has it)
         if (const std::string tag = std::format("PM4 op {:#x} ", op);
             std::none_of(r.stats.notes.begin(), r.stats.notes.end(), [&](const std::string& n) { return n.starts_with(tag); }))

@@ -359,6 +359,7 @@ struct Renderer::Impl {
         u32 chunk;
     };
     std::vector<Pending> pending;
+    std::vector<Pending> stage_sends;  // extra staging slices copied by RecordSend to stage_dev, not flushed via pending
     size_t sent = 0;  // pending entries already copied to their chunk's VRAM twin (Send)
     u32 stage_at = 0;
     u64 stage_used = 0;
@@ -538,6 +539,7 @@ struct Renderer::Impl {
         bool foreign = false;  // read through another layout once: its writes go back to the mirror at once
         bool growing = false;  // its image grew this frame: the same until Regrow
         u32 current = ~0u;     // the last frame a T# as big as its image was checked: the image holds the CPU writes staged until then
+        u32 valid_frame = ~0u, valid_w = 0, valid_h = 0;  // top-left [0..valid_w) x [0..valid_h) current as of valid_frame
         Views views;           // its T#s' (PruneSurfaceViews drops those of images none of them holds)
     };
     std::map<std::tuple<u64, u32, u32, u32, u32, u32, u32>, Surface> surfaces;  // base, tile, bits, pitch, layers, levels, extent if mipped
@@ -635,6 +637,9 @@ struct Renderer::Impl {
         u64 evicted_bytes[5]{}, evicted_count[5]{};    // indexed by TempEvict (1..4)
         u64 compact_runs = 0, regrow_runs = 0, regrow_moved = 0, regrow_mipviews = 0, deferred_elements = 0;
         u64 lin_copy_hits = 0, lin_copy_bytes = 0, lin_copy_fallbacks = 0;
+        u64 lin_copy_cpu_hits = 0, lin_copy_cpu_bytes = 0;
+        u64 lin_copy_stage_hits = 0, lin_copy_stage_bytes = 0;
+        u64 lin_copy_norb_hits = 0, lin_copy_norb_bytes = 0;
         std::vector<TempTopFresh> top_fresh;
     } temp_mem;
     std::unordered_map<u64, TempEvictedEntry> temp_evicted;
@@ -657,7 +662,8 @@ struct Renderer::Impl {
     struct GpuWrite {
         u64 lo, hi, seq;
         GuestTex* by;
-        bool lazy = false;  // left in its image (WriteBack): the mirror gets it only through Materialize
+        bool lazy = false;          // left in its image (WriteBack): the mirror gets it only through Materialize
+        bool guest_synced = false;  // guest RAM and WrittenSlot already match mirror (RecordReadback skips it)
     };
     std::vector<GpuWrite> gpu_writes;  // this frame
     std::vector<GpuWrite> last_writes;  // the last frame's: textures over them in another image are uploaded again
@@ -1253,6 +1259,10 @@ struct Renderer::Impl {
     void Draw(u32 op, const u32* b, const CpuRead& cpu);
     void Dispatch(const u32* b, const CpuRead& cpu);
     bool TryLinearCopyDispatch(const u32* b, const CpuRead& cpu);
+    struct LinSync { u64 dst, src, size; };
+    std::vector<LinSync> lin_syncs;  // deferred BackingPages syncs when unrecorded parallel blocks precede a linear copy
+    void SyncLinearBacking(u64 dst_lo, u64 src_lo, u64 copy_bytes);
+    void FlushLinearSyncs();
 
     // ---- Diagnostics: stats, notes, traced probes and exploded vertices (vk_gpu.cpp) ----
     Stats stats;

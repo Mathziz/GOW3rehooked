@@ -1881,11 +1881,12 @@ void Renderer::Impl::CompactImageBlocks() {
     // Integrated GPUs, or a discrete one at its VRAM budget: otherwise a discrete GPU's idle blocks take no system RAM.
     if (!uma_single_heap && !uma_budget && !budget_pressure) return;
     constexpr u64 kBudget = 32ull << 20;  // texture bytes moved per call
+    const bool pressed = Pressed();
     const auto idle = [](const ImageBlock& b) { VkDeviceSize n = 0; for (auto& [lo, s] : b.free) n += s; return n; };
     const auto candidate = [&](const ImageBlock& b) { const VkDeviceSize used = image_block_size - idle(b); return !b.lasting && !b.draining && used > 0 && used <= image_block_size / 4; };
     {
         std::scoped_lock lock(image_lock);
-        if (image_free[0] < 2 * image_block_size || !std::any_of(image_blocks.begin(), image_blocks.end(), candidate)) return;
+        if (image_free[0] < (pressed ? 2 : 4) * image_block_size || !std::any_of(image_blocks.begin(), image_blocks.end(), candidate)) return;
     }
     // Textures whose content may exist only in their image (a GPU write not in guest memory yet) stay.
     std::unordered_set<const GuestTex*> written;
@@ -1899,17 +1900,22 @@ void Renderer::Impl::CompactImageBlocks() {
     for (auto& [h, g] : textures)
         if (g.surf) surf_ok.try_emplace(g.surf, !g.surf->growing).first->second &= !written.contains(&g);
     std::unordered_map<VkDeviceMemory, u64> movable;  // bytes of the images that can move, per block memory
+    std::unordered_set<VkDeviceMemory> hot_blocks;    // blocks with recently checked textures (kept unless pressed or <= 1/8 full)
     std::unordered_set<VkImage> counted;              // a surface's image counts once
-    for (auto& [h, g] : textures)
+    for (auto& [h, g] : textures) {
+        if (!pressed && g.t.img && g.t.mem_size && g.checked != ~0u && frame - g.checked <= 16)
+            hot_blocks.insert(g.t.mem);
         if (g.t.img && g.t.mem_size && (g.surf ? surf_ok[g.surf] : !written.contains(&g)) && counted.insert(g.t.img).second)
             movable[g.t.mem] += g.t.mem_size;
+    }
     std::vector<VkDeviceMemory> taken;
     {
         std::scoped_lock lock(image_lock);
         std::vector<std::pair<VkDeviceSize, ImageBlock*>> picks;  // emptiest first
         for (auto& b : image_blocks) {
             const VkDeviceSize used = image_block_size - idle(b);
-            if (candidate(b) && movable[b.mem] == used) picks.push_back({used, &b});  // every byte in it can move: it really empties
+            if (candidate(b) && movable[b.mem] == used && (pressed || used <= image_block_size / 8 || !hot_blocks.contains(b.mem)))
+                picks.push_back({used, &b});  // every byte in it can move: it really empties
         }
         std::sort(picks.begin(), picks.end(), [](auto& x, auto& y) { return x.first < y.first; });
         u64 moved = 0;
@@ -2331,7 +2337,8 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
     if (!cur || g.w > s->w || g.h > s->h || (cube_ok && !s->cube)) {
         // A bigger image: this T# takes it now, the surface's others at the next frame's start (Regrow).
         if (cur) regrow = s->growing = true;
-        s->w = std::max(s->w, g.w), s->h = std::max(s->h, g.h), s->cube |= cube_ok, s->current = ~0u;
+        s->w = std::max(s->w, g.w), s->h = std::max(s->h, g.h), s->cube |= cube_ok;
+        s->current = s->valid_frame = ~0u, s->valid_w = s->valid_h = 0;
         // Storage usage through a format of the same size when this one has none (MUTABLE + EXTENDED_USAGE).
         Tex* t = new Tex(MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, g.fmt, s->w, s->h, 1, g.layers, VK_SAMPLE_COUNT_1_BIT,
                                    usage | (storable ? VK_IMAGE_USAGE_STORAGE_BIT : 0), VK_IMAGE_ASPECT_COLOR_BIT, g.img_levels,
@@ -2345,9 +2352,13 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
         // The image is live (no layout change) and holds this part unless the CPU wrote it since the surface was last current.
         // GOW3's distortion grab passes copy the screen into one surface through a T# of another height each time (~6 a
         // frame in Rage of Sparta): each reloaded its ~13 MB part, written by the GPU only.
-        g.fresh = false, g.reload = s->current == ~0u;
+        u32 known = s->current;
+        if (g.w <= s->valid_w && g.h <= s->valid_h && s->valid_frame != ~0u && (known == ~0u || s->valid_frame > known))
+            known = s->valid_frame;
+        g.fresh = false, g.reload = known == ~0u;
         const u32* at = staged_table.get();
-        for (u64 p = g.base >> 12, end = std::min((g.base + g.size + 0xFFF) >> 12, kPieces); !g.reload && p < end; ++p) g.reload = at[p] > s->current;
+        for (u64 p = g.base >> 12, end = std::min((g.base + g.size + 0xFFF) >> 12, kPieces); !g.reload && p < end; ++p)
+            g.reload = at[p] > known;
     }
     g.shared = cur, g.t = *cur, g.surf = s, g.iw = s->w, g.ih = s->h, ++s->users;
     return true;
@@ -2363,7 +2374,7 @@ void Renderer::Impl::Regrow() {
         Surface& s = *g.surf;
         s.growing = false;
         const std::shared_ptr<Tex> cur = s.t.lock();
-        if (!cur) s.t = g.shared, s.img = g.shared ? g.shared->img : VK_NULL_HANDLE, s.w = g.iw, s.h = g.ih, s.current = ~0u;  // the grown image's T#s are gone: this one's is the surface's again
+        if (!cur) s.t = g.shared, s.img = g.shared ? g.shared->img : VK_NULL_HANDLE, s.w = g.iw, s.h = g.ih, s.current = s.valid_frame = ~0u, s.valid_w = s.valid_h = 0;  // the grown image's T#s are gone: this one's is the surface's again
         if (!cur || cur == g.shared || g.w > s.w || g.h > s.h || (!g.flat && (g.w != s.w || g.h != s.h))) continue;
         mipviews += g.owned.size();
         graves.views.insert(graves.views.end(), g.owned.begin(), g.owned.end());
@@ -2469,7 +2480,20 @@ void Renderer::Impl::Check(GuestTex& g) {
         }
         g.reload = false, g.temp_regrow_reload = false;
     }
-    if (g.surf && g.t.img == g.surf->img && g.w == g.surf->w && g.h == g.surf->h) g.surf->current = frame;
+    if (g.surf && g.t.img == g.surf->img) {
+        Surface& s = *g.surf;
+        if (g.w == s.w && g.h == s.h) {
+            s.current = s.valid_frame = frame, s.valid_w = s.w, s.valid_h = s.h;
+        } else if (s.valid_frame == ~0u || (g.w >= s.valid_w && g.h >= s.valid_h)) {
+            s.valid_frame = frame, s.valid_w = g.w, s.valid_h = g.h;
+        } else {
+            const u32* at = staged_table.get();
+            bool stale = false;
+            for (u64 p = g.base >> 12, end = std::min((g.base + g.size + 0xFFF) >> 12, kPieces); !stale && p < end; ++p)
+                stale = at[p] > s.valid_frame;
+            if (stale) s.valid_frame = frame, s.valid_w = g.w, s.valid_h = g.h;
+        }
+    }
     std::atomic_ref(g.checked).store(frame, std::memory_order_release);
 }
 
@@ -2792,7 +2816,7 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
             const u64 at = TableAt(sizeof(ti), 256);
             if (at == ~0ull) {
                 g->reload = true;
-                if (g->surf && g->t.img == g->surf->img) g->surf->current = ~0u;
+                if (g->surf && g->t.img == g->surf->img) g->surf->current = g->surf->valid_frame = ~0u, g->surf->valid_w = g->surf->valid_h = 0;
                 Note("draw tables full (tiling info)");
                 continue;
             }
@@ -2845,7 +2869,7 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
         if (j.scratch == ~0ull && !j.direct) continue;
         if (j.scratch != ~0ull && !dst_buf) {
             j.g->reload = true;
-            if (j.g->surf && j.g->t.img == j.g->surf->img) j.g->surf->current = ~0u;
+            if (j.g->surf && j.g->t.img == j.g->surf->img) j.g->surf->current = j.g->surf->valid_frame = ~0u, j.g->surf->valid_w = j.g->surf->valid_h = 0;
             continue;
         }
         GuestTex& g = *j.g;
@@ -3010,6 +3034,41 @@ void Renderer::Impl::WriteBack() {
     Barrier(cmd, !shared);
 }
 
+void Renderer::Impl::SyncLinearBacking(u64 dst_lo, u64 src_lo, u64 copy_bytes) {
+#ifndef GOW3_OFFLINE
+    InvalidateBlocks(dst_lo, copy_bytes);
+    const u8* src = reinterpret_cast<const u8*>(src_lo);
+    for (u64 o = 0; o < copy_bytes;) {
+        const u64 a = dst_lo + o, p_idx = a >> 12, page_addr = a & ~0xFFFull;
+        const u64 n = std::min<u64>(0x1000 - (a & 0xFFFull), copy_bytes - o);
+        if (n == 0x1000) {
+            const u64 h = Gow3::GuestMemory::CopyBacking(a, src + o, 0x1000, true);
+            if (p_idx < kPieces) written[p_idx] = h;
+        } else {
+            Gow3::GuestMemory::CopyBacking(a, src + o, n, false);
+            if (p_idx < kPieces) {
+                const char before = Gow3::GuestMemory::PageKind(page_addr);
+                if (written[p_idx] && (before == 'C' || before == 'F')) {
+                    const u64 h = PieceHash(reinterpret_cast<const u8*>(page_addr), 0x1000);
+                    const char after = Gow3::GuestMemory::PageKind(page_addr);
+                    written[p_idx] = (after == 'C' || after == 'F') ? h : 0;
+                } else {
+                    written[p_idx] = 0;
+                }
+            }
+        }
+        o += n;
+    }
+#else
+    (void)dst_lo, (void)src_lo, (void)copy_bytes;
+#endif
+}
+
+void Renderer::Impl::FlushLinearSyncs() {
+    for (const LinSync& s : lin_syncs) SyncLinearBacking(s.dst, s.src, s.size);
+    lin_syncs.clear();
+}
+
 bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
     Prepared& p = prep;
     auto fallback = [&]() -> bool {
@@ -3107,13 +3166,122 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
         if (has_lazy(lazy_writes) || has_lazy(gpu_writes) || has_lazy(own_writes)) return fallback();
     }
 
+    const u64 copy_bytes = (u64)copy_h * row_bytes;
+    const bool contiguous = copy_h == 1 || (copy_w == src.pitch && copy_w == dst.pitch);
+
+#ifndef GOW3_OFFLINE
+    auto over_writes = [&](const std::vector<GpuWrite>& list, u64 lo, u64 hi, bool unsynced_only) {
+        return std::any_of(list.begin(), list.end(), [&](const GpuWrite& w) {
+            return (!unsynced_only || !w.guest_synced) && w.lo < hi && w.hi > lo;
+        });
+    };
+    const bool can_sync_guest =
+        contiguous && !stats.trace && !boom_on && !in_worker &&
+        Gow3::GpuThread::InTextureHeap(src_lo, src_hi) && Gow3::GpuThread::InTextureHeap(dst_lo, dst_hi) &&
+        !(src_lo < marked_hi && marked_lo < src_hi) && !(dst_lo < marked_hi && marked_lo < dst_hi) &&
+        std::none_of(flight.back.begin(), flight.back.end(), [&](const VkBufferCopy& cf) {
+            const u64 clo = cf.srcOffset, chi = clo + cf.size;
+            return (clo < src_hi && chi > src_lo) || (clo < dst_hi && chi > dst_lo);
+        }) &&
+        !over_writes(gpu_writes, src_lo, src_hi, true) && !over_writes(gpu_writes, dst_lo, dst_hi, true) &&
+        !over_writes(last_writes, src_lo, src_hi, true) && !over_writes(last_writes, dst_lo, dst_hi, true) &&
+        !over_writes(own_writes, src_lo, src_hi, true) && !over_writes(own_writes, dst_lo, dst_hi, true) &&
+        Gow3::GuestMemory::Readable(src_lo, copy_bytes) && Gow3::GuestMemory::HasBacking(dst_lo, dst_hi);
+
+    if (can_sync_guest) {
+        const bool has_pending_parallel = std::any_of(blocks.begin(), blocks.end(), [](const Block& blk) { return !blk.serial; });
+        const bool src_in_lin_syncs = std::any_of(lin_syncs.begin(), lin_syncs.end(), [&](const LinSync& s) {
+            return s.dst < src_hi && src_lo < s.dst + s.size;
+        });
+        const bool src_unknown = !src_in_lin_syncs && Gow3::GuestMemory::AllUnknown(src_lo, src_hi);
+        auto over_dirty = [&](u64 lo, u64 hi) {
+            auto d = std::upper_bound(dirty.begin(), dirty.end(), std::pair{hi, 0ull});
+            return d != dirty.begin() && std::prev(d)->second > lo;
+        };
+
+        // Sub-case A: both src and dst are untracked (Unknown), no parallel blocks precede us, and dst has no mirror writes.
+        if (src_unknown && !has_pending_parallel && !over_dirty(dst_lo, dst_hi) && Gow3::GuestMemory::AllUnknown(dst_lo, dst_hi) &&
+            !over_writes(gpu_writes, dst_lo, dst_hi, false) && !over_writes(last_writes, dst_lo, dst_hi, false) &&
+            !over_writes(own_writes, dst_lo, dst_hi, false)) {
+            Gow3::GuestMemory::CopyBacking(dst_lo, reinterpret_cast<const void*>(src_lo), copy_bytes, false);
+            InvalidateBlocks(dst_lo, copy_bytes);
+            for (u64 pg = dst_lo >> 12, end = std::min((dst_hi + 0xFFF) >> 12, kPieces); pg < end; ++pg) staged_table.get()[pg] = frame;
+            if (temp_copylog)
+                std::fprintf(stderr, "COPY LIN-CPU %llx -> %llx %ux%u (%.2f MB)\n", (unsigned long long)src_lo, (unsigned long long)dst_lo, copy_w, copy_h,
+                             copy_bytes / 1048576.0);
+            GOW3_DIAG {
+                std::scoped_lock res(res_lock);
+                ++temp_mem.lin_copy_hits, temp_mem.lin_copy_bytes += copy_bytes;
+                ++temp_mem.lin_copy_cpu_hits, temp_mem.lin_copy_cpu_bytes += copy_bytes;
+            }
+            Count(stats.dispatches);
+            return true;
+        }
+
+        // Sub-case B: cold src (AllUnknown), dst already mirrored/tracked -> stage src directly for dst, sync BackingPages, skip readback.
+        if (src_unknown) {
+            Pending sp{};
+            {
+                std::scoped_lock lock(stage_lock);
+                sp = AllocateStage(copy_bytes);
+                if (sp.chunk != ~0u && use_stage_dev) stage_sends.push_back(sp);
+            }
+            if (sp.chunk != ~0u) {
+                std::memcpy(stage[sp.chunk].ptr + sp.src, reinterpret_cast<const void*>(src_lo), copy_bytes);
+                EndRendering();
+                BindPages(dst_lo, dst_hi);
+                Barrier(cmd);
+                const VkBufferCopy region{sp.src, dst_lo, copy_bytes};
+                vkCmdCopyBuffer(cmd, (use_stage_dev ? stage_dev : stage)[sp.chunk].buf, mirror, 1, &region);
+                Barrier(cmd);
+                const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
+                gpu_writes.push_back({dst_lo, dst_hi, seq, nullptr, false, true});
+                if (has_pending_parallel) lin_syncs.push_back({dst_lo, src_lo, copy_bytes});
+                else SyncLinearBacking(dst_lo, src_lo, copy_bytes);
+                if (temp_copylog)
+                    std::fprintf(stderr, "COPY LIN-STAGE %llx -> %llx %ux%u (%.2f MB)\n", (unsigned long long)src_lo, (unsigned long long)dst_lo, copy_w, copy_h,
+                                 copy_bytes / 1048576.0);
+                GOW3_DIAG {
+                    std::scoped_lock res(res_lock);
+                    ++temp_mem.lin_copy_hits, temp_mem.lin_copy_bytes += copy_bytes;
+                    ++temp_mem.lin_copy_stage_hits, temp_mem.lin_copy_stage_bytes += copy_bytes;
+                }
+                Count(stats.dispatches);
+                return true;
+            }
+        }
+
+        // Sub-case C: hot/mixed src -> mirror->mirror copy + BackingPages sync on dst, skip RecordReadback.
+        Track(src_lo, src_hi), NoteRead(src_lo, src_hi);
+        EndRendering();
+        BindPages(src_lo, src_hi), BindPages(dst_lo, dst_hi);
+        Barrier(cmd);
+        const VkBufferCopy region{src_lo, dst_lo, copy_bytes};
+        vkCmdCopyBuffer(cmd, mirror, mirror, 1, &region);
+        Barrier(cmd);
+        const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
+        gpu_writes.push_back({dst_lo, dst_hi, seq, nullptr, false, true});
+        if (has_pending_parallel) lin_syncs.push_back({dst_lo, src_lo, copy_bytes});
+        else SyncLinearBacking(dst_lo, src_lo, copy_bytes);
+        if (temp_copylog)
+            std::fprintf(stderr, "COPY LIN-NORB %llx -> %llx %ux%u (%.2f MB)\n", (unsigned long long)src_lo, (unsigned long long)dst_lo, copy_w, copy_h,
+                         copy_bytes / 1048576.0);
+        GOW3_DIAG {
+            std::scoped_lock res(res_lock);
+            ++temp_mem.lin_copy_hits, temp_mem.lin_copy_bytes += copy_bytes;
+            ++temp_mem.lin_copy_norb_hits, temp_mem.lin_copy_norb_bytes += copy_bytes;
+        }
+        Count(stats.dispatches);
+        return true;
+    }
+#endif
+
     Track(src_lo, src_hi), NoteRead(src_lo, src_hi);
     EndRendering();
     BindPages(src_lo, src_hi), BindPages(dst_lo, dst_hi);
     Barrier(cmd);
-    const u64 copy_bytes = (u64)copy_h * row_bytes;
     std::vector<VkBufferCopy> regions;
-    if (copy_h == 1 || (copy_w == src.pitch && copy_w == dst.pitch)) {
+    if (contiguous) {
         regions.push_back({src_lo, dst_lo, copy_bytes});
     } else {
         regions.reserve(copy_h);
@@ -3332,12 +3500,14 @@ std::vector<std::string> Renderer::FlushMemTelemetry() {
     if (ev_n || m.compact_runs || m.regrow_runs || m.deferred_elements || ded_n || m.lin_copy_hits || m.lin_copy_fallbacks || !m.top_fresh.empty()) {
         std::string line = std::format(
             "TEMP evict/regrow: evicted {:.1f}MB({}) [age64 {:.1f}/{} compact {:.1f}/{} press {:.1f}/{} bind {:.1f}/{}]; "
-            "compact {} regrow {} (moved {}, mipviews {}), deferred_el {}, ded-img-allocs {}/{:.1f}MB, lin-copy {:.1f}MB({}/fb {})",
+            "compact {} regrow {} (moved {}, mipviews {}), deferred_el {}, ded-img-allocs {}/{:.1f}MB, lin-copy {:.1f}MB({}/fb {} [cpu {:.1f}/{} stage {:.1f}/{} norb {:.1f}/{}])",
             ev_b * kMb, ev_n,
             m.evicted_bytes[1] * kMb, m.evicted_count[1], m.evicted_bytes[2] * kMb, m.evicted_count[2],
             m.evicted_bytes[3] * kMb, m.evicted_count[3], m.evicted_bytes[4] * kMb, m.evicted_count[4],
             m.compact_runs, m.regrow_runs, m.regrow_moved, m.regrow_mipviews, m.deferred_elements, ded_n, ded_bytes * kMb,
-            m.lin_copy_bytes * kMb, m.lin_copy_hits, m.lin_copy_fallbacks);
+            m.lin_copy_bytes * kMb, m.lin_copy_hits, m.lin_copy_fallbacks,
+            m.lin_copy_cpu_bytes * kMb, m.lin_copy_cpu_hits, m.lin_copy_stage_bytes * kMb, m.lin_copy_stage_hits,
+            m.lin_copy_norb_bytes * kMb, m.lin_copy_norb_hits);
         if (!m.top_fresh.empty()) {
             static constexpr const char* kBucket[]{"new", "age64", "compact", "press", "bind", "lin-src", "lin-dst"};
             std::sort(m.top_fresh.begin(), m.top_fresh.end(), [](const auto& a, const auto& b) { return a.bytes > b.bytes; });

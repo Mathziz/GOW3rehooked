@@ -22,4 +22,7 @@ bool Track(Gpu::Renderer& renderer, u64 lo, u64 hi);  // Renderer::SetTracker
 u64 Store(u64 addr, const void* data, u64 size);      // GPU readback into guest memory, returns piece hash
 bool Readable(u64 addr, u64 size);                    // committed and readable (descriptor and program reads)
 char PageKind(u64 addr);                              // U unknown, C clean, D dirty, Y dynamic, F fixed, R region (diagnostics)
+bool AllUnknown(u64 lo, u64 hi);                      // every 4 KB page in [lo, hi) is Unknown
+bool HasBacking(u64 lo, u64 hi);                      // every 16 KB backing page in [lo, hi) has a physical alias
+u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash = false);  // write via physical alias (caller verified HasBacking & Readable)
 } // namespace Gow3::GuestMemory
