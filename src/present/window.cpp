@@ -470,25 +470,37 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
                     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, Tr("Could not restart the game"), SDL_GetError(), window);
             }
         }
+        // The pointer: over the game it points at nothing. While a menu that takes the mouse is up (Controls and Extras, a
+        // prompt) it shows while the mouse moves and hides after 3 s still (a prompt keeps it). While playing, full screen
+        // keeps it hidden whatever the mouse does (its buttons can be bound to actions); a window shows it while the mouse
+        // moves, until 1.5 s still or the next key or button of the game. Decided by the window's focus, not by SDL's mouse
+        // focus: that one stays empty until the mouse first moves, and a pointer that never moved never went away.
         const bool prompt_active = reset_prompt || SaveImportUi::Active();
-        const bool mouse_inside = SDL_GetMouseFocus() == window;
+        const SDL_WindowFlags window_flags = SDL_GetWindowFlags(window);
+        const bool focused = (window_flags & SDL_WINDOW_INPUT_FOCUS) != 0;
+        const bool pointing = prompt_active || ImGui::Core::HasInteractiveLayers();
+        const Uint64 still_ms = pointing ? 3000 : (window_flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS)) ? 0 : 1500;
         const Uint64 elapsed = SDL_GetTicks() - mouse_time;
-        if (!prompt_active && mouse_inside && !mouse_hidden && elapsed >= 3000) {
-            ImGui::Core::SetMouseCursorHidden(mouse_hidden = true);
-        } else if (!mouse_inside && mouse_hidden) {
-            ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
-        }
-        int timeout = !prompt_active && mouse_inside && !mouse_hidden ? int(3000 - elapsed) : -1;
+        if (const bool hide = focused && !prompt_active && elapsed >= still_ms; hide != mouse_hidden)
+            ImGui::Core::SetMouseCursorHidden(mouse_hidden = hide);
+        int timeout = focused && !prompt_active && !mouse_hidden ? int(still_ms - elapsed) : -1;
         if (ImGui::Core::MustKeepDrawing()) timeout = timeout < 0 ? 16 : std::min(timeout, 16);
         if (!SDL_WaitEventTimeout(&event, timeout)) {
             if (ImGui::Core::MustKeepDrawing()) ImGui::Core::NewFrame();
             continue;
         }
-        if (event.type == SDL_EVENT_MOUSE_MOTION || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
-            event.type == SDL_EVENT_MOUSE_BUTTON_UP || event.type == SDL_EVENT_MOUSE_WHEEL ||
-            event.type == SDL_EVENT_WINDOW_MOUSE_ENTER) {
-            mouse_time = SDL_GetTicks();
-            if (mouse_hidden) ImGui::Core::SetMouseCursorHidden(mouse_hidden = false);
+        switch (event.type) {
+        case SDL_EVENT_MOUSE_MOTION:  // a jittery mouse lying still sends motions of a pixel
+            if (std::abs(event.motion.xrel) + std::abs(event.motion.yrel) >= 2.0f || pointing) mouse_time = SDL_GetTicks();
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP: case SDL_EVENT_MOUSE_WHEEL:
+            if (pointing) mouse_time = SDL_GetTicks();  // in the game they are its input
+            break;
+        case SDL_EVENT_WINDOW_MOUSE_ENTER: mouse_time = SDL_GetTicks(); break;
+        case SDL_EVENT_KEY_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            if (!pointing) mouse_time = 0;  // playing: the pointer goes at once
+            break;
+        default: break;
         }
         if (event.type == main_menu_event || event.type == tools_event) {
             if (!prompt_active) {

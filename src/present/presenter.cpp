@@ -729,7 +729,17 @@ void Run(const std::stop_token& token) {
                 Common::AccurateSleep(std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now), nullptr, false);
             last_movie_present = std::chrono::steady_clock::now();
         } else last_movie_present = {};
-        try { Draw(GpuThread::CinematicActive() ? 0 : latch, address, bgra, guest_frame); } catch (const std::exception& error) { Log(std::string("Presentation: ") + error.what()); return; }
+        try {
+            Draw(GpuThread::CinematicActive() ? 0 : latch, address, bgra, guest_frame);
+        } catch (const std::exception& error) {
+            const std::string what = error.what();
+            // VK_ERROR_DEVICE_LOST: the driver reset the GPU, the image stops while the game goes on. On a GPU with little video
+            // memory that is mostly the VRAM overcommitted (Windows moves memory to and from the GPU until a frame takes seconds).
+            Log("Presentation: " + what +
+                (what.ends_with(": -4") ? "; the GPU stopped responding (device lost). With 2 GB of video memory, a lower resolution keeps the game in VRAM"
+                                        : ""));
+            return;
+        }
     }
 }
 } // namespace

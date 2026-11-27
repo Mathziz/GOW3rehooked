@@ -333,10 +333,20 @@ struct Renderer::Impl {
     // block (zeroed, shared by every such page) keeps the whole mirror bound, and BindPages replaces it page by page.
     VkDeviceMemory backstop = VK_NULL_HANDLE;
     u64 backstop_size = 0;
+    VkBuffer backstop_buf = VK_NULL_HANDLE;  // over the backstop block (zeroed at the start), to zero it again (Submit)
+    bool backstop_dirty = false;             // a chunk was refused while the frame recorded: Submit zeroes the block at the next one
     bool BindBackstop();
     VkDeviceMemory AllocateChunk(u64& size);
+    u32 chunk_fail_frame = ~0u;  // the frame a chunk was last refused in: the driver is not asked again before the next one
     std::vector<u64> bound;  // bitmap of mirror pages with memory
     std::vector<VkSparseMemoryBind> pending_binds;
+    // Staged bytes whose mirror pages got no memory (the VRAM full): not copied, kept here until RestageLost offers them
+    // again (GuestMemory::Restage), next frame and then with a delay doubling up to 32 frames while memory stays short.
+    using Span = std::pair<u64, u64>;
+    std::vector<Span> lost;
+    u32 lost_retry = 0, lost_delay = 1;
+    std::function<void(u64, u64)> restage;  // live: GuestMemory::Restage (SetRestage)
+    void Unstage(u64 lo, u64 hi);
     std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)
     // 4 KB piece -> content hash | 1 (0: never written), to skip unchanged uploads. Guest addresses below 32 GB; the
     // table is demand-zero memory, so only the pieces the game uses cost anything.
@@ -376,7 +386,9 @@ struct Renderer::Impl {
     void QueueStage(Pending p);    // stage_lock held; schedules only changed bytes
     void RecordSend(VkCommandBuffer c);  // copies the bytes staged since the last send to their chunks' VRAM twins
     void Send();
-    void BindPages(u64 lo, u64 hi);
+    // A staging chunk with a VRAM twin (one that could not get VRAM goes without: copied from the host).
+    bool HasTwin(u32 chunk) const { return use_stage_dev && chunk < stage_dev.size() && stage_dev[chunk].buf; }
+    bool BindPages(u64 lo, u64 hi, std::vector<Span>* missing = nullptr);  // false: some page got no memory (skip writes there)
     void Flush(VkCommandBuffer c);
     bool SetupMirror(std::string& error);
     void DestroyMirror();  // mirror, its memory, the draw tables' sets
@@ -412,6 +424,7 @@ struct Renderer::Impl {
     u64 rb_used = 0;
     std::vector<Buffer> stage, stage_dev;    // staging chunks of `pending`, and their VRAM twins
     u64 stage_chunk_size = 64ull << 20;
+    size_t stage_twins = ~size_t(0);         // the chunks of a frame slot that get a twin (1 with 2 GB of VRAM)
     // Draw tables: per frame slot dynamic uniform buffers over `tables`. Each thread takes 64 KB pieces and fills them alone.
     VkDescriptorSetLayout table_layout = VK_NULL_HANDLE;
     VkDescriptorPool table_pool = VK_NULL_HANDLE;

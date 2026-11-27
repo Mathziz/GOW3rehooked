@@ -288,6 +288,7 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
 
     // special keys
     {"escape", SDLK_ESCAPE},
+    {"esc", SDLK_ESCAPE},  // as other ports' configs write it
     {"printscreen", SDLK_PRINTSCREEN},
     {"scrolllock", SDLK_SCROLLLOCK},
     {"pausebreak", SDLK_PAUSE},

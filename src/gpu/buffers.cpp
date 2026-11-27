@@ -258,7 +258,6 @@ bool Renderer::Impl::BindBackstop() {
         }
     }
     if (zpool) vkDestroyCommandPool(dev, zpool, nullptr);
-    if (zero) vkDestroyBuffer(dev, zero, nullptr);
     // Bound in batches; each waits, so the first frame finds the whole mirror bound.
     std::vector<VkSparseMemoryBind> binds;
     binds.reserve(4096);
@@ -278,8 +277,12 @@ bool Renderer::Impl::BindBackstop() {
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (result != VK_SUCCESS) {
         Gow3::Log(std::format("Renderer: binding the mirror to its backstop block failed ({})", (int)result));
+        if (zero) vkDestroyBuffer(dev, zero, nullptr);
         return false;
     }
+    // Kept to zero the block again should a GPU write ever reach a page without memory (Submit, after a refused chunk).
+    if (zeroed) backstop_buf = std::exchange(zero, VK_NULL_HANDLE);
+    if (zero) vkDestroyBuffer(dev, zero, nullptr);
     Gow3::Log(std::format("Renderer: no sparseResidencyBuffer (fallback in use): the {} GB mirror is bound to a {} KB zeroed backstop block{} "
                           "({} binds, {:.0f} ms); the pages the game uses get their own memory",
                           mirror_size >> 30, backstop_size >> 10, zeroed ? "" : " (not cleared)", mirror_size / backstop_size, ms));
@@ -288,6 +291,7 @@ bool Renderer::Impl::BindBackstop() {
 
 void Renderer::Impl::DestroyMirror() {
     vkDestroyBuffer(dev, mirror, nullptr);
+    if (backstop_buf) vkDestroyBuffer(dev, backstop_buf, nullptr);
     for (auto m : chunks) vkFreeMemory(dev, m, nullptr);
     if (backstop) vkFreeMemory(dev, backstop, nullptr);
     vkDestroyDescriptorPool(dev, table_pool, nullptr), vkDestroyDescriptorSetLayout(dev, table_layout, nullptr);
@@ -336,59 +340,76 @@ bool Renderer::Impl::SetupTables() {
 }
 
 // Memory for the mirror's next chunk: DeviceType's pick first, then the other memory types the mirror takes (largest heap
-// first), then a quarter of the size. `size` returns what was allocated (VK_NULL_HANDLE: nothing could be).
+// first), then a quarter of the size, down to 1 MB (VRAM nearly full is fragmented: a GTX 750 Ti's 2 GB refused 64 and 16 MB
+// with smaller pieces free). Before giving up, the empty texture blocks go back to the driver and the sizes are tried once
+// more. `size` returns what was allocated (VK_NULL_HANDLE: nothing could be). A frame asks the driver once: each refusal
+// costs the driver's attempt to make room, and every BindPages of that frame would ask again.
 VkDeviceMemory Renderer::Impl::AllocateChunk(u64& size) {
+    if (chunk_fail_frame == frame) return VK_NULL_HANDLE;
     constexpr VkMemoryPropertyFlags kAvoid = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT |
                                              VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
     VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-    for (u64 want = size; want >= page && want >= size / 4; want /= 4) {
-        const u32 first = DeviceType(mirror_bits, want);
-        std::vector<u32> order;
-        if (first != ~0u) order.push_back(first);
-        std::vector<u32> rest;
-        for (u32 i = 0; i < mem.memoryTypeCount; ++i)
-            if (mirror_bits >> i & 1 && i != first && !(mem.memoryTypes[i].propertyFlags & kAvoid)) rest.push_back(i);
-        std::stable_sort(rest.begin(), rest.end(), [&](u32 a, u32 b) {
-            return mem.memoryHeaps[mem.memoryTypes[a].heapIndex].size > mem.memoryHeaps[mem.memoryTypes[b].heapIndex].size;
-        });
-        order.insert(order.end(), rest.begin(), rest.end());
-        VkResult last = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-        for (const u32 type : order) {
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, want, type};
-            VkDeviceMemory m = VK_NULL_HANDLE;
-            if ((last = vkAllocateMemory(dev, &ai, nullptr, &m)) == VK_SUCCESS) {
-                if ((type != first || want != size) && !chunk_spilled)
-                    chunk_spilled = true, Gow3::Log(std::format("Renderer: guest mirror chunk from memory type {} (heap {}), {} MB, after {} failed",
-                                                                type, mem.memoryTypes[type].heapIndex, want >> 20, (int)first));
-                return size = want, m;
+    const u64 smallest = std::max<u64>(page, 1ull << 20);
+    VkResult last = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    for (int round = 0; round < 2; ++round) {
+        if (round == 1 && !ReclaimEmptyImageBlocks()) break;
+        for (u64 want = size; want >= smallest; want /= 4) {
+            const u32 first = DeviceType(mirror_bits, want);
+            std::vector<u32> order;
+            if (first != ~0u) order.push_back(first);
+            std::vector<u32> rest;
+            for (u32 i = 0; i < mem.memoryTypeCount; ++i)
+                if (mirror_bits >> i & 1 && i != first && !(mem.memoryTypes[i].propertyFlags & kAvoid)) rest.push_back(i);
+            std::stable_sort(rest.begin(), rest.end(), [&](u32 a, u32 b) {
+                return mem.memoryHeaps[mem.memoryTypes[a].heapIndex].size > mem.memoryHeaps[mem.memoryTypes[b].heapIndex].size;
+            });
+            order.insert(order.end(), rest.begin(), rest.end());
+            for (const u32 type : order) {
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, want, type};
+                VkDeviceMemory m = VK_NULL_HANDLE;
+                if ((last = vkAllocateMemory(dev, &ai, nullptr, &m)) == VK_SUCCESS) {
+                    if ((type != first || want != size) && !chunk_spilled)
+                        chunk_spilled = true, Gow3::Log(std::format("Renderer: guest mirror chunk from memory type {} (heap {}), {} MB, after {} failed",
+                                                                    type, mem.memoryTypes[type].heapIndex, want >> 20, (int)first));
+                    lost_delay = 1, lost_retry = 0;  // memory again: what is still lost is offered again at the next frame
+                    return size = want, m;
+                }
             }
         }
-        if (!chunk_failed)
-            chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror ({} MB wanted, {} MB held)", (int)last,
-                                                       want >> 20, mirror_chunks.load() >> 20));
     }
+    if (!chunk_failed)
+        chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror ({} MB wanted, {} MB held); the bytes "
+                                                   "for pages without memory are uploaded again once some is free",
+                                                   (int)last, size >> 20, mirror_chunks.load() >> 20));
+    chunk_fail_frame = frame;
     return VK_NULL_HANDLE;
 }
 
-// Gives memory to every mirror page in [lo, hi) that has none (without residency, a page that none could be found for
-// keeps the backstop block).
-void Renderer::Impl::BindPages(u64 lo, u64 hi) {
+// Gives memory to every mirror page in [lo, hi) that has none. False when some page could get none: without residency it
+// keeps the backstop block, which every such page shares, so nothing may be written there (the callers skip those writes);
+// `missing` gets those pages, page-aligned and merged.
+bool Renderer::Impl::BindPages(u64 lo, u64 hi, std::vector<Span>* missing) {
     std::scoped_lock bind(bind_lock);
-    for (u64 p = lo / page * page; p < std::min(hi, mirror_size); p += page) {
+    bool all = true;
+    for (u64 p = lo / page * page, end = std::min(hi, mirror_size); p < end; p += page) {
         u64& word = bound[p / page / 64];
         const u64 bit = 1ull << (p / page % 64);
         if (word & bit) continue;
-        word |= bit;
         if (chunk_used + page > chunk_cap) {
             u64 size = chunk_size;
-            VkDeviceMemory m = AllocateChunk(size);
+            // After a refusal the pages left in this range would need the same chunk: none is asked for again.
+            VkDeviceMemory m = all ? AllocateChunk(size) : VK_NULL_HANDLE;
             if (!m) {
-                word &= ~bit;  // the rest stays without memory (reads zero, or the backstop); the next write there tries again
+                all = false;
                 alloc_pressure.store(true, std::memory_order_relaxed);
-                break;
+                if (!missing) break;
+                if (!missing->empty() && missing->back().second == p) missing->back().second = p + page;
+                else missing->push_back({p, p + page});
+                continue;
             }
             chunks.push_back(m), chunk_used = 0, chunk_cap = size, mirror_chunks += size;
         }
+        word |= bit;
         if (!pending_binds.empty() && pending_binds.back().resourceOffset + pending_binds.back().size == p &&
             pending_binds.back().memory == chunks.back() &&
             pending_binds.back().memoryOffset + pending_binds.back().size == chunk_used)
@@ -397,7 +418,45 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
             pending_binds.push_back({p, page, chunks.back(), chunk_used, 0});
         chunk_used += page;
     }
+    return all;
 }
+
+// Staged bytes that could not reach the mirror (their pages got no memory): their hashes are forgotten, so the next offer
+// stages them again, and they wait in `lost` for RestageLost.
+void Renderer::Impl::Unstage(u64 lo, u64 hi) {
+    if (hi <= lo) return;
+    for (u64 a = lo & ~0xFFFull; a < hi && a >> 12 < kPieces; a += 0x1000) written[a >> 12] = 0;
+    if (!written_partial.empty())
+        std::erase_if(written_partial, [&](const auto& e) { return e.first < hi && e.first + 0x1000 > lo; });
+    InvalidateBlocks(lo, hi - lo);
+    if (!lost.empty() && lost.back().second >= lo && lost.back().first <= hi)
+        lost.back() = {std::min(lost.back().first, lo), std::max(lost.back().second, hi)};
+    else
+        lost.push_back({lo, hi});
+}
+
+// Before the frame's offer: what the mirror lost is offered again (GuestMemory::Restage reopens its pages), once a frame
+// after the loss, then with a delay that doubles while memory stays short (up to 32 frames): staging it again every frame
+// would copy and hash it for nothing.
+void Renderer::RestageLost() {
+    Impl& r = *d;
+    if (r.lost.empty() || r.frame < r.lost_retry) return;
+    std::vector<Impl::Span> spans;
+    spans.swap(r.lost);
+    std::sort(spans.begin(), spans.end());
+    size_t n = 0;
+    for (const auto& s : spans)
+        if (n && s.first <= spans[n - 1].second) spans[n - 1].second = std::max(spans[n - 1].second, s.second);
+        else spans[n++] = s;
+    spans.resize(n);
+    for (auto [lo, hi] : spans)
+        if (r.restage) r.restage(lo, hi);
+    r.Note("guest memory the mirror had no video memory for offered again");
+    r.lost_retry = r.frame + r.lost_delay;
+    r.lost_delay = std::min<u32>(r.lost_delay * 2, 32);
+}
+
+void Renderer::SetRestage(std::function<void(std::uint64_t lo, std::uint64_t hi)> restage) { d->restage = std::move(restage); }
 
 // ---- Staging chunks and guest-to-mirror uploads ----
 
@@ -411,8 +470,13 @@ Renderer::Impl::Pending Renderer::Impl::AllocateStage(u64 n) {
                 stage.push_back(host);
                 return true;
             }
-            Buffer dev_buf = MakeBuffer(sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "stage dev", true);
-            if (!dev_buf.buf) return FreeBuffer(host), false;
+            // Its VRAM twin is a speed-up only: with the VRAM full the chunk goes without one (copied from the host) rather than
+            // the bytes not being staged at all (a page protected after its offer would then never reach the mirror). With 2 GB
+            // of VRAM only the first chunk of a frame slot has one: a level load stages hundreds of MB at once, and twins for all
+            // of it took that much VRAM just when the mirror grows for the new level.
+            Buffer dev_buf;
+            if (stage_dev.size() < stage_twins)
+                dev_buf = MakeBuffer(sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "stage dev", true);
             stage.push_back(host), stage_dev.push_back(dev_buf);
             return true;
         };
@@ -455,6 +519,7 @@ void Renderer::Impl::RecordSend(VkCommandBuffer c) {
     auto send_span = [&](std::span<const Pending> src) {
         for (size_t i = 0, j; i < src.size(); i = j) {
             for (j = i; j < src.size() && src[j].chunk == src[i].chunk;) ++j;
+            if (!HasTwin(src[i].chunk)) continue;  // copied from the host by Flush
             copies.clear();
             for (size_t k = i; k < j; ++k) {
                 const auto& p = src[k];
@@ -483,22 +548,38 @@ void Renderer::Impl::Send() {
     TempLost("send submit", vkQueueSubmit(xfer, 1, &si, VK_NULL_HANDLE));  // TEMP fault
 }
 
-// Staged guest writes -> mirror, recorded at the start of the frame's command buffer: the sent ones from VRAM.
+// Staged guest writes -> mirror, recorded at the start of the frame's command buffer: the sent ones from VRAM. Bytes whose
+// pages got no memory are not copied (they would land in the backstop block every such page reads): Unstage keeps them for
+// RestageLost, and until then those pages read zero.
 void Renderer::Impl::Flush(VkCommandBuffer c) {
     std::vector<VkBufferCopy> copies;
+    std::vector<Span> missing;
     if (boom_on) boom_up[slot].clear();
     for (size_t i = 0; i < pending.size();) {
         const u32 chunk = pending[i].chunk;
-        const bool dev = i < sent;
+        const bool dev = i < sent && HasTwin(chunk);  // a chunk without its VRAM twin (no memory for it) copies from the host
         copies.clear();
-        for (; i < pending.size() && pending[i].chunk == chunk && (i < sent) == dev; ++i) {
+        for (; i < pending.size() && pending[i].chunk == chunk && (i < sent && HasTwin(chunk)) == dev; ++i) {
             const Pending& p = pending[i];
-            BindPages(p.addr, p.addr + p.size);
-            copies.push_back({p.src, p.addr, p.size});
-            stats.uploaded += p.size;
             if (boom_on) boom_up[slot].push_back(p);
+            missing.clear();
+            if (BindPages(p.addr, p.addr + p.size, &missing)) {
+                copies.push_back({p.src, p.addr, p.size});
+                stats.uploaded += p.size;
+                continue;
+            }
+            u64 at = p.addr;
+            const u64 end = p.addr + p.size;
+            for (auto [lo, hi] : missing) {
+                const u64 a = std::max(lo, p.addr), b = std::min(hi, end);
+                if (b <= a) continue;
+                if (a > at) copies.push_back({p.src + (at - p.addr), at, a - at}), stats.uploaded += a - at;
+                Unstage(a, b);
+                at = b;
+            }
+            if (end > at) copies.push_back({p.src + (at - p.addr), at, end - at}), stats.uploaded += end - at;
         }
-        vkCmdCopyBuffer(c, (dev ? stage_dev : stage)[chunk].buf, mirror, (u32)copies.size(), copies.data());
+        if (!copies.empty()) vkCmdCopyBuffer(c, (dev ? stage_dev : stage)[chunk].buf, mirror, (u32)copies.size(), copies.data());
     }
     pending.clear(), sent = 0;
 }
@@ -1150,6 +1231,17 @@ bool Track(Gpu::Renderer& renderer, u64 lo, u64 hi) {
         a = end;
     }
     return staged;
+}
+
+// The mirror lost these bytes (no video memory for their pages): they are offered again as if the CPU had written them. A
+// protected page is reopened and queued (offered at the next frame); a read-only one is tracked again at its next draw.
+// Dirty, dynamic and region pages are offered anyway, and an unknown one is staged at its first draw.
+void Restage(u64 lo, u64 hi) {
+    for (u64 p = lo / kPage, end = std::min((hi + kPage - 1) / kPage, kPages); p < end; ++p) {
+        u8 v = state[p].load(std::memory_order_acquire);
+        if ((v & 7) == Clean) Reopen(p, 1);
+        else if ((v & 7) == Fixed) state[p].compare_exchange_strong(v, Unknown);
+    }
 }
 
 u64 Store(u64 addr, const void* data, u64 size) {

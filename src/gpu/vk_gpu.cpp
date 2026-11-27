@@ -1154,15 +1154,20 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     // load it again, the CPU reads it back). Everything before the dispatch finishes first, everything after waits for it.
     const u64 stored = prep.stored;
     if (stored) {
-        Barrier(cmd);
+        // A buffer whose pages got no memory (the VRAM full) would have the program write the backstop block, which every page
+        // without memory reads, and the readback hand that to the CPU: the dispatch is skipped this frame instead.
+        static thread_local std::vector<std::pair<u64, u64>> ranges;
+        ranges.clear();
         for (u32 k = 0; k < prep.fdesc.size(); ++k) {
             const u32* v = stored >> k & 1 ? prep.fdesc[k] : nullptr;
             if (!v) continue;
             const u64 lo = (u64)(v[1] & 0xFFFF) << 32 | v[0], stride = v[1] >> 16 & 0x3FFF, hi = lo + std::min<u64>(stride ? stride * v[2] : v[2], 1ull << 30);
             if (hi <= lo || hi > mirror_size) continue;
-            BindPages(lo, hi);
-            (in_worker ? own_writes : gpu_writes).push_back({lo, hi, std::atomic_ref(write_seq).fetch_add(1) + 1, nullptr});
+            if (!BindPages(lo, hi)) return stores.clear(), Count(stats.skipped), Note("dispatch skipped: no video memory for the buffer it stores to");
+            ranges.push_back({lo, hi});
         }
+        Barrier(cmd);
+        for (auto [lo, hi] : ranges) (in_worker ? own_writes : gpu_writes).push_back({lo, hi, std::atomic_ref(write_seq).fetch_add(1) + 1, nullptr});
     }
     // Targets stored to through their twin (TargetTexture): the twin holds the target while the program runs (it may load
     // what it does not store), then the target takes it back.
@@ -1696,6 +1701,16 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         vkCmdResetQueryPool(r.copy_cmd, r.prof_pool, r.prof_base, Impl::kProfQueries),
             vkCmdWriteTimestamp2(r.copy_cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.prof_pool, r.prof_base);
     const u64 temp_up = r.stats.uploaded;
+    if (r.backstop_dirty && r.backstop_buf) {
+        // Pages without memory share the backstop block (the VRAM was full last frame): whatever may have reached it is zeroed
+        // again, after all the work before and before this frame's.
+        Impl::StageBarrier(r.copy_cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        vkCmdFillBuffer(r.copy_cmd, r.backstop_buf, 0, VK_WHOLE_SIZE, 0);
+        Impl::StageBarrier(r.copy_cmd, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    }
+    r.backstop_dirty = r.chunk_fail_frame == r.frame;  // refused this frame: zeroed at the next one
     if (!r.pending.empty()) {
         Impl::StageBarrier(r.copy_cmd, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
                            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);

@@ -159,6 +159,10 @@ public:
     // descriptor tables), from every recording thread at once; it Writes what the mirror lacks (serialized) and returns
     // true when it staged new bytes.
     void SetTracker(std::function<bool(std::uint64_t lo, std::uint64_t hi)> track);
+    // Live: guest bytes the mirror could not take (no video memory for their pages) are handed to `restage` to be offered
+    // again; RestageLost, before each frame's offer, does it when due.
+    void SetRestage(std::function<void(std::uint64_t lo, std::uint64_t hi)> restage);
+    void RestageLost();
     // Live linear readback: after each Submit, the bytes of every guest range the GPU wrote (storage images, linear
     // color targets), for the caller to store in guest memory.
     void SetReadback(std::function<std::uint64_t(std::uint64_t addr, const void* data, std::uint64_t size)> readback);

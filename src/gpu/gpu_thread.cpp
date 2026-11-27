@@ -229,6 +229,7 @@ Gpu::Renderer* Renderer() {
     GuestMemory::Install();
 #endif
     r->SetTracker([p = r.get()](u64 lo, u64 hi) { return GuestMemory::Track(*p, lo, hi); });
+    r->SetRestage(GuestMemory::Restage);
     r->SetReadback(GuestMemory::Store);
     live.store(r.get(), std::memory_order_release);
     return r.release();
@@ -298,6 +299,7 @@ void Render(Gpu::Renderer& r, const std::vector<std::pair<const u32*, u32>>& buf
     const auto temp_t0 = DiagNow();
     RenderProbe::Begin(n, mem.regions);
     if (mem.regions != regions) GuestMemory::SetRegions(regions = mem.regions);
+    r.RestageLost();  // what the mirror could not take (no video memory) goes with this frame's offer
     const u32 faults = GuestMemory::BeginFrame(r, mem.offer);
     const auto temp_t1 = DiagNow();
     // The chain is the submitted command buffers: 011A2AA0 submits the segments in chain order, and the game's commands

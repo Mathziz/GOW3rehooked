@@ -721,6 +721,14 @@ void Renderer::Impl::LoadDeviceFunctions() {
         stage_chunk_size = 32ull << 20;
         temp_chunk_size = 16ull << 20;
     }
+    // 2 GB of VRAM (a GeForce GTX 750 Ti): the mirror grows by 32 MB chunks, which fit the gaps of a nearly full heap and leave
+    // less of the last one unused, and a frame slot's staging has one 16 MB VRAM twin (a frame stages a few MB; the chunks a
+    // level load adds are copied from the host).
+    if (!integrated && mem.memoryHeaps[vram_heap].size <= (2560ull << 20)) {
+        chunk_size = chunk_used = 32ull << 20;
+        stage_chunk_size = 16ull << 20;
+        stage_twins = 1;
+    }
     image_copy_via_temp = p13.maxBufferSize < kMirrorMax;  // before SetupMirror: against the largest mirror
 #define LOAD(var, name) var = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
     if (caps.path == ShaderPath::Objects) {

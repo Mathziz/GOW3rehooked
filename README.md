@@ -41,7 +41,7 @@ No game code or assets are included. You need your own copy of the game.
 | NVIDIA GPU | GeForce GTX 750 Ti (Maxwell, 1st generation) or newer. The original GOW3rehooked needs a GTX 950 or newer. |
 | Intel GPU | UHD Graphics: experimental. Arc and Xe: untested. |
 | Memory | 16 GB of RAM recommended |
-| Video memory | 2 GB is enough at 720p (tested on a GTX 750 Ti 2 GB). Higher resolutions need more. |
+| Video memory | 2 GB: 1080p or lower. At 1440p the heavier areas need about 1.9 GB of video memory (measured on a GTX 750 Ti 2 GB), more than the card has free: frames slow down and the image can break up. |
 | Game | God of War III Remastered, European (CUSA01715) or American (CUSA01623) release, updated to version 1.02 |
 
 The standard build requires an x86-64-v3 CPU (including AVX2, BMI1/2, FMA, F16C, LZCNT and MOVBE). Six cores or more are recommended.
@@ -117,7 +117,7 @@ Performance is the main goal of the project. Both screenshots show the same scen
   </tr>
 </table>
 
-On a GeForce GTX 750 Ti 2 GB with a Core i5-6400, this fork holds 60 FPS at 720p from the climb to the first save, with about 7 ms of GPU time per frame. Press **F10** in the game to see your own frame rate.
+On a GeForce GTX 750 Ti 2 GB with a Core i5-6400, this fork holds 60 FPS at 720p from the climb to the first save, with about 7 ms of GPU time per frame. At 1440p the same card averages about 46 FPS (21 ms of GPU time per frame) and runs out of video memory in the heavier areas. Press **F10** in the game to see your own frame rate.
 
 ## Features
 

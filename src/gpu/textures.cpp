@@ -1711,7 +1711,10 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t, bool las
     const u32 type = Type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (r.size <= image_block_size / 4 && type != ~0u) {
         std::scoped_lock lock(image_lock);
-        if (image_free[lasting] < image_block_size / 2 && (!image_growing.valid() || image_growing.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
+        // A block made ahead stays mostly empty for a while: under memory pressure none is (a texture that fits no block gets
+        // memory of its own size), so the VRAM left goes to what needs it now, the mirror first.
+        if (!Pressed() && image_free[lasting] < image_block_size / 2 &&
+            (!image_growing.valid() || image_growing.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
             image_growing = std::async(std::launch::async, [this, bits = r.memoryTypeBits, lasting] {
                 const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, image_block_size, DeviceType(bits, image_block_size)};
                 VkDeviceMemory m = VK_NULL_HANDLE;
@@ -2220,8 +2223,8 @@ void Renderer::Impl::WriteBackTarget(const Target& t, u32 pitch, VkRect2D area) 
     if (t.samples > 1 || x1 <= x0 || y1 <= y0) return;
     const u64 tb = TexelBytes(t.fmt), lo = t.base + ((u64)y0 * pitch + x0) * tb, hi = t.base + ((u64)(y1 - 1) * pitch + x1) * tb;
     if (hi > mirror_size) return;
+    if (!BindPages(lo, hi)) return Note("linear target not written back: no video memory for its pages");  // stays in its image
     EndRendering();
-    BindPages(lo, hi);
     const VkBufferImageCopy bc{0, pitch, y1 - y0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int)x0, (int)y0, 0}, {x1 - x0, y1 - y0, 1}};
     ImageToMirror(cmd, t.t.img, bc, lo, (x1 - x0) * tb, pitch * tb, 1);
     if (temp_copylog) std::fprintf(stderr, "COPY WBT %llx %ux%u rect %ux%u\n", (unsigned long long)t.base, t.w, t.h, x1 - x0, y1 - y0);
@@ -2867,7 +2870,8 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
 bool Renderer::Impl::Store(VkCommandBuffer c, GuestTex& g, u32 m) {
     const Layout& l = g.mips[m];
     const bool linear = g.tile == 8 || g.tile == 31;
-    BindPages(g.base + l.offset, g.base + l.offset + l.size);
+    // No memory for its pages (the VRAM full): the copy would land in the backstop block every page without memory reads.
+    if (!BindPages(g.base + l.offset, g.base + l.offset + l.size)) return Note("storage image not written back: no video memory for its pages"), false;
     const VkExtent3D ext{std::max(g.w >> m, 1u), std::max(g.h >> m, 1u), std::max(g.d >> m, 1u)};
     VkBufferImageCopy bc{0, l.pitch, l.height, {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, g.layers}, {}, ext};
     if (linear) return ImageToMirror(c, g.t.img, bc, g.base + l.offset, (u64)ext.width * g.bits / 8, (u64)l.pitch * g.bits / 8, ext.depth * g.layers), true;
@@ -3151,15 +3155,14 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
             {
                 std::scoped_lock lock(stage_lock);
                 sp = AllocateStage(copy_bytes);
-                if (sp.chunk != ~0u && use_stage_dev) stage_sends.push_back(sp);
+                if (sp.chunk != ~0u && HasTwin(sp.chunk)) stage_sends.push_back(sp);
             }
-            if (sp.chunk != ~0u) {
+            if (sp.chunk != ~0u && BindPages(dst_lo, dst_hi)) {
                 std::memcpy(stage[sp.chunk].ptr + sp.src, reinterpret_cast<const void*>(src_lo), copy_bytes);
                 EndRendering();
-                BindPages(dst_lo, dst_hi);
                 Barrier(cmd);
                 const VkBufferCopy region{sp.src, dst_lo, copy_bytes};
-                vkCmdCopyBuffer(cmd, (use_stage_dev ? stage_dev : stage)[sp.chunk].buf, mirror, 1, &region);
+                vkCmdCopyBuffer(cmd, (HasTwin(sp.chunk) ? stage_dev : stage)[sp.chunk].buf, mirror, 1, &region);
                 Barrier(cmd);
                 const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
                 gpu_writes.push_back({dst_lo, dst_hi, seq, nullptr, false, true});
@@ -3172,8 +3175,8 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
 
         // Sub-case C: hot/mixed src -> mirror->mirror copy + BackingPages sync on dst, skip RecordReadback.
         Track(src_lo, src_hi), NoteRead(src_lo, src_hi);
+        if (!BindPages(src_lo, src_hi) || !BindPages(dst_lo, dst_hi)) return false;  // no VRAM for them: the program's own way
         EndRendering();
-        BindPages(src_lo, src_hi), BindPages(dst_lo, dst_hi);
         Barrier(cmd);
         const VkBufferCopy region{src_lo, dst_lo, copy_bytes};
         vkCmdCopyBuffer(cmd, mirror, mirror, 1, &region);
@@ -3188,8 +3191,8 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
 #endif
 
     Track(src_lo, src_hi), NoteRead(src_lo, src_hi);
+    if (!BindPages(src_lo, src_hi) || !BindPages(dst_lo, dst_hi)) return false;  // no VRAM for them: the program's own way
     EndRendering();
-    BindPages(src_lo, src_hi), BindPages(dst_lo, dst_hi);
     Barrier(cmd);
     std::vector<VkBufferCopy> regions;
     if (contiguous) {
