@@ -6,6 +6,7 @@
 #include <bit>
 #include <magic_enum/magic_enum.hpp>
 #include "gpu/renderer_impl.h"
+#include "gpu/device.h"
 #ifndef GOW3_OFFLINE
 #include "gpu/gpu_thread.h"
 #include "gpu/buffers.h"
@@ -2624,16 +2625,21 @@ u32 Renderer::Impl::Sampler(const u32* s) {
     std::scoped_lock res(res_lock);
     if (auto it = samplers.find(key); it != samplers.end()) return memo[key] = it->second;
     const u64 r0 = (u64)s[1] << 32 | s[0], r1 = (u64)s[3] << 32 | s[2];
-    auto clamp = [](u64 m) {
+    const ::Gpu::DeviceFeatures& features = ::Gpu::Features();
+    auto clamp = [&features](u64 m) {
         static constexpr VkSamplerAddressMode t[]{VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
                                                   VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
                                                   VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
                                                   VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE};
-        return t[m & 7];
+        const VkSamplerAddressMode mode = t[m & 7];
+        // A GPU without samplerMirrorClampToEdge mirrors and repeats instead.
+        return mode == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE && !features.sampler_mirror_clamp ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT : mode;
     };
     const u32 aniso = r0 >> 9 & 7, compare = r0 >> 12 & 7, reduction = r0 >> 29 & 3, mag = r1 >> 20 & 3, min = r1 >> 22 & 3, mip = r1 >> 26 & 3;
+    // A GPU without samplerFilterMinmax (a GeForce GTX 750 Ti) averages the texels instead of taking their minimum or maximum.
     VkSamplerReductionModeCreateInfo rm{VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO, nullptr,
-                                        reduction == 1 ? VK_SAMPLER_REDUCTION_MODE_MIN : reduction == 2 ? VK_SAMPLER_REDUCTION_MODE_MAX
+                                        !features.sampler_filter_minmax ? VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE
+                                        : reduction == 1 ? VK_SAMPLER_REDUCTION_MODE_MIN : reduction == 2 ? VK_SAMPLER_REDUCTION_MODE_MAX
                                                                                         : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE};
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, &rm};
     ci.magFilter = mag & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, ci.minFilter = min & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;

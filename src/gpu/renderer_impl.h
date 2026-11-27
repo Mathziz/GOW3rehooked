@@ -326,7 +326,15 @@ struct Renderer::Impl {
     std::vector<VkDeviceMemory> chunks;
     u64 chunk_size = kChunk;
     u64 chunk_used = kChunk;
+    u64 chunk_cap = 0;          // bytes of chunks.back() (chunk_size, or less when a full chunk did not fit)
     bool chunk_failed = false;  // a chunk allocation failed (logged once)
+    bool chunk_spilled = false;  // a chunk came from another memory type than DeviceType's (logged once)
+    // Without sparseResidencyBuffer (a GeForce GTX 750 Ti) a page without memory is not allowed to be read: the backstop
+    // block (zeroed, shared by every such page) keeps the whole mirror bound, and BindPages replaces it page by page.
+    VkDeviceMemory backstop = VK_NULL_HANDLE;
+    u64 backstop_size = 0;
+    bool BindBackstop();
+    VkDeviceMemory AllocateChunk(u64& size);
     std::vector<u64> bound;  // bitmap of mirror pages with memory
     std::vector<VkSparseMemoryBind> pending_binds;
     std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)

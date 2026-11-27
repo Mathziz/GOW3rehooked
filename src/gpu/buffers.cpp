@@ -203,12 +203,93 @@ bool Renderer::Impl::SetupMirror(std::string& error) {
     bound.assign(mirror_size / page / 64 + 1, 0);
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, mirror};
     mirror_addr = vkGetBufferDeviceAddress(dev, &bai);
+    if (!::Gpu::Features().sparse_residency_buffer) {
+        const char* env = std::getenv("GOW3_MIRROR_BACKSTOP");
+        if (env && env[0] == '0') {
+            Gow3::Log("Renderer: no sparseResidencyBuffer and GOW3_MIRROR_BACKSTOP=0: mirror pages without memory stay unbound (reads may lose the device)");
+        } else if (!BindBackstop()) {
+            return error = "the GPU has no sparse buffer residency and the mirror could not be bound to its backstop block", false;
+        }
+    }
+    return true;
+}
+
+// Without sparseResidencyBuffer a sparse buffer has to be bound wherever the GPU may read it. Every mirror page gets the
+// backstop block (one zeroed block shared by all of them, binds of backstop_size); BindPages then gives each page the
+// game uses its own memory. A read of a page the game never wrote returns zero, as on GPUs with residency; a stray
+// write to such a page lands in the shared block (those pages read it back instead of zero).
+bool Renderer::Impl::BindBackstop() {
+    backstop_size = std::max<u64>(page, 4ull << 20) / page * page;
+    if (mirror_size % backstop_size) backstop_size = page;
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, backstop_size, DeviceType(mirror_bits, backstop_size)};
+    if (ai.memoryTypeIndex == ~0u) ai.memoryTypeIndex = (u32)std::countr_zero(mirror_bits);
+    if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &backstop); e != VK_SUCCESS) {
+        Gow3::Log(std::format("Renderer: backstop block of {} KB failed ({})", backstop_size >> 10, (int)e));
+        return backstop = VK_NULL_HANDLE, false;
+    }
+    std::scoped_lock lock(*queue_lock);
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence done = VK_NULL_HANDLE;
+    if (vkCreateFence(dev, &fci, nullptr, &done) != VK_SUCCESS) return false;
+    // Zeroed once (Windows hands out zeroed video memory already; this does not rely on it).
+    VkBufferCreateInfo zci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, backstop_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer zero = VK_NULL_HANDLE;
+    VkCommandPool zpool = VK_NULL_HANDLE;
+    VkCommandBuffer zcmd = VK_NULL_HANDLE;
+    bool zeroed = false;
+    if (vkCreateBuffer(dev, &zci, nullptr, &zero) == VK_SUCCESS) {
+        VkMemoryRequirements zr;
+        vkGetBufferMemoryRequirements(dev, zero, &zr);
+        const VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, family};
+        if (zr.memoryTypeBits >> ai.memoryTypeIndex & 1 && zr.size <= backstop_size && vkBindBufferMemory(dev, zero, backstop, 0) == VK_SUCCESS &&
+            vkCreateCommandPool(dev, &pci, nullptr, &zpool) == VK_SUCCESS) {
+            const VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, zpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+            const VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            if (vkAllocateCommandBuffers(dev, &cai, &zcmd) == VK_SUCCESS && vkBeginCommandBuffer(zcmd, &cbi) == VK_SUCCESS) {
+                vkCmdFillBuffer(zcmd, zero, 0, VK_WHOLE_SIZE, 0);
+                const VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+                vkCmdPipelineBarrier(zcmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+                const VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &zcmd};
+                zeroed = vkEndCommandBuffer(zcmd) == VK_SUCCESS && vkQueueSubmit(queue, 1, &si, done) == VK_SUCCESS &&
+                         vkWaitForFences(dev, 1, &done, VK_TRUE, ~0ull) == VK_SUCCESS;
+                vkResetFences(dev, 1, &done);
+            }
+        }
+    }
+    if (zpool) vkDestroyCommandPool(dev, zpool, nullptr);
+    if (zero) vkDestroyBuffer(dev, zero, nullptr);
+    // Bound in batches; each waits, so the first frame finds the whole mirror bound.
+    std::vector<VkSparseMemoryBind> binds;
+    binds.reserve(4096);
+    VkResult result = VK_SUCCESS;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (u64 at = 0; at < mirror_size && result == VK_SUCCESS;) {
+        binds.clear();
+        for (; at < mirror_size && binds.size() < 4096; at += backstop_size) binds.push_back({at, backstop_size, backstop, 0, 0});
+        const VkSparseBufferMemoryBindInfo bi{mirror, (u32)binds.size(), binds.data()};
+        VkBindSparseInfo bsi{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+        bsi.bufferBindCount = 1, bsi.pBufferBinds = &bi;
+        result = vkQueueBindSparse(queue, 1, &bsi, done);
+        if (result == VK_SUCCESS) result = vkWaitForFences(dev, 1, &done, VK_TRUE, ~0ull);
+        vkResetFences(dev, 1, &done);
+    }
+    vkDestroyFence(dev, done, nullptr);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (result != VK_SUCCESS) {
+        Gow3::Log(std::format("Renderer: binding the mirror to its backstop block failed ({})", (int)result));
+        return false;
+    }
+    Gow3::Log(std::format("Renderer: no sparseResidencyBuffer (fallback in use): the {} GB mirror is bound to a {} KB zeroed backstop block{} "
+                          "({} binds, {:.0f} ms); the pages the game uses get their own memory",
+                          mirror_size >> 30, backstop_size >> 10, zeroed ? "" : " (not cleared)", mirror_size / backstop_size, ms));
     return true;
 }
 
 void Renderer::Impl::DestroyMirror() {
     vkDestroyBuffer(dev, mirror, nullptr);
     for (auto m : chunks) vkFreeMemory(dev, m, nullptr);
+    if (backstop) vkFreeMemory(dev, backstop, nullptr);
     vkDestroyDescriptorPool(dev, table_pool, nullptr), vkDestroyDescriptorSetLayout(dev, table_layout, nullptr);
 }
 
@@ -254,7 +335,43 @@ bool Renderer::Impl::SetupTables() {
     return true;
 }
 
-// Gives memory to every mirror page in [lo, hi) that has none.
+// Memory for the mirror's next chunk: DeviceType's pick first, then the other memory types the mirror takes (largest heap
+// first), then a quarter of the size. `size` returns what was allocated (VK_NULL_HANDLE: nothing could be).
+VkDeviceMemory Renderer::Impl::AllocateChunk(u64& size) {
+    constexpr VkMemoryPropertyFlags kAvoid = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT |
+                                             VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    for (u64 want = size; want >= page && want >= size / 4; want /= 4) {
+        const u32 first = DeviceType(mirror_bits, want);
+        std::vector<u32> order;
+        if (first != ~0u) order.push_back(first);
+        std::vector<u32> rest;
+        for (u32 i = 0; i < mem.memoryTypeCount; ++i)
+            if (mirror_bits >> i & 1 && i != first && !(mem.memoryTypes[i].propertyFlags & kAvoid)) rest.push_back(i);
+        std::stable_sort(rest.begin(), rest.end(), [&](u32 a, u32 b) {
+            return mem.memoryHeaps[mem.memoryTypes[a].heapIndex].size > mem.memoryHeaps[mem.memoryTypes[b].heapIndex].size;
+        });
+        order.insert(order.end(), rest.begin(), rest.end());
+        VkResult last = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        for (const u32 type : order) {
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, want, type};
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            if ((last = vkAllocateMemory(dev, &ai, nullptr, &m)) == VK_SUCCESS) {
+                if ((type != first || want != size) && !chunk_spilled)
+                    chunk_spilled = true, Gow3::Log(std::format("Renderer: guest mirror chunk from memory type {} (heap {}), {} MB, after {} failed",
+                                                                type, mem.memoryTypes[type].heapIndex, want >> 20, (int)first));
+                return size = want, m;
+            }
+        }
+        if (!chunk_failed)
+            chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror ({} MB wanted, {} MB held)", (int)last,
+                                                       want >> 20, mirror_chunks.load() >> 20));
+    }
+    return VK_NULL_HANDLE;
+}
+
+// Gives memory to every mirror page in [lo, hi) that has none (without residency, a page that none could be found for
+// keeps the backstop block).
 void Renderer::Impl::BindPages(u64 lo, u64 hi) {
     std::scoped_lock bind(bind_lock);
     for (u64 p = lo / page * page; p < std::min(hi, mirror_size); p += page) {
@@ -262,19 +379,15 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
         const u64 bit = 1ull << (p / page % 64);
         if (word & bit) continue;
         word |= bit;
-        if (chunk_used + page > chunk_size) {
-            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, chunk_size, DeviceType(mirror_bits, chunk_size)};
-            VkDeviceMemory m = VK_NULL_HANDLE;
-            if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS) {
-                word &= ~bit;  // the rest stays without memory (reads zero); the next write there tries again
+        if (chunk_used + page > chunk_cap) {
+            u64 size = chunk_size;
+            VkDeviceMemory m = AllocateChunk(size);
+            if (!m) {
+                word &= ~bit;  // the rest stays without memory (reads zero, or the backstop); the next write there tries again
                 alloc_pressure.store(true, std::memory_order_relaxed);
-                if (!chunk_failed)
-                    chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror (type {}, {} MB held)", (int)e,
-                                                               (int)ai.memoryTypeIndex, mirror_chunks.load() >> 20));
                 break;
             }
-            chunks.push_back(m), chunk_used = 0, mirror_chunks += chunk_size;
+            chunks.push_back(m), chunk_used = 0, chunk_cap = size, mirror_chunks += size;
         }
         if (!pending_binds.empty() && pending_binds.back().resourceOffset + pending_binds.back().size == p &&
             pending_binds.back().memory == chunks.back() &&
