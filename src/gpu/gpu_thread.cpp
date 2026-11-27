@@ -80,7 +80,7 @@ void Watch(const std::stop_token& token) {
         const char* phase = Gpu::frame_phase.load(std::memory_order_relaxed);
         auto* r = live.load(std::memory_order_acquire);
         Log(std::format("GPU thread: frame {} busy for {:.1f} s: {}; {} recording threads wait for a compile; video memory {}", n, s,
-                        phase ? phase : "staging guest memory", Gpu::compile_waiters.load(std::memory_order_relaxed), r ? r->MemoryBudget() : "?"));
+                        phase ? phase : "starting the frame", Gpu::compile_waiters.load(std::memory_order_relaxed), r ? r->MemoryBudget() : "?"));
     }
 }
 unsigned configured_anisotropy{};
@@ -239,6 +239,7 @@ Gpu::Renderer* Renderer() {
     if (auto* r = live.load(std::memory_order_acquire); r || render_off) return r;
     const auto& vk = Vulkan::Get();
     if (!vk.device) return nullptr;
+    Gpu::frame_phase.store("starting the renderer", std::memory_order_relaxed);
     auto r = std::make_unique<Gpu::Renderer>();
     std::string error;
     if (!r->Init(Gpu::External{vk.instance, vk.physical, vk.device, vk.queue, vk.family, &Vulkan::QueueMutex()}, error)) {
@@ -253,6 +254,7 @@ Gpu::Renderer* Renderer() {
 #endif
     r->SetTracker([p = r.get()](u64 lo, u64 hi) { return GuestMemory::Track(*p, lo, hi); });
     r->SetRestage(GuestMemory::Restage);
+    r->SetRelease(GuestMemory::Release);
     r->SetReadback(GuestMemory::Store);
     live.store(r.get(), std::memory_order_release);
     return r.release();
@@ -321,7 +323,9 @@ void Render(Gpu::Renderer& r, const std::vector<std::pair<const u32*, u32>>& buf
     static std::vector<GuestMemory::Range> regions;
     const auto temp_t0 = DiagNow();
     RenderProbe::Begin(n, mem.regions);
+    Gpu::frame_phase.store("staging guest memory", std::memory_order_relaxed);
     if (mem.regions != regions) GuestMemory::SetRegions(regions = mem.regions);
+    r.ReclaimMirror();  // idle mirror pages give their memory back while video memory is short
     r.RestageLost();  // what the mirror could not take (no video memory) goes with this frame's offer
     const u32 faults = GuestMemory::BeginFrame(r, mem.offer);
     const auto temp_t1 = DiagNow();

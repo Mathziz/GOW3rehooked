@@ -310,6 +310,8 @@ struct Renderer::Impl {
         for (const auto& e : last)
             if (e[0] == lo && e[1] == hi) return false;
         last[last_at][0] = lo, last[last_at][1] = hi, last_at = (last_at + 1) & 3;
+        if (page_used)  // the mirror pages this draw reads stay (Reclaim)
+            for (u64 p = lo / page, e = std::min((hi + page - 1) / page, mirror_size / page); p < e; ++p) page_used[p].store(frame, std::memory_order_relaxed);
         const u64 h = ::Gpu::PieceHash::TrackingKey(&lo, 8, hi), tag = h ^ frame * 0x9E3779B97F4A7C15ull;
         if (u64& s = seen[h & 4095]; s == tag) return false;
         else s = tag;
@@ -347,6 +349,23 @@ struct Renderer::Impl {
     u32 lost_retry = 0, lost_delay = 1;
     std::function<void(u64, u64)> restage;  // live: GuestMemory::Restage (SetRestage)
     void Unstage(u64 lo, u64 hi);
+    // Mirror pages give their memory back (GPUs with little VRAM, set up by SetupMirror). Pages bound once stayed bound: the
+    // mirror only grew, past 1 GB after a few areas on a 2 GB card, and over the driver's budget the GPU stopped for good.
+    // When video memory nears its budget, Reclaim (frame start) unbinds the pages no draw read or wrote for a while: their
+    // slots serve the next binds, and a chunk left empty goes back to the driver. GuestMemory forgets those pages
+    // (GuestMemory::Release): the next draw that reads one tracks and stages it again.
+    std::unique_ptr<std::atomic<u32>[]> page_used;  // frame each mirror page was last read (Track) or bound or written (BindPages)
+    std::vector<u32> page_slot;                     // mirror page -> its chunk << 16 | page in the chunk (where bound)
+    std::vector<u64> pinned;                        // bitmap: pages the GPU writes (their bytes are only in the mirror): kept
+    std::vector<u32> chunk_live;                    // bound pages per chunk
+    std::vector<u64> chunk_bytes;                   // size per chunk
+    std::vector<u32> free_slots;                    // slots Reclaim freed, taken before a new chunk
+    std::vector<std::pair<u32, VkDeviceMemory>> dying_chunks;  // emptied chunks and the frame they emptied in: freed 4 frames later
+    std::unordered_map<u64, size_t> unbinds;        // pages unbound this frame -> their pending_binds entry (a bind reuses it)
+    std::function<bool(u64, u64)> release;          // live: GuestMemory::Release (SetRelease)
+    u32 reclaim_level = 0, reclaim_logged = 0;      // 0 room, 1 within an eighth of the budget, 2 over it (looked up every 16 frames)
+    u64 reclaim_cursor = 0, reclaimed_pages = 0, returned_bytes = 0;
+    void Reclaim();
     std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)
     // 4 KB piece -> content hash | 1 (0: never written), to skip unchanged uploads. Guest addresses below 32 GB; the
     // table is demand-zero memory, so only the pieces the game uses cost anything.

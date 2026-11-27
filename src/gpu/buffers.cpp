@@ -211,6 +211,16 @@ bool Renderer::Impl::SetupMirror(std::string& error) {
             return error = "the GPU has no sparse buffer residency and the mirror could not be bound to its backstop block", false;
         }
     }
+    // Reclaim (page_used): GPUs with 4 GB of VRAM or less that report a budget, mirror pages of 16 KB or more (each table then
+    // takes 2 MB for a 32 GB mirror of 64 KB pages). GOW3_MIRROR_RECLAIM=0 turns it off, =1 on wherever a budget is reported.
+    const char* reclaim_env = std::getenv("GOW3_MIRROR_RECLAIM");
+    const bool reclaim = reclaim_env ? reclaim_env[0] == '1' : compact_memory;
+    if (reclaim && budget_heaps && page >= (16u << 10) && kChunk / page <= 0x10000 && (backstop || ::Gpu::Features().sparse_residency_buffer)) {
+        const u64 pages = mirror_size / page;
+        page_used.reset(new std::atomic<u32>[pages]{});
+        page_slot.assign(pages, 0), pinned.assign(bound.size(), 0);
+        Gow3::Log("Renderer: guest mirror pages unused for a while give their memory back when video memory nears its budget");
+    }
     return true;
 }
 
@@ -293,6 +303,7 @@ void Renderer::Impl::DestroyMirror() {
     vkDestroyBuffer(dev, mirror, nullptr);
     if (backstop_buf) vkDestroyBuffer(dev, backstop_buf, nullptr);
     for (auto m : chunks) vkFreeMemory(dev, m, nullptr);
+    for (auto [f, m] : dying_chunks) vkFreeMemory(dev, m, nullptr);
     if (backstop) vkFreeMemory(dev, backstop, nullptr);
     vkDestroyDescriptorPool(dev, table_pool, nullptr), vkDestroyDescriptorSetLayout(dev, table_layout, nullptr);
 }
@@ -392,34 +403,114 @@ bool Renderer::Impl::BindPages(u64 lo, u64 hi, std::vector<Span>* missing) {
     std::scoped_lock bind(bind_lock);
     bool all = true;
     for (u64 p = lo / page * page, end = std::min(hi, mirror_size); p < end; p += page) {
-        u64& word = bound[p / page / 64];
-        const u64 bit = 1ull << (p / page % 64);
+        const u64 i = p / page;
+        if (page_used) {
+            page_used[i].store(frame, std::memory_order_relaxed);
+            if (!missing) pinned[i / 64] |= 1ull << i % 64;  // a GPU write (only Flush passes `missing`): kept from Reclaim
+        }
+        u64& word = bound[i / 64];
+        const u64 bit = 1ull << (i % 64);
         if (word & bit) continue;
-        if (chunk_used + page > chunk_cap) {
-            u64 size = chunk_size;
-            // After a refusal the pages left in this range would need the same chunk: none is asked for again.
-            VkDeviceMemory m = all ? AllocateChunk(size) : VK_NULL_HANDLE;
-            if (!m) {
-                all = false;
-                alloc_pressure.store(true, std::memory_order_relaxed);
-                if (!missing) break;
-                if (!missing->empty() && missing->back().second == p) missing->back().second = p + page;
-                else missing->push_back({p, p + page});
-                continue;
+        u32 chunk;
+        u64 offset;
+        if (!free_slots.empty()) {  // a slot Reclaim freed
+            chunk = free_slots.back() >> 16, offset = u64(free_slots.back() & 0xFFFF) * page;
+            free_slots.pop_back();
+        } else {
+            if (chunk_used + page > chunk_cap) {
+                u64 size = chunk_size;
+                // After a refusal the pages left in this range would need the same chunk: none is asked for again.
+                VkDeviceMemory m = all ? AllocateChunk(size) : VK_NULL_HANDLE;
+                if (!m) {
+                    all = false;
+                    alloc_pressure.store(true, std::memory_order_relaxed);
+                    if (!missing) break;
+                    if (!missing->empty() && missing->back().second == p) missing->back().second = p + page;
+                    else missing->push_back({p, p + page});
+                    continue;
+                }
+                chunks.push_back(m), chunk_live.push_back(0), chunk_bytes.push_back(size), chunk_used = 0, chunk_cap = size, mirror_chunks += size;
             }
-            chunks.push_back(m), chunk_used = 0, chunk_cap = size, mirror_chunks += size;
+            chunk = u32(chunks.size() - 1), offset = chunk_used, chunk_used += page;
         }
         word |= bit;
-        if (!pending_binds.empty() && pending_binds.back().resourceOffset + pending_binds.back().size == p &&
-            pending_binds.back().memory == chunks.back() &&
-            pending_binds.back().memoryOffset + pending_binds.back().size == chunk_used)
+        ++chunk_live[chunk];
+        if (page_used) page_slot[i] = chunk << 16 | u32(offset / page);
+        const VkDeviceMemory m = chunks[chunk];
+        if (const auto u = unbinds.find(p); u != unbinds.end()) {  // unbound by Reclaim this frame: that bind takes the slot instead
+            pending_binds[u->second].memory = m, pending_binds[u->second].memoryOffset = offset;
+            unbinds.erase(u);
+        } else if (!pending_binds.empty() && pending_binds.back().resourceOffset + pending_binds.back().size == p &&
+                   pending_binds.back().memory == m && pending_binds.back().memoryOffset + pending_binds.back().size == offset) {
             pending_binds.back().size += page;
-        else
-            pending_binds.push_back({p, page, chunks.back(), chunk_used, 0});
-        chunk_used += page;
+        } else {
+            pending_binds.push_back({p, page, m, offset, 0});
+        }
     }
     return all;
 }
+
+// Mirror pages unused for a while give their memory back while video memory is near or over its budget (see page_used):
+// 900 frames unused within an eighth of the budget, 120 over it, at most 256 pages (16 MB) a frame (each costs a protection
+// change). GPU writes, pages offered every frame and pages waiting for their copy stay.
+void Renderer::Impl::Reclaim() {
+    if (!page_used) return;
+    std::scoped_lock bind(bind_lock);
+    for (size_t k = 0; k < dying_chunks.size();)  // every frame that could reach an emptied chunk has retired
+        if (frame - dying_chunks[k].first >= 4) vkFreeMemory(dev, dying_chunks[k].second, nullptr), dying_chunks[k] = dying_chunks.back(), dying_chunks.pop_back();
+        else ++k;
+    if (frame % 16 == 0) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+        vkGetPhysicalDeviceMemoryProperties2(pd, &query);
+        reclaim_level = 0;
+        for (u32 h = 0; h < mem.memoryHeapCount; ++h)
+            if (budget_heaps >> h & 1)
+                reclaim_level = std::max(reclaim_level, budget.heapUsage[h] > budget.heapBudget[h] ? 2u
+                                                        : budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 > budget.heapBudget[h] ? 1u : 0u);
+    }
+    if (!reclaim_level || chunks.empty()) return;
+    const u32 idle = reclaim_level == 2 ? 120 : 900;
+    const u64 words = bound.size();
+    std::vector<u64> freed;  // mirror page indices released this frame (ascending per pass)
+    for (u64 n = 0; n < words && freed.size() < 256; ++n, reclaim_cursor = (reclaim_cursor + 1) % words) {
+        for (u64 bits = bound[reclaim_cursor] & ~pinned[reclaim_cursor]; bits && freed.size() < 256; bits &= bits - 1) {
+            const u64 i = reclaim_cursor * 64 + std::countr_zero(bits), p = i * page;
+            if (frame - page_used[i].load(std::memory_order_relaxed) < idle) continue;
+            if (!release(p, p + page)) {  // offered every frame or waiting for its copy: looked at again later
+                page_used[i].store(frame, std::memory_order_relaxed);
+                continue;
+            }
+            for (u64 a = p; a < p + page && a >> 12 < kPieces; a += 0x1000) written[a >> 12] = 0;  // staged again in full
+            InvalidateBlocks(p, page);
+            unbinds[p] = pending_binds.size();
+            pending_binds.push_back({p, page, backstop, backstop ? p % backstop_size : 0, 0});  // the backstop, or none (residency)
+            bound[i / 64] &= ~(1ull << i % 64);
+            const u32 slot = page_slot[i], c = slot >> 16;
+            free_slots.push_back(slot), freed.push_back(i);
+            if (--chunk_live[c] == 0 && c + 1 != chunks.size()) {  // emptied (not the chunk still being filled): back to the driver
+                dying_chunks.push_back({frame, chunks[c]}), chunks[c] = VK_NULL_HANDLE;
+                mirror_chunks -= chunk_bytes[c], returned_bytes += chunk_bytes[c];
+                std::erase_if(free_slots, [c](u32 s) { return s >> 16 == c; });
+            }
+        }
+    }
+    if (freed.empty()) return;
+    reclaimed_pages += freed.size();
+    if (!written_partial.empty()) {
+        std::sort(freed.begin(), freed.end());
+        std::erase_if(written_partial, [&](const auto& e) { return std::binary_search(freed.begin(), freed.end(), e.first / page); });
+    }
+    if (frame - reclaim_logged >= 600 || !reclaim_logged) {
+        reclaim_logged = frame | 1;
+        Gow3::Log(std::format("Renderer: video memory {} its budget: {} guest mirror pages unused for {} frames released so far, {} MB "
+                              "given back to the driver; mirror {} MB",
+                              reclaim_level == 2 ? "over" : "near", reclaimed_pages, idle, returned_bytes >> 20, mirror_chunks.load() >> 20));
+    }
+}
+
+void Renderer::ReclaimMirror() { d->Reclaim(); }
+void Renderer::SetRelease(std::function<bool(std::uint64_t lo, std::uint64_t hi)> release) { d->release = std::move(release); }
 
 // Staged bytes that could not reach the mirror (their pages got no memory): their hashes are forgotten, so the next offer
 // stages them again, and they wait in `lost` for RestageLost.
@@ -894,6 +985,8 @@ const std::unique_ptr<std::atomic<u8>[]> state(new std::atomic<u8>[kPages]{});
 // Host readability per page (one bit each) as VirtualQuery reported it, dropped on every guest mapping change:
 // VirtualQuery walks the page tables to the end of the region, tens of microseconds to milliseconds on the large views.
 const std::unique_ptr<std::atomic<u64>[]> known(new std::atomic<u64>[kPages / 64]{}), readable(new std::atomic<u64>[kPages / 64]{});
+// Pages Release opened (one bit each, never cleared): a write that faulted just before is run again (OnFault).
+const std::unique_ptr<std::atomic<u64>[]> released(new std::atomic<u64>[kPages / 64]{});
 #ifdef _WIN32
 std::mutex dirty_lock;
 std::vector<u64> dirty; // pages reopened by CPU writes since the last frame
@@ -1047,7 +1140,9 @@ bool OnFault(void* context, void* address) {
     // Another thread won the reopen and may not have changed the protection yet: run the access again, which faults again only
     // while it is still protected. VirtualQuery here walks the page tables of a view of gigabytes: milliseconds per fault.
     const Kind k = KindOf(page);
-    if ((k == Dirty || k == Dynamic || k == Clean) && (lost = page == lost_page ? lost + 1 : 1, lost_page = page, lost <= 16)) {
+    // Released by the renderer while this write faulted: opened, then forgotten (Unknown).
+    const bool opened = k == Unknown && (released[page / 64].load(std::memory_order_acquire) >> (page % 64) & 1);
+    if ((k == Dirty || k == Dynamic || k == Clean || opened) && (lost = page == lost_page ? lost + 1 : 1, lost_page = page, lost <= 16)) {
         if (lost > 2) {
 #ifdef _WIN32
             SwitchToThread();
@@ -1059,11 +1154,11 @@ bool OnFault(void* context, void* address) {
     }
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION m;
-    if ((k == Dirty || k == Dynamic || k == Clean) && VirtualQuery(reinterpret_cast<void*>(page * kPage), &m, sizeof(m)) &&
-        (Writable(m.Protect) || m.Protect == PAGE_READONLY || m.Protect == PAGE_EXECUTE_READ))
+    if ((k == Dirty || k == Dynamic || k == Clean || opened) && VirtualQuery(reinterpret_cast<void*>(page * kPage), &m, sizeof(m)) &&
+        (Writable(m.Protect) || (!opened && (m.Protect == PAGE_READONLY || m.Protect == PAGE_EXECUTE_READ))))
         return resume;
 #else
-    if ((k == Dirty || k == Dynamic || k == Clean) && lost <= 1024) {
+    if ((k == Dirty || k == Dynamic || k == Clean || opened) && lost <= 1024) {
         const timespec ts{0, 10'000};
         nanosleep(&ts, nullptr);
         return resume;
@@ -1246,6 +1341,33 @@ bool Track(Gpu::Renderer& renderer, u64 lo, u64 hi) {
         a = end;
     }
     return staged;
+}
+
+// The renderer's mirror gives the memory behind [lo, hi) back (Renderer::Impl::Reclaim): false, nothing changed, when a page
+// in it is offered every frame or waits for its copy (dirty, dynamic, region). Otherwise every page is forgotten: a
+// protected one is opened first (a write no longer faults, and none is missed: the page is read in full again), and each is
+// tracked again, its bytes staged, at the next draw that reads it.
+bool Release(u64 lo, u64 hi) {
+    const u64 first = lo / kPage, end = std::min((hi + kPage - 1) / kPage, kPages);
+    for (u64 p = first; p < end; ++p)
+        if (const Kind k = KindOf(p); k == Dirty || k == Dynamic || k == Region) return false;
+    for (u64 p = first; p < end;) {
+        u8 v = state[p].load(std::memory_order_acquire);
+        if ((v & 7) != Clean) {
+            if ((v & 7) == Fixed) state[p].compare_exchange_strong(v, Unknown);
+            ++p;
+            continue;
+        }
+        u64 q = p + 1;  // the run of protected pages alike: one protection change
+        while (q < end && (state[q].load(std::memory_order_acquire) & (7 | kExec)) == (v & (7 | kExec))) ++q;
+        Mark(released.get(), p, q, true);
+        ProtectRange(p, q, v & kExec ? ExecuteReadWrite : ReadWrite);
+        for (u64 i = p; i < q; ++i)  // a fault in between reopened it (Dirty): it stays queued
+            if (u8 c = state[i].load(std::memory_order_acquire); (c & 7) == Clean) state[i].compare_exchange_strong(c, Unknown);
+        p = q;
+    }
+    std::erase_if(closed, [&](u64 page) { return page >= first && page < end; });
+    return true;
 }
 
 // The mirror lost these bytes (no video memory for their pages): they are offered again as if the CPU had written them. A

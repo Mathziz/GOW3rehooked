@@ -1790,7 +1790,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
             Impl::Stalled(r.stall_binds, r.stall_bind_ns, [&] {
                 temp_call = "bind sparse", r.TempLost("bind sparse", vkQueueBindSparse(r.queue, 1, &bsi, VK_NULL_HANDLE)), temp_call = nullptr;  // TEMP fault
             });
-            r.pending_binds.clear();
+            r.pending_binds.clear(), r.unbinds.clear();
         }
         frame_phase.store("submitting the frame", std::memory_order_relaxed);
         temp_call = "submit", r.TempLost("submit", vkQueueSubmit(r.queue, 1, &si, rb_async ? VK_NULL_HANDLE : r.fence)), temp_call = nullptr;
