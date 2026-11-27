@@ -47,6 +47,8 @@
 #define LEFTJOYSTICK_HALFMODE 0x00010000
 #define RIGHTJOYSTICK_HALFMODE 0x00020000
 #define BACK_BUTTON 0x00040000
+// Evade toward the direction of movement: while held, the right stick takes the left stick's direction.
+#define DODGE_BUTTON 0x00080000
 
 #define KEY_TOGGLE 0x00200000
 #define MOUSE_GYRO_ROLL_MODE 0x00400000
@@ -142,6 +144,7 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"touchpad_right", SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT},
     {"leftjoystick_halfmode", LEFTJOYSTICK_HALFMODE},
     {"rightjoystick_halfmode", RIGHTJOYSTICK_HALFMODE},
+    {"dodge", DODGE_BUTTON},
 
     // this is only for input
     {"back", SDL_GAMEPAD_BUTTON_BACK},
@@ -541,13 +544,14 @@ public:
 
 class ControllerAllOutputs {
 public:
-    static constexpr u64 output_count = 43;
+    static constexpr u64 output_count = 44;
     std::array<ControllerOutput, output_count> data = {
         // Important: these have to be the first, or else they will update in the wrong order
         ControllerOutput(LEFTJOYSTICK_HALFMODE),
         ControllerOutput(RIGHTJOYSTICK_HALFMODE),
         ControllerOutput(KEY_TOGGLE),
         ControllerOutput(MOUSE_GYRO_ROLL_MODE),
+        ControllerOutput(DODGE_BUTTON),
 
         // Button mappings
         ControllerOutput(SDL_GAMEPAD_BUTTON_NORTH),           // Triangle

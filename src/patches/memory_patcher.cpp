@@ -4,6 +4,9 @@
 #include "main/host.h"
 #include "orbis/core/loader/elf.h"
 #include "orbis/core/memory.h"
+#include "orbis/common/util.h"
+#include "orbis/core/file_sys/fs.h"
+#include <cctype>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -46,6 +49,23 @@ void MemoryPatcher::Apply(std::span<const MemoryPatch> patches) {
 #endif
         throw;
     }
+}
+
+bool Cinematics4KAvailable() {
+    static const bool available = [] {
+        const auto folder = Common::Singleton<Core::FileSys::MntPoints>::Instance()->GetHostPath("/app0/EXEC/CINEMATICS/4K");
+        size_t videos = 0;
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
+            auto extension = entry.path().extension().string();
+            std::ranges::transform(extension, extension.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+            if (extension == ".BSF" && entry.is_regular_file(error)) ++videos;
+        }
+        Log(videos ? std::format("4K cinematics: {} videos in {}", videos, folder.string())
+                   : std::format("4K cinematics: on, but {} has no .BSF video; the original cinematics play", folder.string()));
+        return videos != 0;
+    }();
+    return available;
 }
 
 bool IsSupportedEboot(const std::filesystem::path& path) {
@@ -126,7 +146,7 @@ void ApplyGamePatches(Core::Module& eboot, const Config& config) {
         patches.push_back({0x01b2a3, {0x75, 0x4a}, {0x75, 0x42}});
         patches.push_back({0x01b2e7, {0x85, 0xc0, 0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc8}, {0xb9, 0x01, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90}});
     }
-    if (config.cinematics_4k) {
+    if (config.cinematics_4k && Cinematics4KAvailable()) {
         // Frame queue capacity, decoder limits, and the Y/UV render height clamp.
         value(0x1f2d69, 1920, 3840);
         value(0x1f2d6e, 1080, 2160);

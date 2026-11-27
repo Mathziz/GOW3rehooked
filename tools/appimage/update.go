@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-const repo = "cuesta4/GOW3rehooked"
+const repo = "Mathziz/GOW3rehooked" // this fork updates from its own releases
 const gameImage = "gow3.AppImage"
 const debugImage = "gow3_debug.AppImage"
 const cache = "_rehooked_/shader_cache/recipes-hash2-aes.bin"

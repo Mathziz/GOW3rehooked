@@ -32,6 +32,7 @@
 #include "ui/game_language.h"
 #include "kernel.h"
 #include "patches/hooks.h" // TEMP shadow trace
+#include "patches/button_glyphs.h"
 #include "present/splash.h"
 #include "gpu/shaders/shader_cache.h"
 #include "gpu/shaders/shader_recipes.h"
@@ -360,11 +361,13 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
+    const u64 position = file->Tell();
     s64 bytes = file->Read(file_buf.data(), nbytes);
     if (bytes < 0) {
         return bytes;
     }
     std::memcpy(buf, file_buf.data(), bytes);
+    Gow3::FileOverlay::Apply(file->m_guest_name, position, buf, u64(bytes)); // the keyboard prompts (button_glyphs.cpp)
     // Without page protection on cached images, an upload during the read would keep the partial contents.
     memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), u64(bytes));
     return bytes;

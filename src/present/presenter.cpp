@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "present/presenter.h"
+#include "present/fps_overlay.h"
 #include "present/presentation_timing.h"
 #include "present/splash.h"
 #include <SDL3/SDL.h>
@@ -718,7 +719,7 @@ void Run(const std::stop_token& token) {
             std::unique_lock lock(flip_mutex);
             flip_cv.wait_for(lock, token, std::chrono::milliseconds(16), [] { return flipped; });
             if (std::exchange(flipped, false)) latch = flip_time, guest_frame = flipped_frame;
-            else if (!ImGui::Core::MustKeepDrawing()) continue;
+            else if (!ImGui::Core::HasInteractiveLayers()) continue;  // a passive layer is drawn with the game's frames
             address = display; bgra = display_bgra;
         }
         if (GpuThread::CinematicActive()) {
@@ -745,6 +746,7 @@ void UpdateDisplay() {
 void Flipped(u64 address, bool bgra, u64 frame_id) {
     { std::scoped_lock lock(flip_mutex); flipped = true; display = address; display_bgra = bgra; flip_time = PresentationTiming::Now(); flipped_frame = frame_id; }
     flip_cv.notify_one();
+    FpsOverlay::Flip();
 }
 
 void SetGamma(float value) { output_gamma.store(value, std::memory_order_relaxed); }

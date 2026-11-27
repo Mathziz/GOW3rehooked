@@ -13,6 +13,9 @@ enum class AntiAliasing { None, Cmaa2 };
 enum class ScalingFilter { Bilinear, Fsr1 };
 enum class ShaderRecompilation { Sync, Async };
 enum class ShaderMechanism { Jit, Aot };
+// The game's own button prompts: PlayStation (the original), the keys and mouse buttons of the controls, or those when no
+// gamepad is connected at startup.
+enum class ButtonIcons { Auto, PlayStation, Keyboard };
 // Output resolutions of the resolution patches (God_of_War_III_Remastered.xml, kvicken + cuesta4).
 // Base video arena in the stock eboot is 0x50000000 (1280 MiB), high byte 0x50.
 // Every option enlarges the Video Arena (`arena` is the high byte of its size, where 1 unit = 16 MiB).
@@ -66,7 +69,9 @@ struct Config {
     unsigned msaa = 2;
     bool skip_intro = false;
     bool skip_videos = true;                // cinematics can be skipped with X
-    bool cinematics_4k = false;
+    bool cinematics_4k = false;             // the cinematics found in EXEC/CINEMATICS/4K replace the originals
+    ButtonIcons button_icons = ButtonIcons::Auto;
+    bool fps_overlay = false;               // the frame rate counter (F10)
     DisplayMode display_mode = DisplayMode::Borderless;
     bool vrr = false;                       // full screen: the display at its highest refresh rate
     VSync vsync = VSync::Fifo;
@@ -91,4 +96,6 @@ struct Config {
 Config LoadConfig(const std::filesystem::path& path);
 void SaveMenuConfig(const std::filesystem::path& path, const Config& config);
 void SaveExtrasConfig(const std::filesystem::path& path, const Config& config);
+// Sets one option of config.cfg, keeping the rest of the file as it is.
+void SaveConfigValue(const std::filesystem::path& path, std::string_view key, std::string_view value);
 }

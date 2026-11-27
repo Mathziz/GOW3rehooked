@@ -247,7 +247,7 @@ bool ProcessEvent(const SDL_Event& event) {
     // An overlay can take input before ImGui has drawn its first frame. Keep key releases flowing to the game
     // so bindings pressed before the overlay opened still get released.
     const bool key_captured = event.type == SDL_EVENT_KEY_DOWN && captured != 0;
-    const bool active = MustKeepDrawing();
+    const bool active = HasInteractiveLayers();
     if (!active && event.type != SDL_EVENT_GAMEPAD_ADDED && event.type != SDL_EVENT_GAMEPAD_REMOVED &&
         event.type != SDL_EVENT_MOUSE_BUTTON_UP) return key_captured;
     std::scoped_lock lock(ui_mutex);
@@ -267,8 +267,9 @@ void NewFrame() {
     ImGui::Render();
     UpdateRetiring();
     ui_visible = GetDrawData()->CmdListsCount != 0;
-    ui_capture = MustKeepDrawing() && (GetIO().NavActive || GetIO().WantCaptureMouse || GetIO().WantCaptureKeyboard);
-    if (!MustKeepDrawing()) { GetIO().ClearInputKeys(); GetIO().ClearEventsQueue(); }
+    const bool interactive = HasInteractiveLayers();
+    ui_capture = interactive && (GetIO().NavActive || GetIO().WantCaptureMouse || GetIO().WantCaptureKeyboard);
+    if (!interactive) { GetIO().ClearInputKeys(); GetIO().ClearEventsQueue(); }
 }
 void Render(VkCommandBuffer cmd, VkQueue queue) {
     if (!ui_visible && !retiring) return;
@@ -290,6 +291,12 @@ bool IsGamepadInputCaptured() { return captured != 0 || ui_capture; }
 bool MustKeepDrawing() {
     std::scoped_lock lock(layer_mutex);
     return !layers.empty() || !layer_changes.empty() || retiring;
+}
+bool HasInteractiveLayers() {
+    std::scoped_lock lock(layer_mutex);
+    return std::ranges::any_of(layers, [](Layer* layer) { return layer->ShouldKeepDrawing(); }) ||
+           std::ranges::any_of(layer_changes, [](const auto& change) { return change.first && change.second->ShouldKeepDrawing(); }) ||
+           retiring;
 }
 void DrawLayers() {
     {

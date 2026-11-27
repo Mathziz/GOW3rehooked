@@ -29,6 +29,7 @@ constexpr std::array<std::string_view, 2> AntiAliasingModes{"none", "cmaa2"};
 constexpr std::array<std::string_view, 2> ScalingFilters{"bilinear", "fsr1"};
 constexpr std::array<std::string_view, 2> ShaderModes{"sync", "async"};
 constexpr std::array<std::string_view, 2> ShaderMechanisms{"jit", "aot"};
+constexpr std::array<std::string_view, 3> ButtonIconStyles{"auto", "playstation", "keyboard"};
 
 template <typename Enum, size_t N>
 bool Choice(std::string_view value, Enum& out, const std::array<std::string_view, N>& choices) {
@@ -82,6 +83,10 @@ Config LoadConfig(const std::filesystem::path& path) {
             valid = Boolean(value, config.skip_videos);
         } else if (key == "cinematics_4k") {
             valid = Boolean(value, config.cinematics_4k);
+        } else if (key == "button_icons") {
+            valid = Choice(value, config.button_icons, ButtonIconStyles);
+        } else if (key == "fps_overlay") {
+            valid = Boolean(value, config.fps_overlay);
         } else if (key == "display_mode") {
             valid = Choice(value, config.display_mode, DisplayModes);
         } else if (key == "vsync") {
@@ -213,6 +218,7 @@ void SaveMenuConfig(const std::filesystem::path& path, const Config& config) {
         unsigned(config.scaling_filter) >= ScalingFilters.size() || unsigned(config.anti_aliasing) >= AntiAliasingModes.size() ||
         unsigned(config.shader_recompilation) >= ShaderModes.size() ||
         unsigned(config.shader_mechanism) >= ShaderMechanisms.size() ||
+        unsigned(config.button_icons) >= ButtonIconStyles.size() ||
         config.vibration > 100)
         throw std::runtime_error("Invalid menu configuration");
     const auto flag = [](bool value) { return value ? "true" : "false"; };
@@ -224,11 +230,17 @@ void SaveMenuConfig(const std::filesystem::path& path, const Config& config) {
         {"anti_aliasing", std::string(AntiAliasingModes[size_t(config.anti_aliasing)])}, {"scaling_filter", std::string(ScalingFilters[size_t(config.scaling_filter)])},
         {"skip_intro", flag(config.skip_intro)},
         {"skip_videos", flag(config.skip_videos)}, {"cinematics_4k", flag(config.cinematics_4k)},
+        {"button_icons", std::string(ButtonIconStyles[size_t(config.button_icons)])},
         {"shader_recompilation", std::string(ShaderModes[size_t(config.shader_recompilation)])},
         {"shader_mechanism", std::string(ShaderMechanisms[size_t(config.shader_mechanism)])}, {"lazy_aot", flag(config.lazy_aot)},
     };
     const auto extras = ExtrasValues(config);
     values.insert(values.end(), extras.begin(), extras.end());
+    WriteConfigValues(path, values);
+}
+
+void SaveConfigValue(const std::filesystem::path& path, std::string_view key, std::string_view value) {
+    const std::pair<std::string_view, std::string> values[]{{key, std::string(value)}};
     WriteConfigValues(path, values);
 }
 

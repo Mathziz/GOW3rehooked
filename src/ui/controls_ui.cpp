@@ -62,6 +62,8 @@ constexpr Action actions[]{
     {"Right Analog Down", "axis_right_y_plus", "", Glyph::StickDown},
     {"Right Analog Left", "axis_right_x_minus", "", Glyph::StickLeft},
     {"Right Analog Right", "axis_right_x_plus", "", Glyph::StickRight},
+    // Rehooked's own output: while held, the right stick follows the left one's direction (input_handler.cpp, ApplyDodge).
+    {"Evade", "dodge", "", Glyph::R3},
     {"D-Pad Up", "pad_up", "pad_up", Glyph::DpadUp},
     {"D-Pad Down", "pad_down", "pad_down", Glyph::DpadDown},
     {"D-Pad Left", "pad_left", "pad_left", Glyph::DpadLeft},
@@ -133,6 +135,8 @@ constexpr Help help[]{
     {"Graphics", "Scaler", "How the image is resized to your display. Bilinear is the fastest. FSR 1 (enlarging) and Lanczos 2 (shrinking) keep more detail."},
     {"Other", "Skip Opening Logos", "Starts the game at the title menu."},
     {"Other", "Skip Videos with X", "Press Cross to skip any video or cutscene."},
+    {"Other", "4K Cinematics", "Plays your own 4K versions of the cinematics: files with the original names (OPENINGINT.BSF, for example) in the EXEC/CINEMATICS/4K folder. The others play as they are."},
+    {"Other", "Button Icons", "The game's own prompts: tutorials, move list and quick-time events. Keyboard shows the keys and mouse buttons of your controls. Auto does so when no gamepad is connected at startup."},
     {"Other", "Shader Mechanism", "AOT prepares the shaders before you play, so stutter is rare. JIT translates each shader when it first appears, which can stutter."},
     {"Other", "Shader Recompilation", "How shaders are translated during gameplay. Async: no stutter, but an object can appear a moment late. Sync: nothing appears late, but a hitch is possible."},
     {"Other", "Lazy AOT", "On: the first shader preparation is split over up to four launches. Off: it is done in one."},
@@ -555,6 +559,12 @@ void Screen::ControlRow(int index, ImFont* font) {
         const std::string_view token = bound[index].empty() ? std::string_view(actions[index].fallback) : std::string_view(bound[index]);
         if (const auto input = std::ranges::find(pad_inputs, token, &PadInput::token); input != std::end(pad_inputs)) {
             UI::DrawPadGlyph(draw, center, c.glyph_h, input->glyph);
+        } else if (token.empty() && !std::strcmp(actions[index].output, "dodge")) { // on a gamepad the right stick itself evades
+            const char* stick = Tr("Right stick");
+            float size = 15.0f * S;
+            ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, stick);
+            if (extent.x > box_max.x - box_min.x - 8.0f * S) size *= (box_max.x - box_min.x - 8.0f * S) / extent.x, extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, stick);
+            draw->AddText(font, size, center - extent * 0.5f, Theme::GoldMuted, stick);
         } else if (token.empty()) { // the analog directions the stick drives
             UI::DrawPadGlyph(draw, center, c.glyph_h, actions[index].glyph);
         } else { // an input that has no picture
@@ -775,9 +785,13 @@ void Screen::DrawControls(const Layout& L, ImDrawList* list, ImFont* font) {
 
     const float body = std::max(17.0f, 1.24f * L.cqw);
     auto* text_font = UI::g_font_body ? UI::g_font_body : font;
-    const float y = DrawPaneTitle(L, list, font, Tr("Reassign controls"));
-    WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted,
-             Tr("Select an action, then press the controller/keyboard/mouse key you want to map."));
+    float y = DrawPaneTitle(L, list, font, Tr("Reassign controls"));
+    y = WrapText(list, text_font, body, {L.right_x, y}, L.right_w, Theme::TextMuted,
+                 Tr("Select an action, then press the controller/keyboard/mouse key you want to map."));
+    y = WrapText(list, text_font, body, {L.right_x, y + body * 0.6f}, L.right_w, Theme::TextMuted,
+                 Tr("Evade: press it while moving to roll that way, like a flick of the right stick. With no direction held, Kratos rolls back."));
+    WrapText(list, text_font, body, {L.right_x, y + body * 0.6f}, L.right_w, Theme::TextMuted,
+             Tr("Shortcuts: F10 shows the frame rate, F11 switches full screen, F8 reloads the controls and Ctrl + Shift + End quits."));
 }
 
 void Screen::DrawHelp(const Layout& L, ImDrawList* list, ImFont* font) {

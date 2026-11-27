@@ -12,6 +12,7 @@ public:
     static void RemoveLayer(Layer* layer);
 
     virtual void Draw() = 0;
+    // False for a passive layer: drawn with the game's frames, it takes no input and presents nothing of its own.
     virtual bool ShouldKeepDrawing() {
         return true;
     }

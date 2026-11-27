@@ -26,6 +26,7 @@
 #include "input/input_mouse.h"
 #include "orbis/internals/save_data/save_backup.h"
 #include "main/host.h"
+#include "present/fps_overlay.h"
 #include "present/presenter.h"
 #include "present/prompt.h"
 #include "present/save_import_ui.h"
@@ -273,6 +274,7 @@ void Open(const Config& config, bool splash) {
     ImGui::Core::Initialize(window);
     Presenter::Initialize(window, config);
     Splash::Show(!config.skip_intro, splash);
+    if (config.fps_overlay) FpsOverlay::Show(true);
 }
 
 namespace {
@@ -429,6 +431,17 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
     SDL_AddTimer(33, Input::MousePolling, controllers[0]);
     Uint64 mouse_time = SDL_GetTicks();
     bool mouse_hidden = false, reset_prompt = false;
+#ifdef _WIN32
+    // Shift evades: pressed five times in a row it would open the Sticky Keys question over the game. Its shortcut is off while
+    // the game runs (this session only, as Microsoft advises for games) and comes back when it closes.
+    STICKYKEYS sticky_keys{sizeof(STICKYKEYS)};
+    const bool sticky_saved = SystemParametersInfoW(SPI_GETSTICKYKEYS, sizeof(sticky_keys), &sticky_keys, 0);
+    if (sticky_saved && !(sticky_keys.dwFlags & SKF_STICKYKEYSON)) {
+        STICKYKEYS off = sticky_keys;
+        off.dwFlags &= ~(SKF_HOTKEYACTIVE | SKF_CONFIRMHOTKEY);
+        SystemParametersInfoW(SPI_SETSTICKYKEYS, sizeof(off), &off, 0);
+    }
+#endif
     Splash::Priority priority;  // the hold-to-skip input and the splash's frames keep up with the shader build
     for (SDL_Event event;;) {
         priority.Update();
@@ -531,6 +544,7 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
             SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
             continue;
         case SDL_EVENT_RELOAD_INPUTS: Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial())); continue;
+        case SDL_EVENT_TOGGLE_SIMPLE_FPS: FpsOverlay::Toggle(); continue;
         case SDL_EVENT_MOUSE_TO_JOYSTICK:
             SDL_SetWindowRelativeMouseMode(window, Input::ToggleMouseModeTo(Input::MouseMode::Joystick));
             continue;
@@ -546,6 +560,9 @@ void RunEventLoop(const std::filesystem::path& log_path, const std::filesystem::
         break;
     }
     // Guest threads cannot be unwound; the process ends with the window.
+#ifdef _WIN32
+    if (sticky_saved) SystemParametersInfoW(SPI_SETSTICKYKEYS, sizeof(sticky_keys), &sticky_keys, 0);
+#endif
     SaveImportUi::WaitForCopy();
     Libraries::SaveData::Backup::StopThread();
     StopDiagnosticHooks();

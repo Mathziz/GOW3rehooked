@@ -20,5 +20,8 @@ bool IsGamepadInputCaptured();
 bool GamepadPrompts();
 bool PlayStationPrompts();  // the last gamepad is a DualShock 3, DualShock 4 or DualSense (else Xbox-style prompts)
 void DrawLayers();
+// Any layer is up: UI frames are built (passive layers such as the FPS counter included).
 bool MustKeepDrawing();
+// A layer that takes input or animates on its own is up: the UI gets the input and is presented without game frames.
+bool HasInteractiveLayers();
 }

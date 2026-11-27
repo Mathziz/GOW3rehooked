@@ -7,7 +7,9 @@
 #include <iostream>
 #include <list>
 #include <map>
+#include <mutex>
 #include <ranges>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -89,6 +91,9 @@ axis_right_x_plus = l
 axis_right_y_minus = i
 axis_right_y_plus = k
 
+# Evade toward the direction you move (W, A, S, D), like the right stick
+dodge = lshift
+
 # Controller bindings
 
 triangle = triangle
@@ -123,6 +128,36 @@ analog_deadzone = rightjoystick, 5, 127
 override_controller_color = false, 0, 0, 255
 )";
 }
+// Configs written before the Evade output get it on Shift, unless Shift already does something there. The comment that comes
+// with it marks the file as done, so a binding the player removes stays removed.
+void AddEvadeBinding(const std::filesystem::path& file) {
+    static std::mutex mutex;
+    static std::set<std::filesystem::path> checked; // once per file and run: the configs are read on every lookup
+    std::scoped_lock lock(mutex);
+    if (file.filename() == "global.ini" || !checked.insert(file).second) return;
+    std::string text;
+    {
+        std::ifstream in(file, std::ios::binary);
+        if (!in) return;
+        text.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    if (text.find("dodge") != std::string::npos) return;
+    bool shift_used = false;
+    std::istringstream lines(text);
+    for (std::string line; std::getline(lines, line);) {
+        line.erase(std::find(line.begin(), line.end(), '#'), line.end());
+        std::erase_if(line, [](unsigned char c) { return std::isspace(c); });
+        const auto equal = line.find('=');
+        if (equal == std::string::npos) continue;
+        for (const auto token : std::views::split(std::string_view(line).substr(equal + 1), ','))
+            if (std::string_view(token.begin(), token.end()) == "lshift") shift_used = true;
+    }
+    std::ofstream out(file, std::ios::app | std::ios::binary);
+    if (!text.empty() && text.back() != '\n') out << '\n';
+    out << "\n# Evade toward the direction you move (W, A, S, D), like the right stick\n";
+    if (!shift_used) out << "dodge = lshift\n";
+}
+
 std::filesystem::path GetInputConfigFile(const std::string& game_id) {
     // Read configuration file of the game, and if it doesn't exist, generate it from default
     // If that doesn't exist either, generate that from getDefaultConfig() and try again
@@ -163,53 +198,44 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
         }
     }
     if (game_id == "global") {
+        // The shortcuts the game answers. shadPS4's others (pause, capture, screenshot, virtual users, the mouse as a stick, gyro
+        // or touchpad, its settings and friends windows) did nothing here but hold F2 to F12 and Delete, which then could not be
+        // bound to an action: older files lose them.
         std::map<std::string, std::string> default_bindings_to_add = {
-            {"hotkey_capture_frame", "f12"},
-            {"hotkey_screenshot_with_overlays", "lalt, f12"},
             {"hotkey_fullscreen", "f11"},
             {"hotkey_show_fps", "f10"},
-            {"hotkey_pause", "f9"},
             {"hotkey_reload_inputs", "f8"},
-            {"hotkey_toggle_mouse_to_joystick", "f7"},
-            {"hotkey_toggle_mouse_to_gyro", "f6"},
-            {"hotkey_add_virtual_user", "f5"},
-            {"hotkey_remove_virtual_user", "f4"},
-            {"hotkey_toggle_mouse_to_touchpad", "delete"},
             {"hotkey_quit", "lctrl, lshift, end"},
             {"hotkey_volume_up", "kpplus"},
             {"hotkey_volume_down", "kpminus"},
-            {"hotkey_emulator_settings", "f3"},
-            {"hotkey_toggle_friends", "f2"},
         };
-        std::string legacy_capture_binding;
-        bool legacy_capture_binding_found = false;
-        std::ifstream global_in(config_file);
-        std::string line;
-        while (std::getline(global_in, line)) {
-            line.erase(std::remove_if(line.begin(), line.end(),
-                                      [](unsigned char c) { return std::isspace(c); }),
-                       line.end());
-            std::size_t equal_pos = line.find('=');
-            if (equal_pos == std::string::npos) {
-                continue;
-            }
-            std::string output_string = line.substr(0, equal_pos);
-            if (output_string == "hotkey_renderdoc_capture") {
-                legacy_capture_binding = line.substr(equal_pos + 1);
-                legacy_capture_binding_found = true;
-            }
-            default_bindings_to_add.erase(output_string);
-        }
-        global_in.close();
-        if (legacy_capture_binding_found) {
-            if (auto it = default_bindings_to_add.find("hotkey_capture_frame");
-                it != default_bindings_to_add.end()) {
-                it->second = legacy_capture_binding;
+        static constexpr std::string_view removed[]{
+            "hotkey_capture_frame", "hotkey_renderdoc_capture", "hotkey_screenshot_with_overlays", "hotkey_pause",
+            "hotkey_toggle_mouse_to_joystick", "hotkey_toggle_mouse_to_gyro", "hotkey_toggle_mouse_to_touchpad",
+            "hotkey_add_virtual_user", "hotkey_remove_virtual_user", "hotkey_emulator_settings", "hotkey_toggle_friends",
+        };
+        std::vector<std::string> kept;
+        bool dropped = false;
+        {
+            std::ifstream global_in(config_file);
+            for (std::string line; std::getline(global_in, line);) {
+                std::string compact = line;
+                compact.erase(std::find(compact.begin(), compact.end(), '#'), compact.end());
+                std::erase_if(compact, [](unsigned char c) { return std::isspace(c); });
+                const std::size_t equal_pos = compact.find('=');
+                const std::string output_string = equal_pos == std::string::npos ? std::string{} : compact.substr(0, equal_pos);
+                if (std::ranges::find(removed, output_string) != std::end(removed)) {
+                    dropped = true;
+                    continue;
+                }
+                default_bindings_to_add.erase(output_string);
+                kept.push_back(std::move(line));
             }
         }
-        std::ofstream global_out(config_file, std::ios::app);
-        for (auto const& b : default_bindings_to_add) {
-            global_out << b.first << " = " << b.second << "\n";
+        if (dropped || !default_bindings_to_add.empty()) {
+            std::ofstream global_out(config_file, std::ios::trunc);
+            for (const auto& line : kept) global_out << line << "\n";
+            for (auto const& b : default_bindings_to_add) global_out << b.first << " = " << b.second << "\n";
         }
     }
 
@@ -217,6 +243,8 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
     if (!std::filesystem::exists(config_file)) {
         std::filesystem::copy(default_config_file, config_file);
     }
+    AddEvadeBinding(config_file);
+    if (!game_id.empty() && game_id != "default") AddEvadeBinding(default_config_file);
     return config_file;
 }
 
@@ -697,6 +725,22 @@ void ParseInputConfig(const std::string& game_id) {
         ProcessLine();
     }
     config_stream.close();
+    // A key that presses an action is the action's: a shortcut on the same key alone would take the press from it (only one
+    // binding can use a pressed key), so the shortcut is dropped for this run.
+    std::vector<InputID> action_keys;
+    for (const auto& c : connections) {
+        if (c.output->button >= HOTKEY_FULLSCREEN && c.output->button != u32(SDL_GAMEPAD_BUTTON_INVALID)) continue;
+        for (const auto& key : c.binding.keys)
+            if (key.IsValid() && key.type == InputType::KeyboardMouse) action_keys.push_back(key);
+    }
+    std::erase_if(connections, [&](const BindingConnection& c) {
+        if (c.output->button < HOTKEY_FULLSCREEN || c.output->button == u32(SDL_GAMEPAD_BUTTON_INVALID) || c.binding.KeyCount() != 1)
+            return false;
+        const auto& key = c.binding.keys[0].IsValid() ? c.binding.keys[0] : c.binding.keys[1].IsValid() ? c.binding.keys[1] : c.binding.keys[2];
+        const bool taken = std::ranges::find(action_keys, key) != action_keys.end();
+        if (taken) LOG_INFO(Input, "Shortcut {:#x} is off: its key is bound to an action", c.output->button);
+        return taken;
+    });
     std::sort(connections.begin(), connections.end());
     for (auto& c : connections) {
         LOG_DEBUG(Input, "Binding: {} : {}", c.output->ToString(), c.binding.ToString());
@@ -903,6 +947,7 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             PushSDLEvent(SDL_EVENT_TOGGLE_FRIENDS);
             break;
         case KEY_TOGGLE:
+        case DODGE_BUTTON: // read by ApplyDodge before the axes are sent
             // noop
             break;
         case MOUSE_GYRO_ROLL_MODE:
@@ -1079,6 +1124,28 @@ InputEvent BindingConnection::ProcessBinding() {
     return event; // All keys are active
 }
 
+// While the Evade output is held, the right stick points where the left one does (W, A, S, D or the stick), at full
+// deflection: the game evades with a flick of the right stick. With no direction held, Kratos evades backwards, toward the
+// camera.
+static void ApplyDodge(ControllerAllOutputs& outputs) {
+    const auto find = [&](u32 button, u32 axis) -> ControllerOutput* {
+        const auto it = std::ranges::find(outputs.data, ControllerOutput(button, axis));
+        return it == outputs.data.end() ? nullptr : &*it;
+    };
+    const auto* dodge = find(DODGE_BUTTON, SDL_GAMEPAD_AXIS_INVALID);
+    if (!dodge || !dodge->new_button_state) return;
+    auto* const left_x = find(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTX);
+    auto* const left_y = find(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTY);
+    auto* const right_x = find(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHTX);
+    auto* const right_y = find(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHTY);
+    if (!left_x || !left_y || !right_x || !right_y) return;
+    int x = std::clamp<int>(*left_x->new_param, -127, 127), y = std::clamp<int>(*left_y->new_param, -127, 127);
+    if (std::max(std::abs(x), std::abs(y)) < 32) x = 0, y = 127;
+    const int largest = std::max(std::abs(x), std::abs(y));
+    *right_x->new_param = s16(x * 127 / largest), *right_y->new_param = s16(y * 127 / largest);
+    right_x->digital_axis = right_y->digital_axis = true;
+}
+
 void ActivateOutputsFromInputs() {
 
     // todo find a better solution
@@ -1102,6 +1169,7 @@ void ActivateOutputsFromInputs() {
                 it.output->AddUpdate(it.ProcessBinding());
             }
         }
+        ApplyDodge(output_arrays[i]);
 
         // Update all outputs
         for (auto& it : output_arrays[i].data) {

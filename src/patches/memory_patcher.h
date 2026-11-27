@@ -19,6 +19,9 @@ private:
 };
 // Startup EBOOT patches for native save capacity and configured compatibility settings.
 void ApplyGamePatches(Core::Module& eboot, const Config& config);
+// The 4K cinematics option has something to play: EXEC/CINEMATICS/4K holds at least one .BSF video (logged once). Without one
+// the option changes nothing, not even the decoder's limits.
+bool Cinematics4KAvailable();
 // The file holds version 1.02's code (European and American) where the patches go: checked before the window opens.
 bool IsSupportedEboot(const std::filesystem::path& path);
 }

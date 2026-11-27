@@ -17,6 +17,7 @@
 #include "patches/extras.h"
 #include "patches/hooks.h"
 #include "patches/memory_patcher.h"
+#include "patches/button_glyphs.h"
 #include "present/window.h"
 #include "gpu/gpu_thread.h"
 #ifndef _WIN32
@@ -188,6 +189,7 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
         if (flags == 0) {
             InstallHooks(*linker->GetModule(0), config);
             ApplyGamePatches(*linker->GetModule(0), config);
+            ButtonGlyphs::Prepare(game, config);
         }
         for (const auto* name : {"libc.prx", "libSceFios2.prx"})
             if (linker->LoadModule(game / "sce_module" / name) < 0)

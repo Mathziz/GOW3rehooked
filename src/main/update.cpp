@@ -32,7 +32,8 @@ namespace fs = std::filesystem;
 
 namespace Gow3::Update {
 namespace {
-constexpr std::wstring_view Repository = L"cuesta4/GOW3rehooked";
+// This fork (GTX 750 Ti and other GPUs without sparse buffer residency) updates from its own releases.
+constexpr std::wstring_view Repository = L"Mathziz/GOW3rehooked";
 constexpr std::string_view Program = "gow3.exe", DebugScript = "gow3_debug.cmd",
                            Cache = "_rehooked_/shader_cache/recipes-hash2-aes.bin";
 constexpr uint64_t MaxArchive = 128ull << 20, MaxContents = 256ull << 20;

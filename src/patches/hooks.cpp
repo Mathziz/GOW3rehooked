@@ -19,6 +19,8 @@
 #include "present/splash.h"
 #include "present/window.h"
 #include "orbis/core/memory.h"
+#include "orbis/common/util.h"
+#include "orbis/core/file_sys/fs.h"
 #include "orbis/internals/kernel/time.h"
 #include "orbis/internals/save_data/dialog/savedatadialog.h"
 #include <algorithm>
@@ -130,9 +132,24 @@ void PS4_SYSV_ABI FlipArenas() {
 }
 using CinematicPathFn = char*(PS4_SYSV_ABI*)(const char*, char*, int, u64);
 CinematicPathFn original_cinematic_path;
+// 011EB770 builds the path of a cinematic's stream. A video (NAME.BSF) with a 4K version of the same name in the 4K folder next
+// to it plays that version; the others, and the subtitles and sound, are the original files.
 char* PS4_SYSV_ABI CinematicPath(const char* name, char* output, int size, u64 flags) {
-    if (name && (flags & 0x80) && !(flags & 0x40) && CompareCaseInsensitive(name, "OPENINGINT.BSF") == 0)
-        name = "4K/OPENINGINT_nomos8k_30.0fps_3840x2160.bsf";
+    const size_t length = name ? std::strlen(name) : 0;
+    if (length > 4 && length < 200 && (flags & 0x80) && !(flags & 0x40) && !std::strchr(name, '/') &&
+        CompareCaseInsensitive(name + length - 4, ".bsf") == 0) {
+        thread_local std::string chosen;
+        const bool opening = CompareCaseInsensitive(name, "OPENINGINT.BSF") == 0;
+        for (const std::string candidate : {"4K/" + std::string(name), std::string(opening ? "4K/OPENINGINT_nomos8k_30.0fps_3840x2160.bsf" : "")}) {
+            if (candidate.empty()) continue;
+            char guest[512]{};
+            original_cinematic_path(candidate.c_str(), guest, int(sizeof(guest)), flags);
+            if (!*guest || !Common::Singleton<Core::FileSys::MntPoints>::Instance()->Exists(guest)) continue;
+            chosen = candidate;
+            if (DebugEnabled()) Log(std::format("4K cinematics: {} plays {}", name, guest));
+            return original_cinematic_path(chosen.c_str(), output, size, flags);
+        }
+    }
     return original_cinematic_path(name, output, size, flags);
 }
 u32 Caller(void* address) { return u32(reinterpret_cast<uintptr_t>(address) - guest_base + 0x1000000); }
@@ -959,7 +976,7 @@ bool continue_available{};
 UI::GameLanguage menu_language{};
 
 enum Option : u32 { Resolution, Fps, DisplayModeOption, Vrr, Vsync, Reflex, Msaa, Filtering, PostEffects, Scaler,
-                    SkipIntro, SkipVideos, Cinematics4K, Mechanism, Recompilation, LazyAot, OptionCount, Empty = OptionCount };
+                    SkipIntro, SkipVideos, Cinematics4K, ButtonIconsOption, Mechanism, Recompilation, LazyAot, OptionCount, Empty = OptionCount };
 struct Setting {
     std::string_view label;
     std::span<const std::string_view> values;
@@ -970,19 +987,20 @@ constexpr std::string_view resolutions[]{"480p", "720p", "1080p", "1440p", "1800
     display_modes[]{"Windowed", "Borderless", "Exclusive"}, vsync_modes[]{"FIFO", "Mailbox", "Off"}, on_off[]{"Off", "On"},
     msaa[]{"Off", "2x", "4x"}, filtering[]{"Trilinear", "4x", "8x", "16x"}, anti_aliasing[]{"Off", "CMAA2"},
     scalers[]{"Bilinear / Bilinear", "FSR 1 / Lanczos 2"},
-    compilation[]{"Sync", "Async"}, mechanisms[]{"JIT", "AOT"};
+    compilation[]{"Sync", "Async"}, mechanisms[]{"JIT", "AOT"}, button_icons[]{"Auto", "PlayStation", "Keyboard"};
 Setting settings[OptionCount]{
     {"Resolution", resolutions, 2, 201}, {"Frame Rate", frame_rates, 2, 206}, {"Display Mode", display_modes, 1, 237},
     {"VRR", on_off, 0, 80}, {"VSync", vsync_modes, 0, 106}, {"NVIDIA Reflex", on_off, 0, 260},
     {"MSAA", msaa, 1, 106}, {"Texture Filtering", filtering, 0, 319}, {"Post Effects", anti_aliasing, 0, 235},
     {"Scaler", scalers, 0, 116},
     {"Skip Opening Logos", on_off, 0, 350}, {"Skip Videos with X", on_off, 0, 330}, {"4K Cinematics", on_off, 0, 260},
+    {"Button Icons", button_icons, 0, 236},
     {"Shader Mechanism", mechanisms, 0, 338}, {"Shader Recompilation", compilation, 0, 400}, {"Lazy AOT", on_off, 0, 175}
 };
 constexpr Option pages[][kRows - 1]{
     {Resolution, Fps, DisplayModeOption, Vrr, Vsync, Reflex, Empty, Empty, Empty},
     {Msaa, Filtering, PostEffects, Scaler, Empty, Empty, Empty, Empty, Empty},
-    {SkipIntro, SkipVideos, Mechanism, Recompilation, LazyAot, Empty, Empty, Empty, Empty}
+    {SkipIntro, SkipVideos, Cinematics4K, ButtonIconsOption, Mechanism, Recompilation, LazyAot, Empty, Empty}
 };
 constexpr std::string_view page_names[]{"Display", "Graphics", "Other"};
 constexpr float page_widths[]{198.f, 234.f, 181.f};
@@ -1005,7 +1023,7 @@ float ValueWidth(std::string_view value) {
         {"Windowed", 196}, {"Borderless", 209}, {"Exclusive", 180}, {"FIFO", 84}, {"Mailbox", 153},
         {"Off", 67}, {"On", 57}, {"2x", 42}, {"4x", 43}, {"8x", 43}, {"16x", 57},
         {"Trilinear", 178}, {"CMAA2", 129}, {"Bilinear / Bilinear", 344}, {"FSR 1 / Lanczos 2", 305},
-        {"Sync", 92}, {"Async", 114}, {"JIT", 50}, {"AOT", 77},
+        {"Sync", 92}, {"Async", 114}, {"JIT", 50}, {"AOT", 77}, {"Auto", 92}, {"PlayStation", 222}, {"Keyboard", 196},
     };
     const auto it = std::ranges::find(widths, value, &std::pair<std::string_view, float>::first);
     return it != std::end(widths) ? it->second : kMaxValueWidth;
@@ -1072,6 +1090,7 @@ Config SelectedConfig() {
     config.skip_intro = settings[SkipIntro].index;
     config.skip_videos = settings[SkipVideos].index;
     config.cinematics_4k = settings[Cinematics4K].index;
+    config.button_icons = ButtonIcons(settings[ButtonIconsOption].index);
     config.shader_recompilation = ShaderRecompilation(settings[Recompilation].index);
     config.shader_mechanism = ShaderMechanism(settings[Mechanism].index);
     config.lazy_aot = settings[LazyAot].index;
@@ -1093,6 +1112,7 @@ void Configure(const Config& config) {
     settings[SkipIntro].index = config.skip_intro;
     settings[SkipVideos].index = config.skip_videos;
     settings[Cinematics4K].index = config.cinematics_4k;
+    settings[ButtonIconsOption].index = u32(config.button_icons);
     settings[Recompilation].index = u32(config.shader_recompilation);
     settings[Mechanism].index = u32(config.shader_mechanism);
     settings[LazyAot].index = config.lazy_aot;
@@ -1695,7 +1715,7 @@ void InstallHooks(Core::Module& eboot, const Config& config) {
         original_input_update = reinterpret_cast<InputUpdate>(PrepareTrampoline(0x1eec40, input));
         detours.emplace_back(0x1eec40, reinterpret_cast<const void*>(UpdateInput));
     }
-    if (config.cinematics_4k) {
+    if (config.cinematics_4k && Cinematics4KAvailable()) {
         constexpr u8 path[]{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x49, 0x89, 0xf6,
                             0x48, 0x89, 0xfb, 0x31, 0xc0};
         original_cinematic_path = reinterpret_cast<CinematicPathFn>(PrepareTrampoline(0x1eb770, path));

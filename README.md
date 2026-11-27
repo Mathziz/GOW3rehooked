@@ -1,5 +1,10 @@
 <h1 align="center">GOW3rehooked</h1>
 
+> [!NOTE]
+> **This is a fork of [cuesta4/GOW3rehooked](https://github.com/cuesta4/GOW3rehooked)** with support for GPUs without sparse buffer residency (GeForce GTX 750 Ti and other Maxwell 1st-generation cards), which the original refuses with `Create Vulkan device failed: -8`. It also adds keyboard and mouse prompts in the game, Evade on Shift, an FPS counter (F10), working F-key shortcuts and 4K cinematics from your own files. Downloads are on this fork's [Releases](https://github.com/Mathziz/GOW3rehooked/releases/latest) page; see the release notes for the differences.
+>
+> **Este é um fork do [cuesta4/GOW3rehooked](https://github.com/cuesta4/GOW3rehooked)** que roda em placas sem *sparse buffer residency* (GeForce GTX 750 Ti e outras Maxwell de 1ª geração), que o original recusa com `Create Vulkan device failed: -8`. Ele também adiciona ícones de teclado e mouse no jogo, esquiva no Shift, contador de FPS (F10), atalhos F1–F12 que funcionam e cenas em 4K a partir dos seus arquivos. Baixe em [Releases](https://github.com/Mathziz/GOW3rehooked/releases/latest) deste fork; as notas da versão explicam as diferenças.
+
 <p align="center"><i>“Your pawn has failed you, Gaia. Perhaps you should have chosen the other one!”</i></p>
 
 ![Title menu with the added Continue, Rehooked, Controls and Extras, and Quit Game entries](assets/screenshots/title-menu.png)
@@ -10,7 +15,7 @@ No game code or assets are included. You need your own copy of the game.
 
 <p align="center">
   <br>
-  <a href="https://github.com/cuesta4/GOW3rehooked/releases/latest">
+  <a href="https://github.com/Mathziz/GOW3rehooked/releases/latest">
     <img src="assets/download-button.svg" alt="Download latest release" width="286" height="58">
   </a>
   <br><br>
@@ -144,6 +149,8 @@ You can play with a gamepad or with keyboard and mouse. Open **Controls and Extr
 - **Cheats & Patches** holds the controller's vibration strength, cheats and visual patches. They apply as soon as you change them and stay as you left them for the next launch.
 - **Help** explains each Rehooked setting.
 
+With the keyboard, **Evade** (L Shift by default) rolls Kratos toward the direction you move, like a flick of the right stick. Shortcuts: **F10** shows the frame rate, **F11** switches full screen, **F8** reloads the controls and **Ctrl + Shift + End** quits. The other F keys are free to bind to actions.
+
 On the keyboard, press **W** or **↑** to move up and **S** or **↓** to move down. Use **Page Up** and **Page Down** to switch tabs, **Enter** or **Space** to activate the selected option, and **Esc** to go back.
 
 The added screens show PlayStation symbols for a DualShock 3, DualShock 4 or DualSense, and Xbox-style buttons for other gamepads.
@@ -242,6 +249,8 @@ Defaults are in bold.
 | --- | --- | --- |
 | Skip Opening Logos | **Off**, On | Starts the game at the title menu. |
 | Skip Videos with X | Off, **On** | Press Cross to skip any video or cutscene. |
+| 4K Cinematics | **Off**, On | Plays your own 4K versions of the cinematics: files with the original names (`OPENINGINT.BSF`, for example) in `EXEC/CINEMATICS/4K`. The others play as they are. |
+| Button Icons | **Auto**, PlayStation, Keyboard | The game's own prompts (tutorials, move list, quick-time events). Keyboard shows the keys and mouse buttons of your controls; Auto does so when no gamepad is connected at startup. |
 | Shader Mechanism | JIT, **AOT** | AOT prepares the shaders before you play, so stutter is rare. JIT translates each shader when it first appears, which can stutter. |
 | Shader Recompilation | Sync, **Async** | How shaders are translated during gameplay. Async: no stutter, but an object can appear a moment late. Sync: nothing appears late, but a hitch is possible. |
 | Lazy AOT | Off, **On** | On: the first shader preparation is split over up to four launches. Off: it is done in one. |
