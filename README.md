@@ -37,8 +37,7 @@ No game code or assets are included. You need your own copy of the game.
 | Operating system | Windows 10 or 11, or Linux x86-64 |
 | Intel CPU | 4th-generation Core (Haswell) or newer for the standard build. |
 | AMD CPU | Ryzen 1000 or newer for the standard build. |
-| AMD GPU | Radeon RX 5300 (RDNA 1) or newer. Vega and Polaris: experimental. |
-| NVIDIA GPU | GeForce GTX 950 or newer. |
+| NVIDIA GPU | GeForce GTX 750 Ti
 | Intel GPU | UHD Graphics: experimental. Arc and Xe: untested. |
 | Memory | 16 GB of RAM recommended |
 | Game | God of War III Remastered, European (CUSA01715) or American (CUSA01623) release, updated to version 1.02 |
