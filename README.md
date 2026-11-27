@@ -9,7 +9,7 @@
 
 ![Title menu with the added Continue, Rehooked, Controls and Extras, and Quit Game entries](assets/screenshots/title-menu.png)
 
-GOW3rehooked lets you play God of War III Remastered on Windows and Linux PCs. The same developer who created the original GOW3 build for shadPS4 made it with a lot of love, care and obsession for performance.
+GOW3rehooked lets you play God of War III Remastered on Windows and Linux PCs. It was made by [cuesta4](https://github.com/cuesta4/GOW3rehooked), the developer who created the original GOW3 build for shadPS4, with a lot of love, care and obsession for performance. This fork keeps all of it and adds support for GPUs without sparse buffer residency, keyboard and mouse prompts in the game, Evade on Shift, an FPS counter, working F-key shortcuts and 4K cinematics from your own files.
 
 No game code or assets are included. You need your own copy of the game.
 
@@ -37,16 +37,18 @@ No game code or assets are included. You need your own copy of the game.
 | Operating system | Windows 10 or 11, or Linux x86-64 |
 | Intel CPU | 4th-generation Core (Haswell) or newer for the standard build. |
 | AMD CPU | Ryzen 1000 or newer for the standard build. |
-| NVIDIA GPU | GeForce GTX 750 Ti
+| AMD GPU | Radeon RX 5300 (RDNA 1) or newer. Vega and Polaris: experimental. |
+| NVIDIA GPU | GeForce GTX 750 Ti (Maxwell, 1st generation) or newer. The original GOW3rehooked needs a GTX 950 or newer. |
 | Intel GPU | UHD Graphics: experimental. Arc and Xe: untested. |
 | Memory | 16 GB of RAM recommended |
+| Video memory | 2 GB is enough at 720p (tested on a GTX 750 Ti 2 GB). Higher resolutions need more. |
 | Game | God of War III Remastered, European (CUSA01715) or American (CUSA01623) release, updated to version 1.02 |
 
 The standard build requires an x86-64-v3 CPU (including AVX2, BMI1/2, FMA, F16C, LZCNT and MOVBE). Six cores or more are recommended.
 
 The experimental AVX1 build may work on some CPUs older than 4th-generation Intel Core or AMD Ryzen 1000. The same GPU requirements apply. Feel free to [report any issues](#reporting-bugs).
 
-The renderer requires Vulkan 1.3 with depth clip control, push descriptors, conditional rendering, sparse buffer residency and min/max sampler filtering, and uses shader objects where the driver has them. Experimental fallbacks support older GPUs without them (AMD Vega/Polaris, Intel UHD Graphics; Arc/Xe untested, but should also work). Please update to the latest drivers. On Linux, Radeon also needs `VK_KHR_maintenance5`.
+The renderer requires Vulkan 1.3 with depth clip control, push descriptors and conditional rendering, and uses shader objects where the driver has them. Sparse buffer residency and min/max sampler filtering are no longer required in this fork: on GPUs without them, such as the GeForce GTX 750 Ti and other first-generation Maxwell cards, the game switches them off and uses a fallback for each, where the original stops with `Create Vulkan device failed: -8`. Experimental fallbacks also support other older GPUs (AMD Vega/Polaris, Intel UHD Graphics; Arc/Xe untested, but should also work). Please update to the latest drivers. On Linux, Radeon also needs `VK_KHR_maintenance5`.
 
 ## Installation
 
@@ -114,6 +116,8 @@ Performance is the main goal of the project. Both screenshots show the same scen
     <td align="center">480p: 403 FPS, 2.6 ms</td>
   </tr>
 </table>
+
+On a GeForce GTX 750 Ti 2 GB with a Core i5-6400, this fork holds 60 FPS at 720p from the climb to the first save, with about 7 ms of GPU time per frame. Press **F10** in the game to see your own frame rate.
 
 ## Features
 
@@ -302,6 +306,8 @@ If you are asked for a more detailed capture, add `--debug=2` to the debug launc
 
 ## Credits
 
+- [cuesta4](https://github.com/cuesta4/GOW3rehooked), the author of GOW3rehooked, which this fork is built on.
+- [SpartanPort](https://github.com/FelipePrado0/SpartanPort), whose way of running without sparse buffer residency this fork adapts, and whose launcher's keyboard prompts guided the in-game ones.
 - The [shadPS4](https://github.com/shadps4-emu/shadPS4) team, for the PS4 kernel, system library and loader work the system layer is built on.
 - kvicken, for the original resolution patches, extended here.
 - Third-party components: [SDL3](https://github.com/libsdl-org/SDL), [Dear ImGui](https://github.com/ocornut/imgui), [FFmpeg](https://ffmpeg.org), [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [Intel CMAA2](https://github.com/GameTechDev/CMAA2), [shaderc](https://github.com/google/shaderc) with [glslang](https://github.com/KhronosGroup/glslang) and [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools), [Zydis](https://github.com/zyantific/zydis), [Xbyak](https://github.com/herumi/xbyak), [xxHash](https://github.com/Cyan4973/xxHash), [Zstandard](https://github.com/facebook/zstd), [fmt](https://github.com/fmtlib/fmt), [magic_enum](https://github.com/Neargye/magic_enum), [stb](https://github.com/nothings/stb), [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) and the [Cinzel](https://github.com/NDISCOVER/Cinzel) typeface.
