@@ -1237,11 +1237,15 @@ bool Track(Gpu::Renderer& renderer, u64 lo, u64 hi) {
 // protected page is reopened and queued (offered at the next frame); a read-only one is tracked again at its next draw.
 // Dirty, dynamic and region pages are offered anyway, and an unknown one is staged at its first draw.
 void Restage(u64 lo, u64 hi) {
-    for (u64 p = lo / kPage, end = std::min((hi + kPage - 1) / kPage, kPages); p < end; ++p) {
+    const u64 first = lo / kPage, end = std::min((hi + kPage - 1) / kPage, kPages);
+    for (u64 p = first; p < end; ++p) {
         u8 v = state[p].load(std::memory_order_acquire);
         if ((v & 7) == Clean) Reopen(p, 1);
         else if ((v & 7) == Fixed) state[p].compare_exchange_strong(v, Unknown);
     }
+    // Not CPU writes: a page protected last frame and reopened here is not one written in two frames in a row (BeginFrame would
+    // offer it every frame from then on).
+    std::erase_if(closed, [&](u64 page) { return page >= first && page < end; });
 }
 
 u64 Store(u64 addr, const void* data, u64 size) {
