@@ -1276,6 +1276,7 @@ void Renderer::Impl::Retire() {
         return;
     }
     const auto temp_t0 = DiagNow();
+    frame_phase.store("waiting for the GPU to finish the frame before", std::memory_order_relaxed);
     temp_call = "fence", TempLost("fence", vkWaitForFences(dev, 1, &flight.fence, VK_TRUE, ~0ull)), temp_call = nullptr;
     GOW3_DIAG temp_fence_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - temp_t0).count();
     vkResetFences(dev, 1, &flight.fence);
@@ -1457,6 +1458,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     std::map<u32, std::pair<u32, std::string>> unhandled;
     r.walk_chain = chain, r.discovered = false, r.effects.clear(), r.effects_whole = true;
     const auto temp_setup = DiagNow();
+    frame_phase.store("walking the command buffers", std::memory_order_relaxed);
     const Impl::Pos end{chain.size(), 0};
     std::chrono::steady_clock::time_point temp_walked{}, temp_recorded{};
     if (r.threads.empty() || r.stats.trace || r.prof) {  // serial: everything in the primary
@@ -1568,6 +1570,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         Impl::SaveRegs(*regs);
         r.next_block = 0;
         Gow3::CpuProbe::BlocksBegin();  // TEMP
+        frame_phase.store("recording draws", std::memory_order_relaxed);
         r.Parallel([&](u32 k) { r.RecordBlocks(k); });
         Gow3::CpuProbe::BlocksEnd();
         temp_recorded = DiagNow();
@@ -1750,6 +1753,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         vkEndCommandBuffer(r.xfer_cmd);
     }
     const auto temp_tail = DiagNow();
+    frame_phase.store("submitting uploads", std::memory_order_relaxed);
     if (need_xfer) {
         const VkSubmitInfo xi{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &r.xfer_cmd, 1, &r.copied};
         std::scoped_lock lock(*r.xfer_lock);
@@ -1782,11 +1786,13 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
             VkBindSparseInfo bsi{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
             bsi.bufferBindCount = 1, bsi.pBufferBinds = &bi;
             bsi.signalSemaphoreCount = 1, bsi.pSignalSemaphores = &r.bound_sem;
+            frame_phase.store("binding guest memory pages", std::memory_order_relaxed);
             Impl::Stalled(r.stall_binds, r.stall_bind_ns, [&] {
                 temp_call = "bind sparse", r.TempLost("bind sparse", vkQueueBindSparse(r.queue, 1, &bsi, VK_NULL_HANDLE)), temp_call = nullptr;  // TEMP fault
             });
             r.pending_binds.clear();
         }
+        frame_phase.store("submitting the frame", std::memory_order_relaxed);
         temp_call = "submit", r.TempLost("submit", vkQueueSubmit(r.queue, 1, &si, rb_async ? VK_NULL_HANDLE : r.fence)), temp_call = nullptr;
     }
     if (rb_async) {
@@ -1796,6 +1802,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     }
     const auto temp_submitted = DiagNow();
     r.Retire();
+    frame_phase.store("freeing retired resources", std::memory_order_relaxed);
     r.Reap();
     const auto t_retired = DiagNow();
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };

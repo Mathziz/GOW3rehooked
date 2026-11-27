@@ -846,6 +846,21 @@ void Renderer::Impl::TrimFrameBuffers() {
     }
     if ((rb.size > kRbReserve || rb_dev.size > kRbReserve) && rb_quiet >= limit) FreeBuffer(rb), FreeBuffer(rb_dev), rb_quiet = 0;
 }
+std::string Renderer::MemoryBudget() const {
+    const Impl& r = *d;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, r.budget_heaps ? &budget : nullptr};
+    vkGetPhysicalDeviceMemoryProperties2(r.pd, &query);
+    std::string out;
+    for (u32 h = 0; h < r.mem.memoryHeapCount; ++h) {
+        if (!(r.mem.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+        out += out.empty() ? "" : ", ";
+        out += r.budget_heaps >> h & 1 ? std::format("heap {} {} of {} MB", h, budget.heapUsage[h] >> 20, budget.heapBudget[h] >> 20)
+                                       : std::format("heap {} ({} MB)", h, r.mem.memoryHeaps[h].size >> 20);
+    }
+    return out;
+}
+
 } // namespace Gpu
 
 #ifndef GOW3_OFFLINE  // the tracker needs the emulator's runtime (framecap builds without it)

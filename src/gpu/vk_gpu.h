@@ -132,6 +132,11 @@ struct Image {
     std::uint32_t level = 0;         // ReadTextures: mip
 };
 
+// What the GPU thread's frame is doing (a constant string; null between frames) and how many recording threads wait for a
+// shader or pipeline compile: the stall watchdog (gpu_thread.cpp) logs both when a frame takes seconds.
+inline std::atomic<const char*> frame_phase{nullptr};
+inline std::atomic<int> compile_waiters{0};
+
 class Renderer {
 public:
     // ---- Lifecycle and configuration ----
@@ -193,6 +198,7 @@ public:
     // frame bound, mip 0 at most 2048 texels wide or high, alpha kept; one that cannot be read comes without pixels.
     std::vector<Image> ReadTextures(bool traced = false);
     Stats& GetStats();
+    std::string MemoryBudget() const;  // device-local heaps: in use of the budget (VK_EXT_memory_budget), any thread
 
 private:
     struct Impl;

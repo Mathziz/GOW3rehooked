@@ -366,7 +366,9 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
         if (own) here.set_value(Compile(stage, prog, key, p.in, std::vector<u32>(p.in.code.begin(), p.in.code.end()),
                                         std::vector<u32>(p.in.fetch.begin(), p.in.fetch.end()), p.spec));
         if (mode == Jit::Mode::Async && !compute && !built && f.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return waiting = true, ShaderRef{};
+        compile_waiters.fetch_add(1, std::memory_order_relaxed);
         Stalled(stall_waits, stall_wait_ns, [&] { c = f.get(); });
+        compile_waiters.fetch_sub(1, std::memory_order_relaxed);
     }
     std::unique_lock lock(prog_lock);
     if (found()) {  // another block or the WAD's warm-up (Prepare) finished it first: the first to end this compile drops its copy
@@ -1214,7 +1216,9 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
     if (!ready && temp_pipelog) TempPlWait(h);
     if (Jit::mode == Jit::Mode::Async && !ready) return waiting = true, CompiledPipeline{};
     CompiledPipeline pl{};
+    compile_waiters.fetch_add(1, std::memory_order_relaxed);
     Stalled(stall_waits, stall_wait_ns, [&] { pl = f.get(); });
+    compile_waiters.fetch_sub(1, std::memory_order_relaxed);
     if (!pl.main) return {};
     return pm[rh] = pl;
 }

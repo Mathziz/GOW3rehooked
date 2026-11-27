@@ -52,6 +52,9 @@ std::mutex queue_mutex;
 std::condition_variable_any queue_cv;
 std::deque<std::function<void()>> submits;
 std::jthread gpu_thread;
+std::jthread watchdog;
+std::atomic<u64> busy_since{0}, busy_frame{0};  // the submit the GPU thread is on (Clock()), 0 between submits
+
 std::atomic<u64> submitted{0};
 std::atomic<u64> copied{0};  // the last submit whose memory the renderer has staged (BeginFrame)
 u64 resting[2];              // SetSpareArenas (game main thread, like Submit and AwaitCopies)
@@ -60,6 +63,26 @@ std::atomic<bool> cinematic_active{false};
 // The renderer, created on the GPU thread at the first submit after the window's device exists. GOW3_NULL_GPU=1 keeps
 // the GPU null (fences only). Never destroyed: process exit tears the device down.
 std::atomic<Gpu::Renderer*> live{nullptr};
+
+// A frame that takes seconds: what the GPU thread is doing (Gpu::frame_phase), how many recording threads wait for a
+// compile, and the video memory in use, logged at 3, 10 and 30 s. The game thread then waits for it (AwaitCopies).
+void Watch(const std::stop_token& token) {
+    Common::SetCurrentThreadName("GOW3 GPU watchdog");
+    u64 frame = 0, next = 0;
+    while (!token.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const u64 since = busy_since.load(std::memory_order_acquire), n = busy_frame.load(std::memory_order_relaxed);
+        if (!since) continue;
+        const double s = double(Clock() - since) * 1e-9;
+        if (n != frame) frame = n, next = 3;
+        if (s < double(next)) continue;
+        next = next == 3 ? 10 : next == 10 ? 30 : next * 2;
+        const char* phase = Gpu::frame_phase.load(std::memory_order_relaxed);
+        auto* r = live.load(std::memory_order_acquire);
+        Log(std::format("GPU thread: frame {} busy for {:.1f} s: {}; {} recording threads wait for a compile; video memory {}", n, s,
+                        phase ? phase : "staging guest memory", Gpu::compile_waiters.load(std::memory_order_relaxed), r ? r->MemoryBudget() : "?"));
+    }
+}
 unsigned configured_anisotropy{};
 bool render_off = std::getenv("GOW3_NULL_GPU") != nullptr;
 size_t notes_logged = 0;
@@ -402,6 +425,7 @@ void Configure(unsigned anisotropy) { configured_anisotropy = anisotropy; }
 void Start() {
     CpuProbe::Start();
     gpu_thread = std::jthread(Run);
+    watchdog = std::jthread(Watch);
     if (S4::enabled) S4::Start();
 }
 
@@ -440,6 +464,8 @@ void Submit(std::span<const u32* const> buffers, std::span<const u32> dwords) {
     { std::scoped_lock lock(queue_mutex);
       submits.emplace_back([copy = std::move(copy), mem = std::move(mem), n, t_submit, t_captured, game, reflex_frame] {
           const auto t0 = DiagNow();
+          busy_frame.store(n, std::memory_order_relaxed), busy_since.store(Clock(), std::memory_order_release);
+          Gpu::frame_phase.store(nullptr, std::memory_order_relaxed);
           static Recorder::Frame unrecorded;  // the frame recorder's record, outside a debug run: written only in one
           Recorder::Frame& rec = DebugEnabled() ? Recorder::frames.Next() : unrecorded;
           GOW3_DIAG {
@@ -481,6 +507,7 @@ void Submit(std::span<const u32* const> buffers, std::span<const u32> dwords) {
           const auto t1 = DiagNow();
           GOW3_DIAG rec.rendered = Clock();
           const auto waits = temp_waits;
+          Gpu::frame_phase.store("running the frame's fences and labels", std::memory_order_relaxed);
           if (effects)
               for (const u32* h : *effects) Execute(*h, h + 1, (*h >> 16 & 0x3fff) + 1);
           else
@@ -490,6 +517,7 @@ void Submit(std::span<const u32* const> buffers, std::span<const u32> dwords) {
               Recorder::frames.Commit();
               temp_t.render += DiagMs(t0, t1), temp_t.process += DiagMs(t1, std::chrono::steady_clock::now()), ++temp_t.frames;
           }
+          busy_since.store(0, std::memory_order_release);
           if (S4::enabled) S4::Arm();
       }); }
     queue_cv.notify_one();
