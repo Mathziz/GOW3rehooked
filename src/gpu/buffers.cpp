@@ -75,14 +75,15 @@ u32 Renderer::Impl::PressureAge() {
     return age;
 }
 
-VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address, bool texture) {
+VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address, bool texture, u32* type) {
     const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     const u32 primary = want == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? DeviceType(r.memoryTypeBits, r.size, texture) : Type(r.memoryTypeBits, want);
-    auto try_alloc = [&](u32 type, VkResult& err) -> VkDeviceMemory {
-        if (type == ~0u) return err = VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_NULL_HANDLE;
-        const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &flags : nullptr, r.size, type};
+    auto try_alloc = [&](u32 t, VkResult& err) -> VkDeviceMemory {
+        if (t == ~0u) return err = VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_NULL_HANDLE;
+        const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &flags : nullptr, r.size, t};
         VkDeviceMemory m = VK_NULL_HANDLE;
         err = vkAllocateMemory(dev, &ai, nullptr, &m);
+        if (err == VK_SUCCESS && type) *type = t;
         return err == VK_SUCCESS ? m : VK_NULL_HANDLE;
     };
     VkResult e = VK_SUCCESS;
@@ -519,6 +520,17 @@ void Renderer::Impl::Reclaim() {
     for (size_t k = 0; k < chunks.size(); ++k)
         sparse[k] = chunks[k] && k != fill[0] && k != fill[1] && u64(chunk_live[k]) * 4 * page <= chunk_bytes[k];
     const u64 words = bound.size();
+    // A page the GPU wrote (pinned) is kept only while the GPU writes or reads it: its writes are read back into guest memory
+    // as each frame retires (RecordReadback, GuestMemory::Store), so 600 frames later guest memory holds them and the page
+    // can go like any other (a later read stages it again from there). Pinned for good, the pages of every area the GPU
+    // ever wrote stayed: the mirror grew through a session and never went below 832 MB (782 of it in use) at the last freeze.
+    for (u64 n = 0, k = unpin_cursor; n < 64; ++n, k = (k + 1) % words) {
+        for (u64 bits = pinned[k] & bound[k]; bits; bits &= bits - 1) {
+            const u64 i = k * 64 + std::countr_zero(bits);
+            if (frame - page_used[i].load(std::memory_order_relaxed) >= 600) pinned[k] &= ~(1ull << (i % 64));
+        }
+        unpin_cursor = (k + 1) % words;
+    }
     std::vector<u64> freed;  // mirror page indices released this frame (ascending per pass)
     for (u64 n = 0; n < words && freed.size() < cap; ++n, reclaim_cursor = (reclaim_cursor + 1) % words) {
         for (u64 bits = bound[reclaim_cursor] & ~pinned[reclaim_cursor]; bits && freed.size() < cap; bits &= bits - 1) {
@@ -554,16 +566,19 @@ void Renderer::Impl::Reclaim() {
     }
     if (frame - reclaim_logged >= 600 || !reclaim_logged) {
         reclaim_logged = frame | 1;
-        u64 texture_bytes = 0, live[2]{}, held = 0, quarter = 0;
+        u64 texture_bytes = 0, live[2]{}, held = 0, quarter = 0, pins = 0;
         for (size_t k = 0; k < chunks.size(); ++k)
             if (chunks[k]) {
                 if (chunk_class[k]) texture_bytes += chunk_bytes[k];
                 live[chunk_class[k]] += chunk_live[k], ++held, quarter += sparse[k];
             }
+        for (u64 k = 0; k < words; ++k) pins += std::popcount(pinned[k] & bound[k]);
         Gow3::Log(std::format("Renderer: video memory {} its budget: {} guest mirror pages dropped so far ({} texture sources), {} staged again, {} MB "
-                              "given back to the driver; mirror {} MB, {} MB of it texture sources; {} MB and {} MB in use, {} of {} chunks a quarter full or less",
+                              "given back to the driver; mirror {} MB, {} MB of it texture sources; {} MB and {} MB in use ({} MB written by the GPU), {} of {} "
+                              "chunks a quarter full or less",
                               reclaim_level == 2 ? "over" : "near", reclaimed_pages, reclaimed_texture_pages, restaged_pages.load(std::memory_order_relaxed),
-                              returned_bytes >> 20, mirror_chunks.load() >> 20, texture_bytes >> 20, live[0] * page >> 20, live[1] * page >> 20, quarter, held));
+                              returned_bytes >> 20, mirror_chunks.load() >> 20, texture_bytes >> 20, live[0] * page >> 20, live[1] * page >> 20,
+                              pins * page >> 20, quarter, held));
     }
 }
 

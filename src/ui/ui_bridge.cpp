@@ -261,9 +261,15 @@ void NewFrame() {
     std::scoped_lock lock(ui_mutex);
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
+    // Taking exclusive full screen back after Alt+Tab, SDL can give the window's size while its size in pixels is still 0: a
+    // framebuffer scale of 0 makes ImGui bake its fonts at density 0, an assertion that ended the game. A minimized window (size
+    // 0) draws no layer that frame (their layouts follow the display's size).
+    ImGuiIO& io = GetIO();
+    if (!(io.DisplayFramebufferScale.x > 0.0f) || !(io.DisplayFramebufferScale.y > 0.0f)) io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+    const bool drawable = io.DisplaySize.x >= 1.0f && io.DisplaySize.y >= 1.0f;
     UpdateTextures();
     ImGui::NewFrame();
-    DrawLayers();
+    if (drawable) DrawLayers();
     ImGui::Render();
     UpdateRetiring();
     ui_visible = GetDrawData()->CmdListsCount != 0;

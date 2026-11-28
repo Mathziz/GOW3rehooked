@@ -1732,12 +1732,16 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t, bool las
                 if (at > lo) b.free.emplace(lo, at - lo);
                 if (lo + n > at + r.size) b.free.emplace(at + r.size, lo + n - at - r.size);
                 image_free[lasting] -= r.size, t.mem = b.mem, t.mem_offset = at, t.mem_size = r.size;
+                t.host = !(mem.memoryTypes[b.type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 return;
             }
         }
     }
-    t.mem = Alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, !lasting);
-    if (t.mem) t.alloc_size = r.size, dedicated_images += r.size;
+    u32 chosen = ~0u;
+    t.mem = Alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, !lasting, &chosen);
+    if (t.mem)
+        t.alloc_size = r.size, dedicated_images += r.size,
+        t.host = chosen != ~0u && !(mem.memoryTypes[chosen].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 }
 
 void Renderer::Impl::FreeImage(const Tex& t) {
@@ -1821,8 +1825,12 @@ u32 Renderer::Impl::Bindless(u32 binding, VkImageView view, VkSampler smp) {
 
 // Guest textures unused for more than `age` frames: bindless elements freed (no frame samples them), views and images
 // destroyed by Reap once the frame being recorded has retired (it and the frame in flight may still copy from them).
-void Renderer::Impl::EvictTextures(u32 age, bool defer_elements) {
-    const auto old = [&](const GuestTex& g) { return g.checked == ~0u || frame - g.checked > age || std::binary_search(doomed.begin(), doomed.end(), &g); };
+// `vram_only` (VRAM pressure): those in system memory stay; evicting them frees no VRAM, and their next use uploads them
+// again through the mirror, whose pages then take VRAM.
+void Renderer::Impl::EvictTextures(u32 age, bool defer_elements, bool vram_only) {
+    const auto old = [&](const GuestTex& g) {
+        return g.checked == ~0u || (frame - g.checked > age && !(vram_only && g.t.host)) || std::binary_search(doomed.begin(), doomed.end(), &g);
+    };
     std::vector<const GuestTex*> gone;
     for (auto& [h, g] : textures)
         if (old(g)) gone.push_back(&g);
@@ -1879,9 +1887,10 @@ void Renderer::Impl::CompactImageBlocks() {
     const u64 kBudget = (over ? 64ull : 32ull) << 20;  // texture bytes moved per call
     const bool pressed = Pressed();
     const auto idle = [](const ImageBlock& b) { VkDeviceSize n = 0; for (auto& [lo, s] : b.free) n += s; return n; };
-    const auto candidate = [&](const ImageBlock& b) {
+    const auto candidate = [&](const ImageBlock& b) {  // a block in system memory takes no VRAM: draining it frees none
         const VkDeviceSize used = image_block_size - idle(b);
-        return !b.lasting && !b.draining && used > 0 && used <= image_block_size / (over ? 2 : 4);
+        return !b.lasting && !b.draining && used > 0 && used <= image_block_size / (over ? 2 : 4) &&
+               (mem.memoryTypes[b.type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     };
     {
         std::scoped_lock lock(image_lock);

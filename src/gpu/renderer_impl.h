@@ -189,7 +189,7 @@ struct Renderer::Impl {
         return ~0u;
     }
     u32 DeviceType(u32 bits, VkDeviceSize size, bool texture = false);  // for `size` more bytes of device memory
-    VkDeviceMemory Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address, bool texture = false);
+    VkDeviceMemory Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address, bool texture = false, u32* type = nullptr);
     // One-off command buffer, waited for.
     template <class F> void Once(F&& f) {
         std::scoped_lock res(res_lock);
@@ -432,6 +432,7 @@ struct Renderer::Impl {
     bool reclaim_urgent = false;                    // a chunk was allocated (bind_lock): the next Reclaim looks the budget up
     u64 reclaim_cursor = 0, reclaimed_pages = 0, reclaimed_texture_pages = 0, returned_bytes = 0;
     std::vector<u8> sparse;  // Reclaim: chunks at most a quarter full (their pages go 4 frames after their last use)
+    u64 unpin_cursor = 0;    // Reclaim: the pinned words looked at next (64 a frame)
     std::atomic<u64> restaged_pages{0};
     void Reclaim();
     std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)
@@ -549,6 +550,7 @@ struct Renderer::Impl {
         VkImageUsageFlags usage = 0;
         VkDeviceSize mem_offset = 0, mem_size = 0;  // mem_size: a range of an image block (ImageMemory), else mem is its own
         VkDeviceSize alloc_size = 0;                // the size of that own allocation
+        bool host = false;                          // its memory is not VRAM (DeviceType spilled it): VRAM pressure leaves it alone
     };
     std::vector<Tex> dummies;
     std::atomic<u64> dedicated_images{0};  // debug: device memory held outside image blocks (bytes)
@@ -709,7 +711,7 @@ struct Renderer::Impl {
     u32 frame = 0;
     // Guest textures unused for more than `age` frames: bindless elements freed (no frame samples them), views and images
     // destroyed by Reap once the frame being recorded has retired (it and the frame in flight may still copy from them).
-    void EvictTextures(u32 age, bool defer_elements = false);
+    void EvictTextures(u32 age, bool defer_elements = false, bool vram_only = false);
     // Texture blocks left mostly empty (a level's textures went, a few survivors hold each one): the textures of the emptiest
     // are evicted, loaded again from guest memory on their next use into the fuller blocks, and the emptied blocks go back.
     void CompactImageBlocks();
