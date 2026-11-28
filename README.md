@@ -12,8 +12,6 @@ Runs on a GeForce GTX 750 Ti, with an anti-aliasing mode made for this game.</p>
 
 <p align="center"><b>English</b> · <a href="README.pt-BR.md">Português (Brasil)</a></p>
 
-![Title menu with the added Continue, Rehooked, Controls and Extras, and Quit Game entries](assets/screenshots/title-menu.png)
-
 ## What is this?
 
 [GOW3rehooked](https://github.com/cuesta4/GOW3rehooked) by cuesta4 lets you play **your own copy** of God of War III Remastered (PS4) natively on Windows and Linux. It is fast, but it needs a GTX 950 or newer, and older cards stop at `Create Vulkan device failed: -8`.
@@ -36,6 +34,8 @@ Runs on a GeForce GTX 750 Ti, with an anti-aliasing mode made for this game.</p>
     <img src="assets/download-button.svg" alt="Download latest release" width="286" height="58">
   </a>
 </p>
+
+<p align="center"><img src="assets/screenshots/title-menu.png" alt="Title menu with the added Continue, Rehooked, Controls and Extras, and Quit Game entries" width="85%"></p>
 
 ## Quick start
 
@@ -62,7 +62,9 @@ Generic anti-aliasing filters guess where edges are from the colors, so they als
 
 ![Edge comparison: no anti-aliasing, GoW3 AA x4, and a 16-sample reference, on three scenes from the game](assets/screenshots/gow3aa-comparison.png)
 
-| Edge error, lower is better (8×8 supersampled test with the game's textures) | |
+Measured against 8×8 supersampling, on surfaces with the game's own textures:
+
+| Method | Edge error (lower is better) |
 | --- | --- |
 | No anti-aliasing | 100% |
 | MSAA 2x | 62% |

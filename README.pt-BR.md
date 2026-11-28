@@ -12,8 +12,6 @@ Roda numa GeForce GTX 750 Ti, com um antisserrilhado feito para este jogo.</p>
 
 <p align="center"><a href="README.md">English</a> · <b>Português (Brasil)</b></p>
 
-![Menu inicial com as entradas Continue, Rehooked, Controls and Extras e Quit Game](assets/screenshots/title-menu.png)
-
 ## O que é isto?
 
 O [GOW3rehooked](https://github.com/cuesta4/GOW3rehooked), do cuesta4, permite jogar a **sua própria cópia** de God of War III Remastered (PS4) direto no Windows e no Linux. Ele é rápido, mas exige uma GTX 950 ou mais nova; nas placas mais antigas, para no erro `Create Vulkan device failed: -8`.
@@ -36,6 +34,8 @@ O [GOW3rehooked](https://github.com/cuesta4/GOW3rehooked), do cuesta4, permite j
     <img src="assets/download-button.svg" alt="Baixar a última versão" width="286" height="58">
   </a>
 </p>
+
+<p align="center"><img src="assets/screenshots/title-menu.png" alt="Menu inicial com as entradas Continue, Rehooked, Controls and Extras e Quit Game" width="85%"></p>
 
 ## Começo rápido
 
@@ -62,7 +62,9 @@ Os filtros de antisserrilhado comuns adivinham onde estão as bordas pelas cores
 
 ![Comparação de bordas: sem antisserrilhado, GoW3 AA x4 e uma referência de 16 amostras, em três cenas do jogo](assets/screenshots/gow3aa-comparison.png)
 
-| Erro nas bordas, menor é melhor (teste com supersampling 8×8 e texturas do jogo) | |
+Medido contra supersampling 8×8, em superfícies com as texturas do próprio jogo:
+
+| Método | Erro nas bordas (menor é melhor) |
 | --- | --- |
 | Sem antisserrilhado | 100% |
 | MSAA 2x | 62% |
