@@ -1716,7 +1716,7 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t, bool las
         if (!Pressed() && image_free[lasting] < image_block_size / 2 &&
             (!image_growing.valid() || image_growing.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
             image_growing = std::async(std::launch::async, [this, bits = r.memoryTypeBits, lasting] {
-                const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, image_block_size, DeviceType(bits, image_block_size)};
+                const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, image_block_size, DeviceType(bits, image_block_size, !lasting)};
                 VkDeviceMemory m = VK_NULL_HANDLE;
                 if (vkAllocateMemory(dev, &ai, nullptr, &m) != VK_SUCCESS) return alloc_pressure.store(true, std::memory_order_relaxed);
                 std::scoped_lock lock(image_lock);
@@ -1736,7 +1736,7 @@ void Renderer::Impl::ImageMemory(const VkMemoryRequirements& r, Tex& t, bool las
             }
         }
     }
-    t.mem = Alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+    t.mem = Alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, !lasting);
     if (t.mem) t.alloc_size = r.size, dedicated_images += r.size;
 }
 

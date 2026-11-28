@@ -15,9 +15,13 @@ namespace Gpu {
 
 // Device-local, unless the GPU is integrated and that heap's budget is spent: then the largest heap with room, the same RAM
 // (no PCIe in between). Write-combined over host-cached, which the GPU snoops.
-u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size) {
+// `texture` on a discrete GPU with 4 GB of VRAM or less (vram_spill): a guest texture goes to system memory once VRAM is
+// within an eighth of its budget. Over the budget, the GTX 750 Ti's driver left a frame unfinished for good (Poseidon at
+// 1440p with MSAA 2x: 1710 of 1650 MB); a texture read over PCIe is slower, and render targets and the mirror keep VRAM.
+u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size, bool texture) {
     const u32 local = Type(bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!uma_budget || local == ~0u) return local;
+    const bool spill = texture && vram_spill;
+    if ((!uma_budget && !spill) || local == ~0u) return local;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
     vkGetPhysicalDeviceMemoryProperties2(pd, &query);
@@ -27,17 +31,21 @@ u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size) {
     if (room(heap)) return local;
     constexpr VkMemoryPropertyFlags kAvoid = VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT |
                                              VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+    // A discrete GPU's other device-local heap (the BAR window) is VRAM too.
+    const VkMemoryPropertyFlags avoid = kAvoid | (uma_budget ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     u32 best = ~0u;
     for (u32 i = 0; i < mem.memoryTypeCount; ++i) {
         const auto& t = mem.memoryTypes[i];
-        if (bits >> i & 1 && t.heapIndex != heap && !(t.propertyFlags & kAvoid) && room(t.heapIndex) &&
+        if (bits >> i & 1 && t.heapIndex != heap && !(t.propertyFlags & avoid) && room(t.heapIndex) &&
             (best == ~0u || mem.memoryHeaps[t.heapIndex].size > mem.memoryHeaps[mem.memoryTypes[best].heapIndex].size))
             best = i;
     }
     if (best == ~0u) return local;  // no heap has room: the driver decides
     if (!spilled.exchange(true))
-        Gow3::Log(std::format("Renderer: device-local heap {} ({} MB) is at its budget; device memory now also comes from heap {} ({} MB, type {})", heap,
-                              mem.memoryHeaps[heap].size >> 20, mem.memoryTypes[best].heapIndex, mem.memoryHeaps[mem.memoryTypes[best].heapIndex].size >> 20, best));
+        Gow3::Log(std::format("Renderer: device-local heap {} ({} MB) is near its budget ({} of {} MB); {} now also comes from heap {} ({} MB, type {})",
+                              heap, mem.memoryHeaps[heap].size >> 20, budget.heapUsage[heap] >> 20, budget.heapBudget[heap] >> 20,
+                              uma_budget ? "device memory" : "texture memory", mem.memoryTypes[best].heapIndex,
+                              mem.memoryHeaps[mem.memoryTypes[best].heapIndex].size >> 20, best));
     return best;
 }
 
@@ -66,9 +74,9 @@ u32 Renderer::Impl::PressureAge() {
     return age;
 }
 
-VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address) {
+VkDeviceMemory Renderer::Impl::Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address, bool texture) {
     const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-    const u32 primary = want == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? DeviceType(r.memoryTypeBits, r.size) : Type(r.memoryTypeBits, want);
+    const u32 primary = want == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? DeviceType(r.memoryTypeBits, r.size, texture) : Type(r.memoryTypeBits, want);
     auto try_alloc = [&](u32 type, VkResult& err) -> VkDeviceMemory {
         if (type == ~0u) return err = VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_NULL_HANDLE;
         const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, address ? &flags : nullptr, r.size, type};

@@ -712,6 +712,9 @@ void Renderer::Impl::LoadDeviceFunctions() {
     if (has_budget) budget_heaps = integrated ? (1u << mem.memoryHeapCount) - 1 : 1u << vram_heap;
     // An 8 GB APU reports ~6.8 GiB of heaps (carve-out + shared); 16 GB ones ~10 GiB.
     compact_memory = integrated ? total_heap <= (8ull << 30) : mem.memoryHeaps[vram_heap].size <= (4ull << 30);
+    // GOW3_TEXTURE_SPILL=0 keeps every texture in VRAM, past the budget too.
+    const char* spill_env = std::getenv("GOW3_TEXTURE_SPILL");
+    vram_spill = !integrated && has_budget && compact_memory && !(spill_env && spill_env[0] == '0');
     if (compact_memory) {
         chunk_size = 64ull << 20;
         image_block_size = 64ull << 20;
@@ -835,10 +838,10 @@ void Renderer::Impl::TempDeviceReport(std::span<const VkQueueFamilyProperties> f
     Report(std::format("Subgroup: size {} (from {} to {}) stages {:x} sized stages {:x} operations {:x} quad in all stages {}", p11.subgroupSize, p13.minSubgroupSize,
                        p13.maxSubgroupSize, (u32)p11.subgroupSupportedStages, (u32)p13.requiredSubgroupSizeStages, (u32)p11.subgroupSupportedOperations,
                        p11.subgroupQuadOperationsInAllStages));
-    Report(std::format("Sparse: binding {} residency buffer {} aliased {} non-resident strict {}; mirror page {:x} memory types {:x}, integrated with budget {}, budget heaps {:x}, single_heap {}, stage_dev {}, direct_tables {}, compact {} [chunk {} MB, img {} MB x{}, table {} MB, scratch {} MB, temp {} MB, stage {} MB], image copies through a temp buffer {}",
+    Report(std::format("Sparse: binding {} residency buffer {} aliased {} non-resident strict {}; mirror page {:x} memory types {:x}, integrated with budget {}, budget heaps {:x}, single_heap {}, stage_dev {}, direct_tables {}, compact {} [chunk {} MB, img {} MB x{}, table {} MB, scratch {} MB, temp {} MB, stage {} MB], image copies through a temp buffer {}, textures to system memory near the VRAM budget {}",
                        f.sparseBinding, f.sparseResidencyBuffer, f.sparseResidencyAliased, p.sparseProperties.residencyNonResidentStrict, page, mirror_bits, uma_budget,
                        budget_heaps, uma_single_heap, use_stage_dev, direct_tables, compact_memory, chunk_size >> 20, image_block_size >> 20, image_reserve_blocks,
-                       table_bytes >> 20, scratch_reserve >> 20, temp_chunk_size >> 20, stage_chunk_size >> 20, image_copy_via_temp));
+                       table_bytes >> 20, scratch_reserve >> 20, temp_chunk_size >> 20, stage_chunk_size >> 20, image_copy_via_temp, vram_spill));
     std::string s;
     for (u32 i = 0; i < fp.size(); ++i)
         s += std::format(" [{}: flags {:x} x{} timestamp bits {} granularity {}x{}x{}]", i, (u32)fp[i].queueFlags, fp[i].queueCount, fp[i].timestampValidBits,

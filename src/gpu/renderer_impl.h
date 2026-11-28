@@ -163,6 +163,7 @@ struct Renderer::Impl {
     // Integrated GPU with VK_EXT_memory_budget: its device-local heap is a carve-out of the same RAM (1 GiB by default on the
     // Steam Deck), so DeviceType takes the largest heap once that budget is spent.
     bool uma_budget = false;
+    bool vram_spill = false;  // discrete GPU with <= 4 GB VRAM and a budget: textures go to system memory near that budget
     bool uma_single_heap = false;  // integrated GPU with one DEVICE_LOCAL+HOST_VISIBLE heap
     bool use_stage_dev = true;     // false on integrated GPUs (host and device heaps are the same RAM): stage -> mirror directly
     bool direct_tables = false;    // single-heap UMA: write draw tables directly into host-visible device memory
@@ -187,8 +188,8 @@ struct Renderer::Impl {
             if (bits >> i & 1 && (mem.memoryTypes[i].propertyFlags & want) == want) return i;
         return ~0u;
     }
-    u32 DeviceType(u32 bits, VkDeviceSize size);  // for `size` more bytes of device memory
-    VkDeviceMemory Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address);
+    u32 DeviceType(u32 bits, VkDeviceSize size, bool texture = false);  // for `size` more bytes of device memory
+    VkDeviceMemory Alloc(VkMemoryRequirements r, VkMemoryPropertyFlags want, bool address, bool texture = false);
     // One-off command buffer, waited for.
     template <class F> void Once(F&& f) {
         std::scoped_lock res(res_lock);
