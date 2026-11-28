@@ -85,6 +85,7 @@ void Watch(const std::stop_token& token) {
 }
 unsigned configured_anisotropy{};
 bool configured_shadows = true;
+bool configured_depth_companion = false;
 bool render_off = std::getenv("GOW3_NULL_GPU") != nullptr;
 size_t notes_logged = 0;
 
@@ -251,6 +252,7 @@ Gpu::Renderer* Renderer() {
     if (DebugEnabled()) Log(Gpu::PieceHash::UsesAes() ? "Renderer piece hash: AES-NI" : "Renderer piece hash: XXH3");
     r->SetAnisotropy(configured_anisotropy);
     r->SetShadows(configured_shadows);
+    r->SetDepthCompanion(configured_depth_companion);
 #ifdef _WIN32
     GuestMemory::Install();
 #endif
@@ -427,7 +429,9 @@ void Run(const std::stop_token& token) {
 } // namespace
 
 // ---- Lifecycle and submission ----
-void Configure(unsigned anisotropy, bool shadows) { configured_anisotropy = anisotropy, configured_shadows = shadows; }
+void Configure(unsigned anisotropy, bool shadows, bool depth_companion) {
+    configured_anisotropy = anisotropy, configured_shadows = shadows, configured_depth_companion = depth_companion;
+}
 
 void Start() {
     CpuProbe::Start();
@@ -558,6 +562,11 @@ void AwaitCopies() {
 bool DisplaySurface(u64 address, Gpu::Surface& out) {
     auto* r = live.load(std::memory_order_acquire);
     return r && address && r->FindTarget(address, out);
+}
+
+bool DisplayDepth(u64 address, Gpu::Surface& out) {
+    auto* r = live.load(std::memory_order_acquire);
+    return r && address && r->DepthCompanion(address, out);
 }
 
 // ---- Video frame state ----

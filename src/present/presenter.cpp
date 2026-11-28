@@ -88,6 +88,10 @@ std::array<VkPipeline, 4> cmaa_pipelines;
 VkDescriptorSetLayout fxaa_set;
 VkPipelineLayout fxaa_layout;
 VkPipeline fxaa_pipeline;
+VkDescriptorSetLayout gow3_set;  // the GoW3 AA: FXAA's search where the frame's depth has a geometry edge
+VkPipelineLayout gow3_layout;
+VkPipeline gow3_pipeline;
+VkSampler nearest;  // its depth, texel by texel
 ScalingFilter scaling;
 AntiAliasing anti_aliasing;
 PFN_vkCmdPushDescriptorSetKHR push_descriptor;
@@ -108,6 +112,9 @@ constexpr u32 cmaa3_spv[]{
 };
 constexpr u32 fxaa_spv[]{
 #include "fxaa_spv.inc"
+};
+constexpr u32 gow3aa_spv[]{
+#include "gow3aa_spv.inc"
 };
 
 u32 DeviceMemoryType(u32 bits) {
@@ -246,7 +253,8 @@ VkImageView ApplyCmaa(Frame& frame, VkExtent2D size) {
 
 // FXAA in one pass, on the display buffer's encoded values (its UNORM view: luma as the eye sees it), into an image the
 // scaling pass samples.
-VkImageView ApplyFxaa(Frame& frame, VkExtent2D size) {
+// FXAA, or with `depth` (the depth of the frame that drew the display buffer, Renderer::DepthCompanion) the GoW3 AA.
+VkImageView ApplyFxaa(Frame& frame, VkExtent2D size, VkImageView depth = VK_NULL_HANDLE) {
     auto& out = frame.fxaa;
     ResizeScaled(out, size);
     if (!out.in_general) {
@@ -258,12 +266,14 @@ VkImageView ApplyFxaa(Frame& frame, VkExtent2D size) {
         const VkDependencyInfo before{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &transition};
         vkCmdPipelineBarrier2(frame.cmd, &before);
     }
-    const VkDescriptorImageInfo desc[2]{{sampler, frame.game, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL}};
-    const VkWriteDescriptorSet writes[2]{
+    const VkDescriptorImageInfo desc[3]{{sampler, frame.game, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL},
+                                        {nearest, depth, VK_IMAGE_LAYOUT_GENERAL}};
+    const VkWriteDescriptorSet writes[3]{
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &desc[0]},
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &desc[1]}};
-    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fxaa_pipeline);
-    push_descriptor(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fxaa_layout, 0, 2, writes);
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &desc[1]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &desc[2]}};
+    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, depth ? gow3_pipeline : fxaa_pipeline);
+    push_descriptor(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, depth ? gow3_layout : fxaa_layout, 0, depth ? 3 : 2, writes);
     vkCmdDispatch(frame.cmd, (size.width + 7) / 8, (size.height + 7) / 8, 1);
     ComputeBarrier(frame.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
     return out.view;
@@ -508,6 +518,10 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
     VkImageView source = frame.game;
     if (shown && frame.linear) source = ApplyCmaa(frame, input);
     else if (shown && fxaa_pipeline) source = ApplyFxaa(frame, input);
+    else if (shown && gow3_pipeline) {
+        Gpu::Surface z{};  // no depth of that frame (MSAA, menus, videos): shown as it is
+        if (GpuThread::DisplayDepth(address, z) && z.view && z.w == input.width && z.h == input.height) source = ApplyFxaa(frame, input, z.view);
+    }
     if (shown && scaling == ScalingFilter::Fsr1 && area.extent.width >= input.width && area.extent.height >= input.height &&
         (area.extent.width > input.width || area.extent.height > input.height)) {
         source = Upscale(frame, source, input, area.extent);
@@ -676,6 +690,22 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
         const VkPipelineLayoutCreateInfo layout{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &fxaa_set};
         Check(vkCreatePipelineLayout(device, &layout, nullptr, &fxaa_layout), "Create FXAA pipeline layout");
         fxaa_pipeline = CreateCompute(fxaa_spv, fxaa_layout);
+    }
+    if (config.anti_aliasing == AntiAliasing::Gow3) {
+        const VkDescriptorSetLayoutBinding bindings[3]{
+            {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT},
+            {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT}};
+        const VkDescriptorSetLayoutCreateInfo set{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = 3, .pBindings = bindings};
+        Check(vkCreateDescriptorSetLayout(device, &set, nullptr, &gow3_set), "Create GoW3 AA descriptor layout");
+        const VkPipelineLayoutCreateInfo layout{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &gow3_set};
+        Check(vkCreatePipelineLayout(device, &layout, nullptr, &gow3_layout), "Create GoW3 AA pipeline layout");
+        const VkSamplerCreateInfo point{.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+        Check(vkCreateSampler(device, &point, nullptr, &nearest), "Create GoW3 AA depth sampler");
+        gow3_pipeline = CreateCompute(gow3aa_spv, gow3_layout);
     }
     if (config.anti_aliasing == AntiAliasing::Cmaa2) {
         std::array<VkDescriptorSetLayoutBinding, 9> bindings{};

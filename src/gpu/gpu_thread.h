@@ -14,7 +14,7 @@ struct Surface;
 // follow the GPU's work. GOW3_NULL_GPU=1 skips the drawing.
 namespace Gow3::GpuThread {
 // ---- Lifecycle and submission ----
-void Configure(unsigned anisotropy, bool shadows);
+void Configure(unsigned anisotropy, bool shadows, bool depth_companion);
 void Start();
 // Command buffers as (address, dword count); processed asynchronously in submission order.
 void Submit(std::span<const u32* const> buffers, std::span<const u32> dwords);
@@ -29,6 +29,8 @@ void SetSpareArenas(u64 half, u64 small);
 // ---- Display ----
 // The image the renderer drew at a display buffer's guest address; callable from any thread.
 bool DisplaySurface(u64 address, Gpu::Surface& out);
+// The depth the frame that drew it had at its last draw (Renderer::DepthCompanion), for the GoW3 AA.
+bool DisplayDepth(u64 address, Gpu::Surface& out);
 
 // ---- Video frame state ----
 void TraceDecodedVideo(u64 address, u32 width, u32 height, u64 tag);

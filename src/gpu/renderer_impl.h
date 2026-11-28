@@ -602,6 +602,19 @@ struct Renderer::Impl {
         for (auto it = targets.lower_bound({base, 0u, 0u, VkFormat(0), 0u}); it != targets.end() && it->second.base == base; ++it) f(it->second);
     }
     std::unordered_map<u64, std::pair<Target*, u32>> stencil_at;
+    // Depth companions (SetDepthCompanion, the presenter's GoW3 AA): Draw notes the frame's last color draw in walk order
+    // (its color target 0 and the depth base bound with it, used or not), Submit copies that depth at the frame's end into an
+    // image kept per color target, so the presenter reads the depth of the frame it shows, not of the one drawn meanwhile.
+    bool depth_companion = false;
+    std::atomic<u64> last_draw_key{0};  // walk position + 1 of the last draw noted (0: none this frame)
+    std::mutex last_draw_lock;
+    struct LastDraw { u64 key = 0, color = 0, depth = 0; u32 w = 0, h = 0; };
+    LastDraw last_draw;
+    struct Companion { Tex t; u32 frame = ~0u; u32 w = 0, h = 0; VkFormat fmt = VK_FORMAT_UNDEFINED; bool ready = false; };
+    std::mutex companion_lock;
+    std::map<u64, std::vector<Companion>> companions;  // by color target base; earlier sizes kept (the presenter may hold their views)
+    void NoteLastDraw(const Target& color0, u64 depth_base);
+    void CopyDepthCompanion(VkCommandBuffer c);
     // width | height << 16 from the NOP hint after the CB / DB setup (0: none)
     static inline thread_local u32 cb_extent[8]{}, db_extent = 0;
     VkSampleCountFlags msaa_samples = VK_SAMPLE_COUNT_1_BIT;  // sample counts supported across color, depth, stencil and sampled views

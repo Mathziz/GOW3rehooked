@@ -5,17 +5,41 @@
 // Tuned against the blur FXAA is known for: no sub-pixel term (it softened every high-contrast texel, the usual blur), a
 // higher contrast threshold, and a pixel moves only toward a real edge end, at most half a pixel. Everything else is copied
 // as it is, so texture detail stays.
+// GOW3_DEPTH (the GoW3 AA, gow3aa_spv.inc): the same search, only where the game's depth has an edge of its geometry. The
+// renderer copies, at the end of the frame that drew the display buffer, the depth bound with its last draw (the final pass;
+// the HUD and subtitles draw before it, over the scene's depth). A pixel whose depth is planar with its four neighbors (inverse
+// depth, which 1 - d is up to a scale, changes linearly across a plane) is copied as it is: texture detail, subtitles and the
+// HUD over a surface stay sharp. Silhouettes and creases bend it, and only there the edge is smoothed, with lower contrast
+// thresholds than plain FXAA, since the depth already tells the geometry's edges from the textures'.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D src;  // linear filtering, clamped
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
 
+#ifdef GOW3_DEPTH
+layout(set = 0, binding = 2) uniform sampler2D depth;  // depth aspect, standard (far 1), read texel by texel
+const float kEdgeThreshold = 0.125;
+const float kEdgeThresholdMin = 0.0312;
+const float kCrease = 0.004;     // second difference of inverse depth, relative: silhouettes and creases
+const float kNoise = 2.4e-7;     // and absolute (a few steps of a 32-bit float depth near 1)
+#else
 const float kEdgeThreshold = 0.166;     // contrast to the local maximum below which a pixel is left alone
 const float kEdgeThresholdMin = 0.0625;  // and absolute contrast (GOW3's darks)
+#endif
 const int kSteps = 10;
 const float kStep[kSteps] = float[](1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
 
 float Luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+#ifdef GOW3_DEPTH
+float InverseDepth(ivec2 q, ivec2 size) { return 1.0 - texelFetch(depth, clamp(q, ivec2(0), size - 1), 0).r; }
+bool GeometryEdge(ivec2 p, ivec2 size) {
+    float c = InverseDepth(p, size);
+    float l = InverseDepth(p + ivec2(-1, 0), size), r = InverseDepth(p + ivec2(1, 0), size);
+    float u = InverseDepth(p + ivec2(0, -1), size), d = InverseDepth(p + ivec2(0, 1), size);
+    float bend = max(abs(l + r - 2.0 * c), abs(u + d - 2.0 * c));
+    return bend > kCrease * max(c, max(max(l, r), max(u, d))) + kNoise;
+}
+#endif
 float LumaAt(vec2 uv) { return Luma(textureLod(src, uv, 0.0).rgb); }
 
 void main() {
@@ -37,6 +61,12 @@ void main() {
         imageStore(dst, p, vec4(center, 1.0));
         return;
     }
+#ifdef GOW3_DEPTH
+    if (!GeometryEdge(p, textureSize(depth, 0))) {
+        imageStore(dst, p, vec4(center, 1.0));
+        return;
+    }
+#endif
     float lumaNW = Luma(textureLodOffset(src, uv, 0.0, ivec2(-1, -1)).rgb);
     float lumaNE = Luma(textureLodOffset(src, uv, 0.0, ivec2(1, -1)).rgb);
     float lumaSW = Luma(textureLodOffset(src, uv, 0.0, ivec2(-1, 1)).rgb);

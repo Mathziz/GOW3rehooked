@@ -1145,8 +1145,88 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     for (u32 k = 0; k < color_count; ++k)  // the blend memo holds this draw's masks up to color_count only
         if (bs.mask[k] && (ctx[0x318 + k * 15 + 5] & 0x1F) == 8) WriteBackTarget(*color[k], ((ctx[0x319 + k * 15] & 0x7FF) + 1) * 8, area);
     WriteBack();
+    if (depth_companion && color[0] && color[0]->samples == 1) NoteLastDraw(*color[0], ctx[0x010] & 3 ? (u64)ctx[0x014] << 8 : 0);
     Count(stats.draws);
 }
+
+// The latest draw in walk order (the recording threads take blocks out of order): the display buffer's final pass.
+void Renderer::Impl::NoteLastDraw(const Target& color0, u64 depth_base) {
+    const u64 key = ((u64)walk_seg << 32 | (u64)walk_pos) + 1;
+    if (key <= last_draw_key.load(std::memory_order_relaxed)) return;
+    std::scoped_lock lock(last_draw_lock);
+    if (key <= last_draw.key) return;
+    last_draw = {key, color0.base, depth_base, color0.w, color0.h};
+    last_draw_key.store(key, std::memory_order_relaxed);
+}
+
+// Frame end (primary command buffer, after its closing barrier): the depth target at the last draw's depth base, single-sampled
+// and of its color target's size, drawn this frame, is copied into that color target's companion. Without one, the companion
+// is marked stale, so the presenter leaves that frame alone.
+void Renderer::Impl::CopyDepthCompanion(VkCommandBuffer c) {
+    LastDraw d;
+    {
+        std::scoped_lock lock(last_draw_lock);
+        d = std::exchange(last_draw, {});
+        last_draw_key.store(0, std::memory_order_relaxed);
+    }
+    if (!d.key) return;
+    const Target* z = nullptr;
+    if (d.depth) {
+        std::scoped_lock lock(targets_lock);
+        TargetsAt(d.depth, [&](const Target& t) {
+            if (t.depth && t.samples == 1 && t.w == d.w && t.h == d.h && std::atomic_ref(t.rendered).load(std::memory_order_relaxed) == frame) z = &t;
+        });
+    }
+    std::scoped_lock lock(companion_lock);
+    auto& list = companions[d.color];
+    Companion* comp = nullptr;
+    for (auto& k : list) {
+        k.ready = false;
+        if (z && k.w == z->w && k.h == z->h && k.fmt == z->fmt) comp = &k;
+    }
+    if (!z) return;
+    if (!comp) {
+        Companion made{MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, z->fmt, z->w, z->h, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 0, true),
+                       ~0u, z->w, z->h, z->fmt, false};
+        if (!made.t.img) return Note("depth companion image failed");
+        const VkImageMemoryBarrier init{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, made.t.img,
+                                        {VK_IMAGE_ASPECT_DEPTH_BIT | (z->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u), 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &init);
+        list.push_back(std::move(made));
+        comp = &list.back();
+        Gow3::Log(std::format("Renderer: depth companion for the display buffer at {:#x}: {}x{} depth of {:#x} (format {})", d.color, z->w, z->h,
+                              z->base, (int)z->fmt));
+    }
+    // The presenter's earlier reads of this image (same queue) before the copy overwrites it; the frame's depth writes are
+    // ordered by the closing barrier already.
+    const VkMemoryBarrier reads{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &reads, 0,
+                         nullptr, 0, nullptr);
+    const VkImageCopy region{{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {}, {z->w, z->h, 1}};
+    vkCmdCopyImage(c, z->t.img, VK_IMAGE_LAYOUT_GENERAL, comp->t.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    comp->frame = frame, comp->ready = true;
+}
+
+bool Renderer::DepthCompanion(std::uint64_t base, Surface& out) {
+    Impl& r = *d;
+    u32 drawn = ~0u;
+    {
+        std::scoped_lock lock(r.targets_lock);
+        r.TargetsAt(base, [&](const Impl::Target& t) {
+            if (!t.depth && t.samples == 1) drawn = std::atomic_ref(t.rendered).load(std::memory_order_relaxed);
+        });
+    }
+    std::scoped_lock lock(r.companion_lock);
+    const auto it = r.companions.find(base);
+    if (it == r.companions.end()) return false;
+    for (const auto& k : it->second)
+        if (k.ready && k.frame == drawn) return out = {k.t.img, k.fmt, k.w, k.h, k.t.view}, true;
+    return false;
+}
+
+void Renderer::SetDepthCompanion(bool on) { d->depth_companion = on; }
 
 // DISPATCH_DIRECT: the CS program with COMPUTE_USER_DATA, outside any rendering; consecutive independent dispatches share
 // one write-back barrier pair.
@@ -1703,6 +1783,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         r.gpu_writes.insert(r.gpu_writes.end(), r.block_writes.begin(), r.block_writes.end()), r.block_writes.clear();
     }
     r.FlushLinearSyncs();
+    if (r.depth_companion) r.CopyDepthCompanion(r.primary);  // after the frame's closing barrier: every draw is done
     for (auto& [op, u] : unhandled)  // once per opcode (first frame that has it)
         if (const std::string tag = std::format("PM4 op {:#x} ", op);
             std::none_of(r.stats.notes.begin(), r.stats.notes.end(), [&](const std::string& n) { return n.starts_with(tag); }))
