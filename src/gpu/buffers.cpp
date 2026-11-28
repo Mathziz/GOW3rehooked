@@ -520,17 +520,9 @@ void Renderer::Impl::Reclaim() {
     for (size_t k = 0; k < chunks.size(); ++k)
         sparse[k] = chunks[k] && k != fill[0] && k != fill[1] && u64(chunk_live[k]) * 4 * page <= chunk_bytes[k];
     const u64 words = bound.size();
-    // A page the GPU wrote (pinned) is kept only while the GPU writes or reads it: its writes are read back into guest memory
-    // as each frame retires (RecordReadback, GuestMemory::Store), so 600 frames later guest memory holds them and the page
-    // can go like any other (a later read stages it again from there). Pinned for good, the pages of every area the GPU
-    // ever wrote stayed: the mirror grew through a session and never went below 832 MB (782 of it in use) at the last freeze.
-    for (u64 n = 0, k = unpin_cursor; n < 64; ++n, k = (k + 1) % words) {
-        for (u64 bits = pinned[k] & bound[k]; bits; bits &= bits - 1) {
-            const u64 i = k * 64 + std::countr_zero(bits);
-            if (frame - page_used[i].load(std::memory_order_relaxed) >= 600) pinned[k] &= ~(1ull << (i % 64));
-        }
-        unpin_cursor = (k + 1) % words;
-    }
+    // Pages the GPU wrote stay pinned for good. Unpinning them 600 frames after their last use froze every session 20 to 30 s
+    // in (frames 1000 to 2000, under the budget, the GPU never finishing): some GPU writes reach those pages without going
+    // through BindPages, so their use is not seen, and an unbound page took them.
     std::vector<u64> freed;  // mirror page indices released this frame (ascending per pass)
     for (u64 n = 0; n < words && freed.size() < cap; ++n, reclaim_cursor = (reclaim_cursor + 1) % words) {
         for (u64 bits = bound[reclaim_cursor] & ~pinned[reclaim_cursor]; bits && freed.size() < cap; bits &= bits - 1) {
