@@ -22,15 +22,18 @@ layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
 #ifdef GOW3_DEPTH
 layout(set = 0, binding = 2) uniform sampler2D depth;  // view distance (R32F), read texel by texel
 const float kCrease = 0.004;  // second difference of inverse distance, relative: silhouettes and creases
+// Contrast floors lower than FXAA's: the depth already keeps textures out, and GOW3 is dark, its edges dark on dark. Run on
+// an F9 capture (the Icarus vent room) offline, 0.0312 left half the geometry edges the depth found untouched; 0.0156 takes
+// three quarters, 0.0078 (two steps of 255) nine tenths.
 #ifdef GOW3_STRONG
 const float kEdgeThreshold = 0.063;
-const float kEdgeThresholdMin = 0.0312;
+const float kEdgeThresholdMin = 0.0078;
 const float kSubpix = 0.75;
 const int kSteps = 12;
 const float kStep[kSteps] = float[](1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
 #else
 const float kEdgeThreshold = 0.125;
-const float kEdgeThresholdMin = 0.0312;
+const float kEdgeThresholdMin = 0.0156;
 #endif
 #else
 const float kEdgeThreshold = 0.166;     // contrast to the local maximum below which a pixel is left alone
