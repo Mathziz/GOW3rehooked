@@ -67,8 +67,14 @@ float LumaAt(vec2 uv) { return Luma(textureLod(src, uv, 0.0).rgb); }
 
 #ifdef GOW3_DEPTH
 const float kJump = 0.02;     // a slope carried across a pair that misses the other side by this, relative: a jump
-const int kRun = 16;          // pixels followed each way along a silhouette
 const float kMaxBlend = 0.5;  // at most half a pixel from its neighbors
+// Set by the presenter (specialization constants). kSilhouette: how much of the silhouette blend to apply; the game's MSAA
+// samples silhouettes already, and on top of its resolve the full blend overshoots (8x8-supersampled test: MSAA 2x 62% of
+// no AA's edge error, 75% with the full blend, 60% with 0.35; MSAA 4x 37%, made worse by any). kRun: pixels followed each way
+// along a silhouette. kMix: the share of FXAA's search on silhouettes too (x4: its sub-pixel term softens thin geometry).
+layout(constant_id = 0) const float kSilhouette = 1.0;
+layout(constant_id = 1) const int kRun = 16;
+layout(constant_id = 2) const float kMix = 0.0;
 const float kTouch = 0.004;   // below this luma range the neighbors are one color: nothing to blend
 ivec2 dsize;
 bool Inside(ivec2 q) { return all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, dsize)); }
@@ -149,38 +155,16 @@ bool Silhouette(ivec2 p, vec3 c, vec3 cN, vec3 cS, vec3 cW, vec3 cE, out vec3 re
 }
 #endif
 
-void main() {
-    ivec2 size = textureSize(src, 0);
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    if (p.x >= size.x || p.y >= size.y) return;
-    vec2 rcp = 1.0 / vec2(size);
-    vec2 uv = (vec2(p) + 0.5) * rcp;
-    vec3 center = textureLod(src, uv, 0.0).rgb;
-    vec3 colorN = textureLodOffset(src, uv, 0.0, ivec2(0, -1)).rgb, colorS = textureLodOffset(src, uv, 0.0, ivec2(0, 1)).rgb;
-    vec3 colorW = textureLodOffset(src, uv, 0.0, ivec2(-1, 0)).rgb, colorE = textureLodOffset(src, uv, 0.0, ivec2(1, 0)).rgb;
-    float lumaM = Luma(center);
-    float lumaN = Luma(colorN), lumaS = Luma(colorS), lumaW = Luma(colorW), lumaE = Luma(colorE);
-    float rangeMax = max(max(max(lumaN, lumaS), max(lumaW, lumaE)), lumaM);
-    float rangeMin = min(min(min(lumaN, lumaS), min(lumaW, lumaE)), lumaM);
-    float range = rangeMax - rangeMin;
-#ifdef GOW3_DEPTH
-    dsize = textureSize(depth, 0);
-    if (range >= kTouch) {
-        vec3 blended;
-        if (Silhouette(p, center, colorN, colorS, colorW, colorE, blended)) {
-            imageStore(dst, p, vec4(blended, 1.0));
-            return;
-        }
-    }
-#endif
+// FXAA's search, where the contrast (and with GOW3_DEPTH the depth) shows an edge: the color half a pixel across it, by the
+// distance to the edge's nearer end; the center where nothing moves.
+vec3 Search(ivec2 p, vec2 uv, vec2 rcp, vec3 center, float lumaM, float lumaN, float lumaS, float lumaW, float lumaE, float range,
+            float rangeMax) {
     if (range < max(kEdgeThresholdMin, rangeMax * kEdgeThreshold)) {
-        imageStore(dst, p, vec4(center, 1.0));
-        return;
+        return center;
     }
 #ifdef GOW3_DEPTH
     if (!GeometryEdge(p, dsize)) {
-        imageStore(dst, p, vec4(center, 1.0));
-        return;
+        return center;
     }
 #endif
     float lumaNW = Luma(textureLodOffset(src, uv, 0.0, ivec2(-1, -1)).rgb);
@@ -240,10 +224,41 @@ void main() {
     offset = max(offset, subpix);
 #endif
     if (offset <= 0.0) {
-        imageStore(dst, p, vec4(center, 1.0));
-        return;
+        return center;
     }
     if (horzSpan) uv.y += offset * lengthSign;
     else uv.x += offset * lengthSign;
-    imageStore(dst, p, vec4(textureLod(src, uv, 0.0).rgb, 1.0));
+    return textureLod(src, uv, 0.0).rgb;
+}
+
+void main() {
+    ivec2 size = textureSize(src, 0);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) return;
+    vec2 rcp = 1.0 / vec2(size);
+    vec2 uv = (vec2(p) + 0.5) * rcp;
+    vec3 center = textureLod(src, uv, 0.0).rgb;
+    vec3 colorN = textureLodOffset(src, uv, 0.0, ivec2(0, -1)).rgb, colorS = textureLodOffset(src, uv, 0.0, ivec2(0, 1)).rgb;
+    vec3 colorW = textureLodOffset(src, uv, 0.0, ivec2(-1, 0)).rgb, colorE = textureLodOffset(src, uv, 0.0, ivec2(1, 0)).rgb;
+    float lumaM = Luma(center);
+    float lumaN = Luma(colorN), lumaS = Luma(colorS), lumaW = Luma(colorW), lumaE = Luma(colorE);
+    float rangeMax = max(max(max(lumaN, lumaS), max(lumaW, lumaE)), lumaM);
+    float rangeMin = min(min(min(lumaN, lumaS), min(lumaW, lumaE)), lumaM);
+    float range = rangeMax - rangeMin;
+#ifdef GOW3_DEPTH
+    dsize = textureSize(depth, 0);
+    vec3 blended = center;
+    bool silhouette = range >= kTouch && Silhouette(p, center, colorN, colorS, colorW, colorE, blended);
+    if (silhouette) {
+        blended = center + (blended - center) * kSilhouette;
+        if (kMix <= 0.0) {
+            imageStore(dst, p, vec4(blended, 1.0));
+            return;
+        }
+    }
+    vec3 searched = Search(p, uv, rcp, center, lumaM, lumaN, lumaS, lumaW, lumaE, range, rangeMax);
+    imageStore(dst, p, vec4(silhouette ? mix(blended, searched, kMix) : searched, 1.0));
+#else
+    imageStore(dst, p, vec4(Search(p, uv, rcp, center, lumaM, lumaN, lumaS, lumaW, lumaE, range, rangeMax), 1.0));
+#endif
 }

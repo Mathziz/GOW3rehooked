@@ -587,13 +587,13 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
     else Check(presented, "Present");
 }
 
-VkPipeline CreateCompute(std::span<const u32> code, VkPipelineLayout layout) {
+VkPipeline CreateCompute(std::span<const u32> code, VkPipelineLayout layout, const VkSpecializationInfo* constants = nullptr) {
     const VkShaderModuleCreateInfo module_info{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = code.size_bytes(), .pCode = code.data()};
     VkShaderModule module{};
     Check(vkCreateShaderModule(device, &module_info, nullptr, &module), "Create post-effect shader");
     const VkPipelineShaderStageCreateInfo stage{.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"};
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main", .pSpecializationInfo = constants};
     const VkComputePipelineCreateInfo info{.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = stage, .layout = layout};
     VkPipeline result{};
     const VkResult status = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &result);
@@ -694,7 +694,7 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
         Check(vkCreatePipelineLayout(device, &layout, nullptr, &fxaa_layout), "Create FXAA pipeline layout");
         fxaa_pipeline = CreateCompute(fxaa_spv, fxaa_layout);
     }
-    if (config.anti_aliasing == AntiAliasing::Gow3 || config.anti_aliasing == AntiAliasing::Gow3x2) {
+    if (config.anti_aliasing == AntiAliasing::Gow3 || config.anti_aliasing == AntiAliasing::Gow3x2 || config.anti_aliasing == AntiAliasing::Gow3x4) {
         const VkDescriptorSetLayoutBinding bindings[3]{
             {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
             {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT},
@@ -708,7 +708,15 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
             .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
         Check(vkCreateSampler(device, &point, nullptr, &nearest), "Create GoW3 AA depth sampler");
-        gow3_pipeline = config.anti_aliasing == AntiAliasing::Gow3x2 ? CreateCompute(gow3aa2_spv, gow3_layout) : CreateCompute(gow3aa_spv, gow3_layout);
+        // fxaa.comp's specialization constants: the silhouette blend's strength over the game's MSAA (which samples silhouettes
+        // already: 0.35 of it over 2x, none over 4x), the run followed along a silhouette, and the share of FXAA's search
+        // mixed in on silhouettes (x4: 32 pixels and 15%, the 8x8-supersampled test's best, 47.9% of no AA's edge error).
+        struct { float silhouette; int run; float mix; } values{config.msaa >= 4 ? 0.0f : config.msaa >= 2 ? 0.35f : 1.0f, 16, 0.0f};
+        if (config.anti_aliasing == AntiAliasing::Gow3x4) values.run = 32, values.mix = 0.15f;
+        const VkSpecializationMapEntry entries[3]{{0, 0, sizeof(float)}, {1, sizeof(float), sizeof(int)}, {2, sizeof(float) + sizeof(int), sizeof(float)}};
+        const VkSpecializationInfo constants{3, entries, sizeof(values), &values};
+        gow3_pipeline = CreateCompute(config.anti_aliasing == AntiAliasing::Gow3 ? std::span<const u32>(gow3aa_spv) : std::span<const u32>(gow3aa2_spv),
+                                      gow3_layout, &constants);
     }
     if (config.anti_aliasing == AntiAliasing::Cmaa2) {
         std::array<VkDescriptorSetLayoutBinding, 9> bindings{};

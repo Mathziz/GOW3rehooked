@@ -1178,20 +1178,32 @@ void Renderer::Impl::CopyDepthCompanion(VkCommandBuffer c) {
                 std::atomic_ref(t.rendered).load(std::memory_order_relaxed) == frame)
                 z = &t;
     }
+    // In half precision where the GPU blits 32-bit floats into 16-bit ones: 1 part in 2048 of the view distance, which on F9
+    // captures moves 0.02 to 0.04% of the GoW3 AA's output pixels by more than 2 of 255, and half the bytes the copy and the
+    // presenter's reads move (both over PCIe where the companion lives in system memory).
+    static const VkFormat half = [&] {
+        VkFormatProperties from{}, to{};
+        vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_R32_SFLOAT, &from);
+        vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_R16_SFLOAT, &to);
+        constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        return from.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT && (to.optimalTilingFeatures & need) == need ? VK_FORMAT_R16_SFLOAT
+                                                                                                                       : VK_FORMAT_UNDEFINED;
+    }();
+    const VkFormat fmt = z && z->fmt == VK_FORMAT_R32_SFLOAT && half != VK_FORMAT_UNDEFINED ? half : z ? z->fmt : VK_FORMAT_UNDEFINED;
     std::scoped_lock lock(companion_lock);
     auto& list = companions[d.color];
     Companion* comp = nullptr;
     for (auto& k : list) {
         k.ready = false;
-        if (z && k.w == z->w && k.h == z->h && k.fmt == z->fmt) comp = &k;
+        if (z && k.w == z->w && k.h == z->h && k.fmt == fmt) comp = &k;
     }
     if (!z) return;
     if (!comp) {
         constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        Tex img = vram_spill ? HostImage(z->fmt, z->w, z->h, usage, VK_IMAGE_ASPECT_COLOR_BIT) : Tex{};
+        Tex img = vram_spill ? HostImage(fmt, z->w, z->h, usage, VK_IMAGE_ASPECT_COLOR_BIT) : Tex{};
         const bool host = img.img != VK_NULL_HANDLE;
-        if (!host) img = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, z->fmt, z->w, z->h, 1, 1, VK_SAMPLE_COUNT_1_BIT, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, true);
-        Companion made{img, ~0u, z->w, z->h, z->fmt, false};
+        if (!host) img = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, fmt, z->w, z->h, 1, 1, VK_SAMPLE_COUNT_1_BIT, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, true);
+        Companion made{img, ~0u, z->w, z->h, fmt, false};
         if (!made.t.img) return Note("depth companion image failed");
         const VkImageMemoryBarrier init{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                                         VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, made.t.img,
@@ -1199,16 +1211,22 @@ void Renderer::Impl::CopyDepthCompanion(VkCommandBuffer c) {
         vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &init);
         list.push_back(std::move(made));
         comp = &list.back();
-        Gow3::Log(std::format("Renderer: depth companion for the display buffer at {:#x}: {}x{} linear depth of {:#x}, in {}", d.color, z->w, z->h,
-                              z->base, host ? "system memory" : "video memory"));
+        Gow3::Log(std::format("Renderer: depth companion for the display buffer at {:#x}: {}x{} linear depth of {:#x}, {} bits, in {}", d.color, z->w,
+                              z->h, z->base, fmt == VK_FORMAT_R16_SFLOAT ? 16 : 32, host ? "system memory" : "video memory"));
     }
     // The presenter's earlier reads of this image (same queue) before the copy overwrites it; the frame's writes are ordered
     // by the closing barrier already.
     const VkMemoryBarrier reads{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &reads, 0,
                          nullptr, 0, nullptr);
-    const VkImageCopy region{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {z->w, z->h, 1}};
-    vkCmdCopyImage(c, z->t.img, VK_IMAGE_LAYOUT_GENERAL, comp->t.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    if (fmt == z->fmt) {
+        const VkImageCopy region{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {z->w, z->h, 1}};
+        vkCmdCopyImage(c, z->t.img, VK_IMAGE_LAYOUT_GENERAL, comp->t.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    } else {
+        const VkOffset3D end{int32_t(z->w), int32_t(z->h), 1};
+        const VkImageBlit region{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{}, end}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{}, end}};
+        vkCmdBlitImage(c, z->t.img, VK_IMAGE_LAYOUT_GENERAL, comp->t.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+    }
     comp->frame = frame, comp->ready = true;
 }
 
