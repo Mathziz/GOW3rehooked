@@ -432,20 +432,15 @@ bool Renderer::Impl::BindPages(u64 lo, u64 hi, std::vector<Span>* missing) {
             const u32 cls = tex_pages && (tex_pages[i / 64].load(std::memory_order_relaxed) & bit) ? 1 : 0;
             u32 chunk = ~0u;
             u64 offset = 0;
-            const auto take = [&](u32 k) {
-                chunk = free_slots[k].back() >> 16, offset = u64(free_slots[k].back() & 0xFFFF) * page;
-                free_slots[k].pop_back();
-            };
-            if (!free_slots[cls].empty()) {
-                take(cls);
+            if (free_count[cls] && TakeSlot(cls, chunk, offset)) {
             } else if (fill[cls] == ~0u || fill_used[cls] + page > fill_cap[cls]) {
                 u64 size = chunk_size;
                 // After a refusal the pages left in this range would need the same chunk: none is asked for again.
                 if (VkDeviceMemory m = all ? AllocateChunk(size) : VK_NULL_HANDLE) {
                     fill[cls] = u32(chunks.size()), fill_used[cls] = 0, fill_cap[cls] = size;
                     chunks.push_back(m), chunk_live.push_back(0), chunk_bytes.push_back(size), chunk_class.push_back(u8(cls)), mirror_chunks += size;
-                } else if (!free_slots[cls ^ 1].empty()) {
-                    take(cls ^ 1);
+                    chunk_free.emplace_back();
+                } else if (free_count[cls ^ 1] && TakeSlot(cls ^ 1, chunk, offset)) {
                 } else {
                     all = false;
                     alloc_pressure.store(true, std::memory_order_relaxed);
@@ -506,7 +501,9 @@ void Renderer::Impl::Reclaim() {
                                                         : budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 > budget.heapBudget[h] ? 1u : 0u);
     }
     if (!reclaim_level || chunks.empty()) return;
-    const u32 idle[2]{reclaim_level == 2 ? 120u : 900u, reclaim_level == 2 ? 16u : 120u};
+    // Texture sources are only read by their upload: 4 frames after it (every frame that copied from them has retired) over
+    // the budget, 16 near it.
+    const u32 idle[2]{reclaim_level == 2 ? 120u : 900u, reclaim_level == 2 ? 4u : 16u};
     const u64 words = bound.size();
     std::vector<u64> freed;  // mirror page indices released this frame (ascending per pass)
     for (u64 n = 0; n < words && freed.size() < 256; ++n, reclaim_cursor = (reclaim_cursor + 1) % words) {
@@ -528,9 +525,9 @@ void Renderer::Impl::Reclaim() {
             if (--chunk_live[c] == 0 && c != fill[0] && c != fill[1]) {  // emptied (not a chunk still being filled): back to the driver
                 dying_chunks.push_back({frame, chunks[c]}), chunks[c] = VK_NULL_HANDLE;
                 mirror_chunks -= chunk_bytes[c], returned_bytes += chunk_bytes[c];
-                std::erase_if(free_slots[cls], [c](u32 s) { return s >> 16 == c; });
+                free_count[cls] -= chunk_free[c].size(), std::vector<u16>().swap(chunk_free[c]);
             } else {
-                free_slots[cls].push_back(slot);
+                chunk_free[c].push_back(u16(slot & 0xFFFF)), ++free_count[cls];
             }
         }
     }
@@ -550,6 +547,19 @@ void Renderer::Impl::Reclaim() {
                               reclaim_level == 2 ? "over" : "near", reclaimed_pages, reclaimed_texture_pages, restaged_pages.load(std::memory_order_relaxed),
                               returned_bytes >> 20, mirror_chunks.load() >> 20, texture_bytes >> 20));
     }
+}
+
+// The fullest chunk of the class with a freed slot gives it (bind_lock held): new pages go where most pages are, so the emptiest
+// chunks drain under Reclaim and go back to the driver. Taking the slot freed last spread the pages over every chunk: at Poseidon
+// the mirror stayed at 880 MB with thousands of pages dropped, and 32 MB went back.
+bool Renderer::Impl::TakeSlot(u32 cls, u32& chunk, u64& offset) {
+    u32 best = ~0u;
+    for (u32 c = 0; c < chunk_free.size(); ++c)
+        if (!chunk_free[c].empty() && chunk_class[c] == cls && (best == ~0u || chunk_live[c] > chunk_live[best])) best = c;
+    if (best == ~0u) return false;
+    chunk = best, offset = u64(chunk_free[best].back()) * page;
+    chunk_free[best].pop_back(), --free_count[cls];
+    return true;
 }
 
 void Renderer::ReclaimMirror() { d->Reclaim(); }

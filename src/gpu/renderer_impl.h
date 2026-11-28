@@ -405,7 +405,9 @@ struct Renderer::Impl {
     std::vector<u64> pinned;                        // bitmap: pages the GPU writes (their bytes are only in the mirror): kept
     std::vector<u32> chunk_live;                    // bound pages per chunk
     std::vector<u64> chunk_bytes;                   // size per chunk
-    std::vector<u32> free_slots[2];                 // per class: slots Reclaim freed, taken before a new chunk
+    std::vector<std::vector<u16>> chunk_free;       // per chunk: slots Reclaim freed (pages in the chunk), taken before a new chunk
+    u64 free_count[2]{};                            // per class: those slots
+    bool TakeSlot(u32 cls, u32& chunk, u64& offset);  // a freed slot of class `cls`, in the fullest chunk that has one
     std::vector<std::pair<u32, VkDeviceMemory>> dying_chunks;  // emptied chunks and the frame they emptied in: freed 4 frames later
     std::unordered_map<u64, size_t> unbinds;        // pages unbound this frame -> their pending_binds entry (a bind reuses it)
     // Reclaim drops a page's memory, not its tracking: GuestMemory keeps watching its guest pages (no protection change), and
