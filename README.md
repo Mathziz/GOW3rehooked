@@ -1,4 +1,5 @@
-<h1 align="center">GOW3rehooked · fusion-750ti</h1>
+<h1 align="center">GOW3rehooked · Vulkan -8 and suport for older GPUS 
+i</h1>
 
 <p align="center"><b>God of War III Remastered on PC, tuned for older and 2 GB graphics cards.</b><br>
 Runs on a GeForce GTX 750 Ti, with an anti-aliasing mode made for this game.</p>
