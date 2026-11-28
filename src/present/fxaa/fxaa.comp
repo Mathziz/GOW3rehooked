@@ -6,38 +6,50 @@
 // higher contrast threshold, and a pixel moves only toward a real edge end, at most half a pixel. Everything else is copied
 // as it is, so texture detail stays.
 // GOW3_DEPTH (the GoW3 AA, gow3aa_spv.inc): the same search, only where the game's depth has an edge of its geometry. The
-// renderer copies, at the end of the frame that drew the display buffer, the depth bound with its last draw (the final pass;
-// the HUD and subtitles draw before it, over the scene's depth). A pixel whose depth is planar with its four neighbors (inverse
-// depth, which 1 - d is up to a scale, changes linearly across a plane) is copied as it is: texture detail, subtitles and the
-// HUD over a surface stay sharp. Silhouettes and creases bend it, and only there the edge is smoothed, with lower contrast
-// thresholds than plain FXAA, since the depth already tells the geometry's edges from the textures'.
+// renderer copies, at the end of the frame that drew the display buffer, the frame's linear depth: the R32F view distance
+// GOW3 keeps for its shadows and depth of field (its depth buffer it clears before the subtitles and the HUD). A pixel whose
+// inverse distance is planar with its four neighbors (it changes linearly across a plane, on screen) is copied as it is:
+// texture detail, and subtitles and HUD over a surface, stay sharp. Silhouettes and creases bend it, and only there the edge
+// is smoothed, with lower contrast thresholds than plain FXAA, since the depth already tells the geometry's edges from the
+// textures'.
+// GOW3_STRONG as well (GoW3 AA x2, gow3aa2_spv.inc): lower thresholds still, a longer search, and on those edges FXAA's
+// sub-pixel term, which smooths thin geometry (chains, spikes, leaves) the edge search alone leaves jagged.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D src;  // linear filtering, clamped
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
 
 #ifdef GOW3_DEPTH
-layout(set = 0, binding = 2) uniform sampler2D depth;  // depth aspect, standard (far 1), read texel by texel
+layout(set = 0, binding = 2) uniform sampler2D depth;  // view distance (R32F), read texel by texel
+const float kCrease = 0.004;  // second difference of inverse distance, relative: silhouettes and creases
+#ifdef GOW3_STRONG
+const float kEdgeThreshold = 0.063;
+const float kEdgeThresholdMin = 0.0312;
+const float kSubpix = 0.75;
+const int kSteps = 12;
+const float kStep[kSteps] = float[](1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+#else
 const float kEdgeThreshold = 0.125;
 const float kEdgeThresholdMin = 0.0312;
-const float kCrease = 0.004;     // second difference of inverse depth, relative: silhouettes and creases
-const float kNoise = 2.4e-7;     // and absolute (a few steps of a 32-bit float depth near 1)
+#endif
 #else
 const float kEdgeThreshold = 0.166;     // contrast to the local maximum below which a pixel is left alone
 const float kEdgeThresholdMin = 0.0625;  // and absolute contrast (GOW3's darks)
 #endif
+#ifndef GOW3_STRONG
 const int kSteps = 10;
 const float kStep[kSteps] = float[](1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+#endif
 
 float Luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 #ifdef GOW3_DEPTH
-float InverseDepth(ivec2 q, ivec2 size) { return 1.0 - texelFetch(depth, clamp(q, ivec2(0), size - 1), 0).r; }
+float InverseDistance(ivec2 q, ivec2 size) { return 1.0 / max(texelFetch(depth, clamp(q, ivec2(0), size - 1), 0).r, 1e-6); }
 bool GeometryEdge(ivec2 p, ivec2 size) {
-    float c = InverseDepth(p, size);
-    float l = InverseDepth(p + ivec2(-1, 0), size), r = InverseDepth(p + ivec2(1, 0), size);
-    float u = InverseDepth(p + ivec2(0, -1), size), d = InverseDepth(p + ivec2(0, 1), size);
+    float c = InverseDistance(p, size);
+    float l = InverseDistance(p + ivec2(-1, 0), size), r = InverseDistance(p + ivec2(1, 0), size);
+    float u = InverseDistance(p + ivec2(0, -1), size), d = InverseDistance(p + ivec2(0, 1), size);
     float bend = max(abs(l + r - 2.0 * c), abs(u + d - 2.0 * c));
-    return bend > kCrease * max(c, max(max(l, r), max(u, d))) + kNoise;
+    return bend > kCrease * max(c, max(max(l, r), max(u, d)));
 }
 #endif
 float LumaAt(vec2 uv) { return Luma(textureLod(src, uv, 0.0).rgb); }
@@ -73,6 +85,12 @@ void main() {
     float lumaSE = Luma(textureLodOffset(src, uv, 0.0, ivec2(1, 1)).rgb);
     float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;
     float lumaNESE = lumaNE + lumaSE, lumaNWNE = lumaNW + lumaNE, lumaNWSW = lumaNW + lumaSW, lumaSWSE = lumaSW + lumaSE;
+#ifdef GOW3_STRONG
+    // FXAA's sub-pixel term: how far the center stands out of its 3x3 average, eased; a thin line or a lone pixel blends.
+    float subpixC = clamp(abs(((lumaNS + lumaWE) * 2.0 + lumaNWSW + lumaNESE) * (1.0 / 12.0) - lumaM) / range, 0.0, 1.0);
+    float subpixF = (-2.0 * subpixC + 3.0) * subpixC * subpixC;
+    float subpix = subpixF * subpixF * kSubpix;
+#endif
     // Second differences across the three rows and the three columns: a horizontal edge varies down the columns.
     float edgeHorz = abs(-2.0 * lumaW + lumaNWSW) + 2.0 * abs(-2.0 * lumaM + lumaNS) + abs(-2.0 * lumaE + lumaNESE);
     float edgeVert = abs(-2.0 * lumaS + lumaSWSE) + 2.0 * abs(-2.0 * lumaM + lumaWE) + abs(-2.0 * lumaN + lumaNWNE);
@@ -114,6 +132,9 @@ void main() {
     // Only an end where the luma crosses to the other side of the edge's is a real one.
     bool goodSpan = directionN ? (lumaEndN < 0.0) != lumaMLTZero : (lumaEndP < 0.0) != lumaMLTZero;
     float offset = goodSpan ? 0.5 - min(dstN, dstP) / (dstN + dstP) : 0.0;
+#ifdef GOW3_STRONG
+    offset = max(offset, subpix);
+#endif
     if (offset <= 0.0) {
         imageStore(dst, p, vec4(center, 1.0));
         return;

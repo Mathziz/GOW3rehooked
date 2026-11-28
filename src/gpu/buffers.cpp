@@ -50,10 +50,11 @@ u32 Renderer::Impl::DeviceType(u32 bits, VkDeviceSize size, bool texture) {
 }
 
 // Frames a texture may go unused before an early eviction (0: no memory pressure): 4 after an allocation failed, 16 while
-// every watched heap (budget_heaps) is within an eighth of its budget (DeviceType's margin; looked up every 16 frames).
+// every watched heap (budget_heaps) is within an eighth of its budget (DeviceType's margin), 4 over it (looked up every 4
+// frames: a scene change brings its textures in within a second).
 u32 Renderer::Impl::PressureAge() {
     u32 age = alloc_pressure.exchange(false, std::memory_order_relaxed) ? 4 : 0;
-    if (budget_heaps && frame % 16 == 0) {
+    if (budget_heaps && frame % 4 == 0) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
         vkGetPhysicalDeviceMemoryProperties2(pd, &query);
@@ -66,7 +67,7 @@ u32 Renderer::Impl::PressureAge() {
         // On entering pressure, the empty blocks FreeImage kept as reserve go back too.
         if (!budget_pressure.exchange(pressed, std::memory_order_relaxed) && pressed) ReclaimEmptyImageBlocks();
     }
-    if (!age && budget_pressure && frame % 16 == 0) age = budget_over ? 4 : 16;
+    if (!age && budget_pressure && frame % 4 == 0) age = budget_over ? 4 : 16;
     static bool logged = false;  // the Submit thread's alone
     if (age && !logged)
         logged = true, Gow3::Log(std::format("Renderer: memory pressure ({}): textures unused for {} frames are evicted early",
@@ -433,6 +434,7 @@ bool Renderer::Impl::BindPages(u64 lo, u64 hi, std::vector<Span>* missing) {
             u32 chunk = ~0u;
             u64 offset = 0;
             if (free_count[cls] && TakeSlot(cls, chunk, offset)) {
+            } else if (reclaim_level && free_count[cls ^ 1] && TakeSlot(cls ^ 1, chunk, offset)) {  // near the budget: before a new chunk
             } else if (fill[cls] == ~0u || fill_used[cls] + page > fill_cap[cls]) {
                 u64 size = chunk_size;
                 // After a refusal the pages left in this range would need the same chunk: none is asked for again.
@@ -440,6 +442,7 @@ bool Renderer::Impl::BindPages(u64 lo, u64 hi, std::vector<Span>* missing) {
                     fill[cls] = u32(chunks.size()), fill_used[cls] = 0, fill_cap[cls] = size;
                     chunks.push_back(m), chunk_live.push_back(0), chunk_bytes.push_back(size), chunk_class.push_back(u8(cls)), mirror_chunks += size;
                     chunk_free.emplace_back();
+                    reclaim_urgent = true;  // the next frame's Reclaim looks at the budget at once
                 } else if (free_count[cls ^ 1] && TakeSlot(cls ^ 1, chunk, offset)) {
                 } else {
                     all = false;
@@ -490,7 +493,9 @@ void Renderer::Impl::Reclaim() {
     for (size_t k = 0; k < dying_chunks.size();)  // every frame that could reach an emptied chunk has retired
         if (frame - dying_chunks[k].first >= 4) vkFreeMemory(dev, dying_chunks[k].second, nullptr), dying_chunks[k] = dying_chunks.back(), dying_chunks.pop_back();
         else ++k;
-    if (frame % 16 == 0) {
+    // The budget every 4 frames, and at the frame after a new chunk: a scene change brings its area in within a second (the
+    // mirror went from 704 to 896 MB loading HDS350 and the GPU stopped at 1816 of 1658 MB), faster than every 16 frames.
+    if (frame % 4 == 0 || std::exchange(reclaim_urgent, false)) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
         vkGetPhysicalDeviceMemoryProperties2(pd, &query);
@@ -501,16 +506,26 @@ void Renderer::Impl::Reclaim() {
                                                         : budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 > budget.heapBudget[h] ? 1u : 0u);
     }
     if (!reclaim_level || chunks.empty()) return;
-    // Texture sources are only read by their upload: 4 frames after it (every frame that copied from them has retired) over
-    // the budget, 16 near it.
-    const u32 idle[2]{reclaim_level == 2 ? 120u : 900u, reclaim_level == 2 ? 4u : 16u};
+    // Over the budget, every page the last 8 frames did not read goes (the frames in flight read none of them), up to 256 MB
+    // a frame; near it, the pages unused for 4 seconds (the area a scene change left behind) and texture sources, read only
+    // by their upload, 16 frames after it. 120 and 900 frames, 16 MB a frame, kept the old area while the new one came in.
+    const u32 idle[2]{reclaim_level == 2 ? 8u : 240u, reclaim_level == 2 ? 4u : 16u};
+    const size_t cap = reclaim_level == 2 ? 4096 : 1024;
+    // Pages that keep a chunk from emptying go 4 frames after their last use (every frame that read them has retired): those
+    // of a chunk at most a quarter full (BindPages fills the fullest first, so it drains), and pages draws read in a texture
+    // chunk (a texture source shares its 64 KB with buffers: bound again, it goes to a buffer chunk). Taking only the pages
+    // idle for 120 frames, the 24-minute session kept its mirror at 608 MB, then 704, with 32 MB given back, and froze.
+    sparse.assign(chunks.size(), 0);
+    for (size_t k = 0; k < chunks.size(); ++k)
+        sparse[k] = chunks[k] && k != fill[0] && k != fill[1] && u64(chunk_live[k]) * 4 * page <= chunk_bytes[k];
     const u64 words = bound.size();
     std::vector<u64> freed;  // mirror page indices released this frame (ascending per pass)
-    for (u64 n = 0; n < words && freed.size() < 256; ++n, reclaim_cursor = (reclaim_cursor + 1) % words) {
-        for (u64 bits = bound[reclaim_cursor] & ~pinned[reclaim_cursor]; bits && freed.size() < 256; bits &= bits - 1) {
+    for (u64 n = 0; n < words && freed.size() < cap; ++n, reclaim_cursor = (reclaim_cursor + 1) % words) {
+        for (u64 bits = bound[reclaim_cursor] & ~pinned[reclaim_cursor]; bits && freed.size() < cap; bits &= bits - 1) {
             const u64 i = reclaim_cursor * 64 + std::countr_zero(bits), p = i * page;
             const u32 slot = page_slot[i], c = slot >> 16, cls = chunk_class[c];
-            if (frame - page_used[i].load(std::memory_order_relaxed) < idle[cls]) continue;
+            const bool stray = cls == 1 && !(tex_pages[i / 64].load(std::memory_order_relaxed) >> i % 64 & 1);
+            if (frame - page_used[i].load(std::memory_order_relaxed) < (sparse[c] || stray ? 4u : idle[cls])) continue;
             if (droppable && !droppable(p, p + page)) {  // offered every frame or waiting for its copy: looked at again later
                 page_used[i].store(frame, std::memory_order_relaxed);
                 continue;
@@ -539,13 +554,16 @@ void Renderer::Impl::Reclaim() {
     }
     if (frame - reclaim_logged >= 600 || !reclaim_logged) {
         reclaim_logged = frame | 1;
-        u64 texture_bytes = 0;
+        u64 texture_bytes = 0, live[2]{}, held = 0, quarter = 0;
         for (size_t k = 0; k < chunks.size(); ++k)
-            if (chunks[k] && chunk_class[k]) texture_bytes += chunk_bytes[k];
+            if (chunks[k]) {
+                if (chunk_class[k]) texture_bytes += chunk_bytes[k];
+                live[chunk_class[k]] += chunk_live[k], ++held, quarter += sparse[k];
+            }
         Gow3::Log(std::format("Renderer: video memory {} its budget: {} guest mirror pages dropped so far ({} texture sources), {} staged again, {} MB "
-                              "given back to the driver; mirror {} MB, {} MB of it texture sources",
+                              "given back to the driver; mirror {} MB, {} MB of it texture sources; {} MB and {} MB in use, {} of {} chunks a quarter full or less",
                               reclaim_level == 2 ? "over" : "near", reclaimed_pages, reclaimed_texture_pages, restaged_pages.load(std::memory_order_relaxed),
-                              returned_bytes >> 20, mirror_chunks.load() >> 20, texture_bytes >> 20));
+                              returned_bytes >> 20, mirror_chunks.load() >> 20, texture_bytes >> 20, live[0] * page >> 20, live[1] * page >> 20, quarter, held));
     }
 }
 

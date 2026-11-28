@@ -43,7 +43,7 @@ struct Surface {
     VkImage image = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     std::uint32_t w = 0, h = 0;
-    VkImageView view = VK_NULL_HANDLE;  // DepthCompanion: a sampled view of the depth aspect
+    VkImageView view = VK_NULL_HANDLE;  // DepthCompanion: a sampled view
 };
 
 // CPU view of guest memory: pointer to `size` readable bytes at `addr`, or null. It refers to the caller's callable, which
@@ -131,6 +131,7 @@ struct Image {
     bool depth = false;
     std::vector<std::uint8_t> rgba;  // 8-bit RGBA, depth as gray
     std::uint32_t level = 0;         // ReadTextures: mip
+    std::vector<std::uint8_t> raw;   // ReadTargets: an R32F target's floats as they are (the frame's linear depth, for the GoW3 AA)
 };
 
 // What the GPU thread's frame is doing (a constant string; null between frames) and how many recording threads wait for a
@@ -181,9 +182,9 @@ public:
     void SetQueries(std::uint64_t lo, std::uint64_t hi);
     // The single-sampled color target at `base`; callable from any thread.
     bool FindTarget(std::uint64_t base, Surface& out);
-    // Depth for the presenter's depth-aware anti-aliasing (SetDepthCompanion): the depth the frame that last drew the color
-    // target at `base` had bound with its last draw, copied at that frame's end (sampled view of its depth aspect, layout
-    // GENERAL). False when that frame had none of the same size (MSAA, menus, videos); callable from any thread.
+    // Depth for the presenter's depth-aware anti-aliasing (SetDepthCompanion): the linear depth (R32F, view distance) of the
+    // frame that last drew the color target at `base`, copied at that frame's end (sampled view, layout GENERAL). False when
+    // that frame had none of the same size (menus, videos); callable from any thread.
     bool DepthCompanion(std::uint64_t base, Surface& out);
     void SetDepthCompanion(bool on);
 

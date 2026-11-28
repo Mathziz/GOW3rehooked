@@ -1873,10 +1873,16 @@ void Renderer::Impl::EvictTextures(u32 age, bool defer_elements) {
 void Renderer::Impl::CompactImageBlocks() {
     // Integrated GPUs, or a discrete one at its VRAM budget: otherwise a discrete GPU's idle blocks take no system RAM.
     if (!uma_single_heap && !uma_budget && !budget_pressure) return;
-    constexpr u64 kBudget = 32ull << 20;  // texture bytes moved per call
+    // Over the budget, blocks up to half full drain, 64 MB of textures a call: at the freezes the texture blocks held 182 to 259
+    // MB free between their textures, none of them empty, so none went back to the driver.
+    const bool over = budget_over;
+    const u64 kBudget = (over ? 64ull : 32ull) << 20;  // texture bytes moved per call
     const bool pressed = Pressed();
     const auto idle = [](const ImageBlock& b) { VkDeviceSize n = 0; for (auto& [lo, s] : b.free) n += s; return n; };
-    const auto candidate = [&](const ImageBlock& b) { const VkDeviceSize used = image_block_size - idle(b); return !b.lasting && !b.draining && used > 0 && used <= image_block_size / 4; };
+    const auto candidate = [&](const ImageBlock& b) {
+        const VkDeviceSize used = image_block_size - idle(b);
+        return !b.lasting && !b.draining && used > 0 && used <= image_block_size / (over ? 2 : 4);
+    };
     {
         std::scoped_lock lock(image_lock);
         if (image_free[0] < (pressed ? 2 : 4) * image_block_size || !std::any_of(image_blocks.begin(), image_blocks.end(), candidate)) return;
@@ -3303,6 +3309,7 @@ std::vector<Image> Renderer::ReadTargets() {
         });
         if (single.img) r.FreeImage(single);
         Image img{t.base, t.w, t.h, (u32)t.fmt, t.depth, std::vector<u8>((size_t)t.w * t.h * 4)};
+        if (!t.depth && t.fmt == VK_FORMAT_R32_SFLOAT) img.raw.assign(buf.ptr, buf.ptr + (size_t)t.w * t.h * 4);
         auto half = [](uint16_t h) {
             const u32 e = h >> 10 & 0x1F, m = h & 0x3FF;
             return (h >> 15 ? -1.0f : 1.0f) * (e ? std::ldexp(1.0f + m / 1024.0f, (int)e - 15) : std::ldexp(m / 1024.0f, -14));

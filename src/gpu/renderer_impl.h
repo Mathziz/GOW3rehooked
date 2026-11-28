@@ -428,8 +428,10 @@ struct Renderer::Impl {
             if (const u64 bit = 1ull << (p & 63); !(tex_pages[p >> 6].load(std::memory_order_relaxed) & bit)) tex_pages[p >> 6].fetch_or(bit, std::memory_order_relaxed);
     }
     void RestagePage(u64 i);  // stages mirror page i again from guest memory (its readable 4 KB pages)
-    u32 reclaim_level = 0, reclaim_logged = 0;      // 0 room, 1 within an eighth of the budget, 2 over it (looked up every 16 frames)
+    u32 reclaim_level = 0, reclaim_logged = 0;      // 0 room, 1 within an eighth of the budget, 2 over it (looked up every 4 frames)
+    bool reclaim_urgent = false;                    // a chunk was allocated (bind_lock): the next Reclaim looks the budget up
     u64 reclaim_cursor = 0, reclaimed_pages = 0, reclaimed_texture_pages = 0, returned_bytes = 0;
+    std::vector<u8> sparse;  // Reclaim: chunks at most a quarter full (their pages go 4 frames after their last use)
     std::atomic<u64> restaged_pages{0};
     void Reclaim();
     std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)
@@ -602,19 +604,22 @@ struct Renderer::Impl {
         for (auto it = targets.lower_bound({base, 0u, 0u, VkFormat(0), 0u}); it != targets.end() && it->second.base == base; ++it) f(it->second);
     }
     std::unordered_map<u64, std::pair<Target*, u32>> stencil_at;
-    // Depth companions (SetDepthCompanion, the presenter's GoW3 AA): Draw notes the frame's last color draw in walk order
-    // (its color target 0 and the depth base bound with it, used or not), Submit copies that depth at the frame's end into an
-    // image kept per color target, so the presenter reads the depth of the frame it shows, not of the one drawn meanwhile.
+    // Depth companions (SetDepthCompanion, the presenter's GoW3 AA): Draw notes the frame's last color draw in walk order (its
+    // color target 0: the display buffer), Submit copies the frame's linear depth at its end into an image kept per display
+    // buffer, so the presenter reads the depth of the frame it shows, not of the one drawn meanwhile. GOW3 writes its view
+    // depth into an R32F target of the frame's size (for its shadows and depth of field) and keeps it to the end; its depth
+    // buffer it clears before the subtitles and the HUD, so a copy of that at the frame's end has no edge left.
     bool depth_companion = false;
     std::atomic<u64> last_draw_key{0};  // walk position + 1 of the last draw noted (0: none this frame)
     std::mutex last_draw_lock;
-    struct LastDraw { u64 key = 0, color = 0, depth = 0; u32 w = 0, h = 0; };
+    struct LastDraw { u64 key = 0, color = 0; u32 w = 0, h = 0; };
     LastDraw last_draw;
     struct Companion { Tex t; u32 frame = ~0u; u32 w = 0, h = 0; VkFormat fmt = VK_FORMAT_UNDEFINED; bool ready = false; };
     std::mutex companion_lock;
     std::map<u64, std::vector<Companion>> companions;  // by color target base; earlier sizes kept (the presenter may hold their views)
-    void NoteLastDraw(const Target& color0, u64 depth_base);
+    void NoteLastDraw(const Target& color0);
     void CopyDepthCompanion(VkCommandBuffer c);
+    Tex HostImage(VkFormat fmt, u32 w, u32 h, VkImageUsageFlags usage, VkImageAspectFlags aspect);  // out of VRAM (vram_spill)
     // width | height << 16 from the NOP hint after the CB / DB setup (0: none)
     static inline thread_local u32 cb_extent[8]{}, db_extent = 0;
     VkSampleCountFlags msaa_samples = VK_SAMPLE_COUNT_1_BIT;  // sample counts supported across color, depth, stencil and sampled views

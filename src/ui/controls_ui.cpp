@@ -131,7 +131,7 @@ constexpr Help help[]{
     {"Display", "NVIDIA Reflex", "Lowers input lag when the GPU is the limit, at a small cost in FPS and frame pacing. Requires a compatible NVIDIA GPU and driver."},
     {"Graphics", "MSAA", "Smooths jagged edges. 2x is the original. 4x is smoother and needs more GPU power and video memory."},
     {"Graphics", "Texture Filtering", "Trilinear is the original. 4x to 16x anisotropic keeps textures sharp at steep angles, at a small GPU cost."},
-    {"Graphics", "Post Effects", "FXAA is the lightest and softens textures a little. CMAA2 keeps textures sharper. GoW3 AA, made for this game, smooths only the edges of its geometry, found in its depth: textures, subtitles and HUD stay sharp (with MSAA off)."},
+    {"Graphics", "Post Effects", "FXAA is the lightest and softens textures a little. CMAA2 keeps textures sharper. GoW3 AA, made for this game, smooths only the edges of its geometry, found in its depth: textures, subtitles and HUD stay sharp. GoW3 AA x2 smooths those edges more, thin ones too."},
     {"Graphics", "Scaler", "How the image is resized to your display. Bilinear is the fastest. FSR 1 (enlarging) and Lanczos 2 (shrinking) keep more detail."},
     {"Graphics", "Shadows", "High is the original. Medium and Low draw the shadow maps at 1536 and 1024 instead of 2048: faster, with softer edges. Off removes the sun's shadows, the largest GPU saving."},
     {"Other", "Skip Opening Logos", "Starts the game at the title menu."},

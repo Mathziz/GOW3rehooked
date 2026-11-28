@@ -9,7 +9,7 @@
 namespace Gow3 {
 enum class DisplayMode { Windowed, Borderless, Fullscreen };
 enum class VSync { Fifo, Mailbox, Off }; // swapchain present mode
-enum class AntiAliasing { None, Fxaa, Cmaa2, Gow3 };
+enum class AntiAliasing { None, Fxaa, Cmaa2, Gow3, Gow3x2 };
 // High: the game's 2048 shadow maps; Medium and Low: 1536 and 1024 (memory_patcher.cpp); Off: none drawn (the renderer).
 enum class ShadowQuality { Off, Low, Medium, High };
 enum class ScalingFilter { Bilinear, Fsr1 };

@@ -142,6 +142,11 @@ add_custom_command(OUTPUT ${gow3aa_spv}
     COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.3 -O -mfmt=num -DGOW3_DEPTH ${SRC}/present/fxaa/fxaa.comp -o ${gow3aa_spv}
     DEPENDS ${SRC}/present/fxaa/fxaa.comp VERBATIM)
 target_sources(gow3 PRIVATE ${gow3aa_spv})
+set(gow3aa2_spv ${CMAKE_CURRENT_BINARY_DIR}/gow3aa2_spv.inc)
+add_custom_command(OUTPUT ${gow3aa2_spv}
+    COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.3 -O -mfmt=num -DGOW3_DEPTH -DGOW3_STRONG ${SRC}/present/fxaa/fxaa.comp -o ${gow3aa2_spv}
+    DEPENDS ${SRC}/present/fxaa/fxaa.comp VERBATIM)
+target_sources(gow3 PRIVATE ${gow3aa2_spv})
 foreach(pass cmaa2_0 cmaa2_1 cmaa2_2 cmaa2_3)
     set(cmaa_spv ${CMAKE_CURRENT_BINARY_DIR}/${pass}_spv.inc)
     add_custom_command(OUTPUT ${cmaa_spv}

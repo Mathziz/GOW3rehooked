@@ -116,6 +116,9 @@ constexpr u32 fxaa_spv[]{
 constexpr u32 gow3aa_spv[]{
 #include "gow3aa_spv.inc"
 };
+constexpr u32 gow3aa2_spv[]{
+#include "gow3aa2_spv.inc"
+};
 
 u32 DeviceMemoryType(u32 bits) {
     VkPhysicalDeviceMemoryProperties props{};
@@ -519,7 +522,7 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
     if (shown && frame.linear) source = ApplyCmaa(frame, input);
     else if (shown && fxaa_pipeline) source = ApplyFxaa(frame, input);
     else if (shown && gow3_pipeline) {
-        Gpu::Surface z{};  // no depth of that frame (MSAA, menus, videos): shown as it is
+        Gpu::Surface z{};  // no depth of that frame (menus, videos): shown as it is
         if (GpuThread::DisplayDepth(address, z) && z.view && z.w == input.width && z.h == input.height) source = ApplyFxaa(frame, input, z.view);
     }
     if (shown && scaling == ScalingFilter::Fsr1 && area.extent.width >= input.width && area.extent.height >= input.height &&
@@ -691,7 +694,7 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
         Check(vkCreatePipelineLayout(device, &layout, nullptr, &fxaa_layout), "Create FXAA pipeline layout");
         fxaa_pipeline = CreateCompute(fxaa_spv, fxaa_layout);
     }
-    if (config.anti_aliasing == AntiAliasing::Gow3) {
+    if (config.anti_aliasing == AntiAliasing::Gow3 || config.anti_aliasing == AntiAliasing::Gow3x2) {
         const VkDescriptorSetLayoutBinding bindings[3]{
             {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
             {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT},
@@ -705,7 +708,7 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
             .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
         Check(vkCreateSampler(device, &point, nullptr, &nearest), "Create GoW3 AA depth sampler");
-        gow3_pipeline = CreateCompute(gow3aa_spv, gow3_layout);
+        gow3_pipeline = config.anti_aliasing == AntiAliasing::Gow3x2 ? CreateCompute(gow3aa2_spv, gow3_layout) : CreateCompute(gow3aa_spv, gow3_layout);
     }
     if (config.anti_aliasing == AntiAliasing::Cmaa2) {
         std::array<VkDescriptorSetLayoutBinding, 9> bindings{};

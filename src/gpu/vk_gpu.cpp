@@ -1145,23 +1145,23 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     for (u32 k = 0; k < color_count; ++k)  // the blend memo holds this draw's masks up to color_count only
         if (bs.mask[k] && (ctx[0x318 + k * 15 + 5] & 0x1F) == 8) WriteBackTarget(*color[k], ((ctx[0x319 + k * 15] & 0x7FF) + 1) * 8, area);
     WriteBack();
-    if (depth_companion && color[0] && color[0]->samples == 1) NoteLastDraw(*color[0], ctx[0x010] & 3 ? (u64)ctx[0x014] << 8 : 0);
+    if (depth_companion && color[0] && color[0]->samples == 1) NoteLastDraw(*color[0]);
     Count(stats.draws);
 }
 
 // The latest draw in walk order (the recording threads take blocks out of order): the display buffer's final pass.
-void Renderer::Impl::NoteLastDraw(const Target& color0, u64 depth_base) {
+void Renderer::Impl::NoteLastDraw(const Target& color0) {
     const u64 key = ((u64)walk_seg << 32 | (u64)walk_pos) + 1;
     if (key <= last_draw_key.load(std::memory_order_relaxed)) return;
     std::scoped_lock lock(last_draw_lock);
     if (key <= last_draw.key) return;
-    last_draw = {key, color0.base, depth_base, color0.w, color0.h};
+    last_draw = {key, color0.base, color0.w, color0.h};
     last_draw_key.store(key, std::memory_order_relaxed);
 }
 
-// Frame end (primary command buffer, after its closing barrier): the depth target at the last draw's depth base, single-sampled
-// and of its color target's size, drawn this frame, is copied into that color target's companion. Without one, the companion
-// is marked stale, so the presenter leaves that frame alone.
+// Frame end (primary command buffer, after its closing barrier): the frame's linear depth (the single-sampled R32F target of
+// the display buffer's size drawn this frame) is copied into that display buffer's companion. Without one, the companion is
+// marked stale, so the presenter leaves that frame alone.
 void Renderer::Impl::CopyDepthCompanion(VkCommandBuffer c) {
     LastDraw d;
     {
@@ -1171,11 +1171,12 @@ void Renderer::Impl::CopyDepthCompanion(VkCommandBuffer c) {
     }
     if (!d.key) return;
     const Target* z = nullptr;
-    if (d.depth) {
+    {
         std::scoped_lock lock(targets_lock);
-        TargetsAt(d.depth, [&](const Target& t) {
-            if (t.depth && t.samples == 1 && t.w == d.w && t.h == d.h && std::atomic_ref(t.rendered).load(std::memory_order_relaxed) == frame) z = &t;
-        });
+        for (const auto& [key, t] : targets)
+            if (!t.depth && t.samples == 1 && t.fmt == VK_FORMAT_R32_SFLOAT && t.w == d.w && t.h == d.h &&
+                std::atomic_ref(t.rendered).load(std::memory_order_relaxed) == frame)
+                z = &t;
     }
     std::scoped_lock lock(companion_lock);
     auto& list = companions[d.color];
@@ -1186,27 +1187,56 @@ void Renderer::Impl::CopyDepthCompanion(VkCommandBuffer c) {
     }
     if (!z) return;
     if (!comp) {
-        Companion made{MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, z->fmt, z->w, z->h, 1, 1, VK_SAMPLE_COUNT_1_BIT,
-                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 0, true),
-                       ~0u, z->w, z->h, z->fmt, false};
+        constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        Tex img = vram_spill ? HostImage(z->fmt, z->w, z->h, usage, VK_IMAGE_ASPECT_COLOR_BIT) : Tex{};
+        const bool host = img.img != VK_NULL_HANDLE;
+        if (!host) img = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, z->fmt, z->w, z->h, 1, 1, VK_SAMPLE_COUNT_1_BIT, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, true);
+        Companion made{img, ~0u, z->w, z->h, z->fmt, false};
         if (!made.t.img) return Note("depth companion image failed");
         const VkImageMemoryBarrier init{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                                         VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, made.t.img,
-                                        {VK_IMAGE_ASPECT_DEPTH_BIT | (z->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u), 0, 1, 0, 1}};
+                                        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &init);
         list.push_back(std::move(made));
         comp = &list.back();
-        Gow3::Log(std::format("Renderer: depth companion for the display buffer at {:#x}: {}x{} depth of {:#x} (format {})", d.color, z->w, z->h,
-                              z->base, (int)z->fmt));
+        Gow3::Log(std::format("Renderer: depth companion for the display buffer at {:#x}: {}x{} linear depth of {:#x}, in {}", d.color, z->w, z->h,
+                              z->base, host ? "system memory" : "video memory"));
     }
-    // The presenter's earlier reads of this image (same queue) before the copy overwrites it; the frame's depth writes are
-    // ordered by the closing barrier already.
+    // The presenter's earlier reads of this image (same queue) before the copy overwrites it; the frame's writes are ordered
+    // by the closing barrier already.
     const VkMemoryBarrier reads{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &reads, 0,
                          nullptr, 0, nullptr);
-    const VkImageCopy region{{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {}, {z->w, z->h, 1}};
+    const VkImageCopy region{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {z->w, z->h, 1}};
     vkCmdCopyImage(c, z->t.img, VK_IMAGE_LAYOUT_GENERAL, comp->t.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     comp->frame = frame, comp->ready = true;
+}
+
+// An image in a memory type of another heap than VRAM's that is not host-visible (NVIDIA's system memory types for images),
+// for what a frame reads once: a depth companion, 18 MB at 1440p, three of them, is VRAM a 2 GB card needs for the game.
+// Empty when the image takes no such type.
+Renderer::Impl::Tex Renderer::Impl::HostImage(VkFormat fmt, u32 w, u32 h, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+    Tex t{.usage = usage};
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = fmt, ci.extent = {w, h, 1}, ci.mipLevels = 1, ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL, ci.usage = usage, ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(dev, &ci, nullptr, &t.img) != VK_SUCCESS) return {};
+    VkMemoryRequirements r;
+    vkGetImageMemoryRequirements(dev, t.img, &r);
+    const u32 local = Type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    constexpr VkMemoryPropertyFlags kNot = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT |
+                                           VK_MEMORY_PROPERTY_PROTECTED_BIT;
+    u32 type = ~0u;
+    for (u32 i = 0; i < mem.memoryTypeCount && type == ~0u; ++i)
+        if (r.memoryTypeBits >> i & 1 && !(mem.memoryTypes[i].propertyFlags & kNot) &&
+            (local == ~0u || mem.memoryTypes[i].heapIndex != mem.memoryTypes[local].heapIndex))
+            type = i;
+    const VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, r.size, type};
+    if (type == ~0u || vkAllocateMemory(dev, &ai, nullptr, &t.mem) != VK_SUCCESS) return vkDestroyImage(dev, t.img, nullptr), Tex{};
+    t.alloc_size = r.size;
+    t.view = vkBindImageMemory(dev, t.img, t.mem, 0) == VK_SUCCESS ? View(t.img, VK_IMAGE_VIEW_TYPE_2D, fmt, {aspect, 0, 1, 0, 1}, {}, usage) : VK_NULL_HANDLE;
+    if (!t.view) return vkDestroyImage(dev, t.img, nullptr), vkFreeMemory(dev, t.mem, nullptr), Tex{};
+    return t;
 }
 
 bool Renderer::DepthCompanion(std::uint64_t base, Surface& out) {
@@ -1544,7 +1574,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
                     if (r.EvictTextures(age), r.free_elements[r.evict_binding].size() >= cap / 8) break;
             if (pressed) r.EvictTextures(pressed);
         }), r.evict_soon = false;
-    if (r.frame % (r.Pressed() ? 32 : 128) == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
+    if (r.frame % (r.budget_over ? 8 : r.Pressed() ? 32 : 128) == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
     if (r.regrow) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
     if (r.stats.trace) r.BeginTraceProbes();
     // Guest ranges the CPU wrote since the last frame, and the last frame's GPU writes: textures over them are uploaded again.

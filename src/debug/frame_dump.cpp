@@ -107,8 +107,11 @@ void End(Gpu::Renderer& r, Gpu::Stats& stats) {
         if (!f9_left) DumpToast::End();  // the F9 dump's last traced frame
         std::thread([dir, targets = r.ReadTargets(), textures = DebugDeep("GOW3_DUMP_TEX") ? r.ReadTextures(true) : std::vector<Gpu::Image>{}] {
             std::scoped_lock lock(encoding);
-            for (const auto& t : targets)
+            for (const auto& t : targets) {
                 if (!t.rgba.empty()) AddPng(std::format("{}/{}-{:x}-{}x{}-f{}.png", dir, t.depth ? "z" : "rt", t.base, t.w, t.h, t.format), t);
+                // The PNG clamps the view distance to 1; the floats as they are, for tuning the GoW3 AA (little-endian, rows top first).
+                if (!t.raw.empty()) DumpArchive::Add(std::format("{}/rt-{:x}-{}x{}-f{}.r32", dir, t.base, t.w, t.h, t.format), t.raw.data(), t.raw.size());
+            }
             std::string list;
             stbi_write_png_compression_level = 2;
             for (const auto& t : textures) {
