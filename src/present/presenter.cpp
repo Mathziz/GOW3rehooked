@@ -712,10 +712,12 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
         // already: 0.35 of it over 2x, none over 4x), the run followed along a silhouette, and the share of FXAA's search
         // mixed in on silhouettes (x4: 15%, a little smoother on thin geometry). 16 pixels each way: on 21 F9 scenes'
         // silhouettes, 32 changed nothing (67.8% of no AA's edge error against 67.7%) and cost search steps.
-        struct { float silhouette; int run; float mix; } values{config.msaa >= 4 ? 0.0f : config.msaa >= 2 ? 0.35f : 1.0f, 16, 0.0f};
-        if (config.anti_aliasing == AntiAliasing::Gow3x4) values.mix = 0.15f;
-        const VkSpecializationMapEntry entries[3]{{0, 0, sizeof(float)}, {1, sizeof(float), sizeof(int)}, {2, sizeof(float) + sizeof(int), sizeof(float)}};
-        const VkSpecializationInfo constants{3, entries, sizeof(values), &values};
+        // x4 mixes half of it in on thin geometry (a jump on opposite sides of the pixel).
+        struct { float silhouette; int run; float mix, thin; } values{config.msaa >= 4 ? 0.0f : config.msaa >= 2 ? 0.35f : 1.0f, 16, 0.0f, 0.0f};
+        if (config.anti_aliasing == AntiAliasing::Gow3x4) values.mix = 0.15f, values.thin = 0.5f;
+        const VkSpecializationMapEntry entries[4]{{0, offsetof(decltype(values), silhouette), sizeof(float)}, {1, offsetof(decltype(values), run), sizeof(int)},
+                                                  {2, offsetof(decltype(values), mix), sizeof(float)}, {3, offsetof(decltype(values), thin), sizeof(float)}};
+        const VkSpecializationInfo constants{4, entries, sizeof(values), &values};
         gow3_pipeline = CreateCompute(config.anti_aliasing == AntiAliasing::Gow3 ? std::span<const u32>(gow3aa_spv) : std::span<const u32>(gow3aa2_spv),
                                       gow3_layout, &constants);
     }
