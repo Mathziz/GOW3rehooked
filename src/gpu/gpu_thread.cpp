@@ -84,6 +84,7 @@ void Watch(const std::stop_token& token) {
     }
 }
 unsigned configured_anisotropy{};
+bool configured_shadows = true;
 bool render_off = std::getenv("GOW3_NULL_GPU") != nullptr;
 size_t notes_logged = 0;
 
@@ -249,12 +250,14 @@ Gpu::Renderer* Renderer() {
     }
     if (DebugEnabled()) Log(Gpu::PieceHash::UsesAes() ? "Renderer piece hash: AES-NI" : "Renderer piece hash: XXH3");
     r->SetAnisotropy(configured_anisotropy);
+    r->SetShadows(configured_shadows);
 #ifdef _WIN32
     GuestMemory::Install();
 #endif
     r->SetTracker([p = r.get()](u64 lo, u64 hi) { return GuestMemory::Track(*p, lo, hi); });
     r->SetRestage(GuestMemory::Restage);
-    r->SetRelease(GuestMemory::Release);
+    r->SetDroppable(GuestMemory::Droppable);
+    r->SetReadable(GuestMemory::Readable);
     r->SetReadback(GuestMemory::Store);
     live.store(r.get(), std::memory_order_release);
     return r.release();
@@ -424,7 +427,7 @@ void Run(const std::stop_token& token) {
 } // namespace
 
 // ---- Lifecycle and submission ----
-void Configure(unsigned anisotropy) { configured_anisotropy = anisotropy; }
+void Configure(unsigned anisotropy, bool shadows) { configured_anisotropy = anisotropy, configured_shadows = shadows; }
 
 void Start() {
     CpuProbe::Start();

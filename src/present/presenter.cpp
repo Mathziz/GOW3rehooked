@@ -31,7 +31,7 @@ using Vulkan::Check;
 struct Scaled { VkImage image{}; VkDeviceMemory memory{}; VkImageView view{}; VkExtent2D size{}; VkFormat format{}; bool in_general{}; };
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceSize size{}; };
 struct CmaaState { Scaled edges, heads, output; std::array<Buffer, 5> buffers; };
-struct Frame { VkCommandBuffer cmd; VkFence fence; VkSemaphore acquired; VkImageView game{}, linear{}; VkImage game_image{}; VkFormat game_format{}; std::vector<Scaled> scaled; CmaaState cmaa; bool probed{}; };
+struct Frame { VkCommandBuffer cmd; VkFence fence; VkSemaphore acquired; VkImageView game{}, linear{}; VkImage game_image{}; VkFormat game_format{}; std::vector<Scaled> scaled; CmaaState cmaa; Scaled fxaa; bool probed{}; };
 SDL_Window* window;
 VkDevice device;
 VkQueue queue;
@@ -85,6 +85,9 @@ VkPipeline easu_pipeline;
 VkDescriptorSetLayout cmaa_set;
 VkPipelineLayout cmaa_layout;
 std::array<VkPipeline, 4> cmaa_pipelines;
+VkDescriptorSetLayout fxaa_set;
+VkPipelineLayout fxaa_layout;
+VkPipeline fxaa_pipeline;
 ScalingFilter scaling;
 AntiAliasing anti_aliasing;
 PFN_vkCmdPushDescriptorSetKHR push_descriptor;
@@ -102,6 +105,9 @@ constexpr u32 cmaa2_spv[]{
 };
 constexpr u32 cmaa3_spv[]{
 #include "cmaa2_3_spv.inc"
+};
+constexpr u32 fxaa_spv[]{
+#include "fxaa_spv.inc"
 };
 
 u32 DeviceMemoryType(u32 bits) {
@@ -236,6 +242,31 @@ VkImageView ApplyCmaa(Frame& frame, VkExtent2D size) {
     dispatch(1, 1, 2, args);
     dispatch(3, 0, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
     return c.output.view;
+}
+
+// FXAA in one pass, on the display buffer's encoded values (its UNORM view: luma as the eye sees it), into an image the
+// scaling pass samples.
+VkImageView ApplyFxaa(Frame& frame, VkExtent2D size) {
+    auto& out = frame.fxaa;
+    ResizeScaled(out, size);
+    if (!out.in_general) {
+        out.in_general = true;
+        const VkImageMemoryBarrier2 transition{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .image = out.image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        const VkDependencyInfo before{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &transition};
+        vkCmdPipelineBarrier2(frame.cmd, &before);
+    }
+    const VkDescriptorImageInfo desc[2]{{sampler, frame.game, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL}};
+    const VkWriteDescriptorSet writes[2]{
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &desc[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &desc[1]}};
+    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fxaa_pipeline);
+    push_descriptor(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fxaa_layout, 0, 2, writes);
+    vkCmdDispatch(frame.cmd, (size.width + 7) / 8, (size.height + 7) / 8, 1);
+    ComputeBarrier(frame.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+    return out.view;
 }
 
 VkImageView Upscale(Frame& frame, VkImageView source, VkExtent2D input, VkExtent2D output) {
@@ -476,6 +507,7 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
     vkCmdPipelineBarrier2(frame.cmd, &before);
     VkImageView source = frame.game;
     if (shown && frame.linear) source = ApplyCmaa(frame, input);
+    else if (shown && fxaa_pipeline) source = ApplyFxaa(frame, input);
     if (shown && scaling == ScalingFilter::Fsr1 && area.extent.width >= input.width && area.extent.height >= input.height &&
         (area.extent.width > input.width || area.extent.height > input.height)) {
         source = Upscale(frame, source, input, area.extent);
@@ -633,6 +665,17 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
             .setLayoutCount = 1, .pSetLayouts = &easu_set, .pushConstantRangeCount = 1, .pPushConstantRanges = &constants};
         Check(vkCreatePipelineLayout(device, &layout, nullptr, &easu_layout), "Create FSR pipeline layout");
         easu_pipeline = CreateCompute(easu_spv, easu_layout);
+    }
+    if (config.anti_aliasing == AntiAliasing::Fxaa) {
+        const VkDescriptorSetLayoutBinding bindings[2]{
+            {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT}};
+        const VkDescriptorSetLayoutCreateInfo set{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = 2, .pBindings = bindings};
+        Check(vkCreateDescriptorSetLayout(device, &set, nullptr, &fxaa_set), "Create FXAA descriptor layout");
+        const VkPipelineLayoutCreateInfo layout{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &fxaa_set};
+        Check(vkCreatePipelineLayout(device, &layout, nullptr, &fxaa_layout), "Create FXAA pipeline layout");
+        fxaa_pipeline = CreateCompute(fxaa_spv, fxaa_layout);
     }
     if (config.anti_aliasing == AntiAliasing::Cmaa2) {
         std::array<VkDescriptorSetLayoutBinding, 9> bindings{};

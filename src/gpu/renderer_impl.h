@@ -134,6 +134,19 @@ struct Renderer::Impl {
     DynamicCaps caps{};
     bool skip_motion_blur = false;
     bool skip_dof_spartan = false;
+    // Shadows off (SetShadows): the projection draws (ShadowProjection) are skipped, and so are the depth-only draws into the
+    // atlas they sample (its last two bases, learned from them): the atlas keeps its clear, which every receiver reads as lit.
+    bool shadows_off = false;
+    std::atomic<u64> shadow_atlas[2]{};
+    std::atomic<u32> shadow_skips{0};
+    bool ShadowAtlas(u64 base) const {
+        return base && (shadow_atlas[0].load(std::memory_order_relaxed) == base || shadow_atlas[1].load(std::memory_order_relaxed) == base);
+    }
+    void LearnShadowAtlas(u64 base) {
+        if (!base || ShadowAtlas(base)) return;
+        shadow_atlas[1].store(shadow_atlas[0].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        shadow_atlas[0].store(base, std::memory_order_relaxed);
+    }
     bool mb_seen_blur = false;
     std::vector<Pos> skipped_draws;
     std::unordered_map<u64, u64> orb_hash_cache;
@@ -161,6 +174,7 @@ struct Renderer::Impl {
     std::atomic<bool> alloc_failed{false};
     std::atomic<bool> alloc_pressure{false};   // an allocation failed since the last Submit start (PressureAge)
     std::atomic<bool> budget_pressure{false};  // PressureAge saw every watched heap within an eighth of its budget
+    bool budget_over = false;                  // and one past it (the driver pages): textures go after 4 unused frames, not 16
     u32 PressureAge();  // frames a texture may go unused under memory pressure, 0 without any
     // Under memory pressure the reserves (empty image blocks, prologue scratch) shrink to what is used.
     bool Pressed() const { return alloc_pressure.load(std::memory_order_relaxed) || budget_pressure.load(std::memory_order_relaxed); }
@@ -242,6 +256,11 @@ struct Renderer::Impl {
     void LoadDeviceFunctions();
     void TempDeviceReport(std::span<const VkQueueFamilyProperties> fp);
     void TempLost(const char* where, VkResult r);
+    // A queue operation that failed (logged once per place, with the video memory): its semaphores and fence are not signaled,
+    // so whatever would wait for them is told not to (Submit), instead of the GPU or this thread waiting for good.
+    void QueueError(const char* where, VkResult r);
+    void RelieveMemory();  // the GPU has not finished a frame for seconds: what nothing in flight uses goes back to the driver
+    std::string BudgetText() const;  // device-local heaps: in use of the budget (VK_EXT_memory_budget)
     bool Init(bool validation, std::string& error);  // tools/framecap/offline_device.cpp
     bool Setup(std::string& error);                  // vk_gpu.cpp: everything after the device
 
@@ -295,28 +314,51 @@ struct Renderer::Impl {
                 for (u64 k = s.word * 64 + ((std::max(lo, s.lo) - s.lo) >> 9), end = s.word * 64 + ((std::min(hi, s.hi) - s.lo + 511) >> 9), n; k < end; k += n)
                     n = std::min(64 - (k & 63), end - k), map[k >> 6] |= (n == 64 ? ~0ull : ((1ull << n) - 1)) << (k & 63);
     }
-    bool Track(u64 lo, u64 hi) {
+    // `texture`: a texture's range (Check). Its image holds the texels and the mirror needs its bytes only to upload them, so
+    // its pages are marked as texture sources (their own chunks, see tex_pages) and not kept: TextureNeedsMirror keeps and
+    // stages them for an upload.
+    bool Track(u64 lo, u64 hi, bool texture = false) {
         if (!track || hi <= lo) return false;
         if (boom_on) NoteGpuRead(lo, hi);  // TEMP coverage of the offer
         // GuestMemory tracks whole pages, the deferred spans' bitmaps 512-byte blocks. A range this thread already tracked
         // this frame (in pages, in blocks over the spans) is skipped: its last four without a lookup (consecutive draws read
-        // the same pages: the data ring), the others by hash (entries tagged with the frame).
+        // the same pages: the data ring), the others by hash (entries tagged with the frame). A texture's range and the same
+        // range read by a draw are different entries (bit 0, below the alignment).
         const bool marked = lo < marked_hi && marked_lo < hi;
         const u64 g = marked ? 0x1FF : 0xFFF;
         lo &= ~g, hi = (hi + g) & ~g;
+        const u64 key = lo | u64(texture);
         thread_local u64 seen[4096], last[4][2], last_frame = ~0ull;
         thread_local u32 last_at = 0;
         if (last_frame != frame) std::memset(last, 0, sizeof(last)), last_frame = frame;
         for (const auto& e : last)
-            if (e[0] == lo && e[1] == hi) return false;
-        last[last_at][0] = lo, last[last_at][1] = hi, last_at = (last_at + 1) & 3;
-        if (page_used)  // the mirror pages this draw reads stay (Reclaim)
-            for (u64 p = lo / page, e = std::min((hi + page - 1) / page, mirror_size / page); p < e; ++p) page_used[p].store(frame, std::memory_order_relaxed);
-        const u64 h = ::Gpu::PieceHash::TrackingKey(&lo, 8, hi), tag = h ^ frame * 0x9E3779B97F4A7C15ull;
+            if (e[0] == key && e[1] == hi) return false;
+        last[last_at][0] = key, last[last_at][1] = hi, last_at = (last_at + 1) & 3;
+        if (page_used) {
+            const u64 p0 = lo / page, p1 = std::min((hi + page - 1) / page, mirror_size / page);
+            if (texture) MarkTexturePages(p0, p1);
+            else
+                for (u64 p = p0; p < p1; ++p) {  // the mirror pages this draw reads stay (Reclaim); dropped ones are staged again
+                    page_used[p].store(frame, std::memory_order_relaxed);
+                    if (TakeDropped(p)) RestagePage(p);
+                    // Read by draws too: bound again, it goes with the pages draws keep (its texture chunk would never empty).
+                    if (const u64 bit = 1ull << (p & 63); tex_pages[p >> 6].load(std::memory_order_relaxed) & bit)
+                        tex_pages[p >> 6].fetch_and(~bit, std::memory_order_relaxed);
+                }
+        }
+        const u64 h = ::Gpu::PieceHash::TrackingKey(&key, 8, hi), tag = h ^ frame * 0x9E3779B97F4A7C15ull;
         if (u64& s = seen[h & 4095]; s == tag) return false;
         else s = tag;
         if (marked) MarkDeferred(lo, hi);
         return track(lo, hi);
+    }
+    // An upload reads [lo, hi) from the mirror this frame: its pages stay a while, and the dropped ones are staged again.
+    void TextureNeedsMirror(u64 lo, u64 hi) {
+        if (!page_used || hi <= lo) return;
+        for (u64 p = lo / page, e = std::min((hi + page - 1) / page, mirror_size / page); p < e; ++p) {
+            page_used[p].store(frame, std::memory_order_relaxed);
+            if (TakeDropped(p)) RestagePage(p);
+        }
     }
 
     // Guest memory mirror: one sparse buffer, device address of byte 0 = guest address 0.
@@ -325,10 +367,13 @@ struct Renderer::Impl {
     u64 mirror_size = 0;  // kMirrorMax, or kMirrorMin when the driver could not reserve that (set once by SetupMirror)
     u64 page = 0;
     u32 mirror_bits = 0;  // memory types its chunks may have (DeviceType picks one per chunk)
-    std::vector<VkDeviceMemory> chunks;
+    std::vector<VkDeviceMemory> chunks;  // a chunk given back stays VK_NULL_HANDLE (indices are kept)
     u64 chunk_size = kChunk;
-    u64 chunk_used = kChunk;
-    u64 chunk_cap = 0;          // bytes of chunks.back() (chunk_size, or less when a full chunk did not fit)
+    // Two classes of chunk (BindPages): class 1 holds the pages texture uploads read (tex_pages), class 0 everything else.
+    // Mixed, the pages draws read every frame kept every chunk alive, and a chunk only goes back to the driver once empty.
+    u32 fill[2]{~0u, ~0u};       // per class: the chunk being filled
+    u64 fill_used[2]{}, fill_cap[2]{};
+    std::vector<u8> chunk_class;
     bool chunk_failed = false;  // a chunk allocation failed (logged once)
     bool chunk_spilled = false;  // a chunk came from another memory type than DeviceType's (logged once)
     // Without sparseResidencyBuffer (a GeForce GTX 750 Ti) a page without memory is not allowed to be read: the backstop
@@ -359,12 +404,30 @@ struct Renderer::Impl {
     std::vector<u64> pinned;                        // bitmap: pages the GPU writes (their bytes are only in the mirror): kept
     std::vector<u32> chunk_live;                    // bound pages per chunk
     std::vector<u64> chunk_bytes;                   // size per chunk
-    std::vector<u32> free_slots;                    // slots Reclaim freed, taken before a new chunk
+    std::vector<u32> free_slots[2];                 // per class: slots Reclaim freed, taken before a new chunk
     std::vector<std::pair<u32, VkDeviceMemory>> dying_chunks;  // emptied chunks and the frame they emptied in: freed 4 frames later
     std::unordered_map<u64, size_t> unbinds;        // pages unbound this frame -> their pending_binds entry (a bind reuses it)
-    std::function<bool(u64, u64)> release;          // live: GuestMemory::Release (SetRelease)
+    // Reclaim drops a page's memory, not its tracking: GuestMemory keeps watching its guest pages (no protection change), and
+    // the page is marked in `dropped`. Its bytes are then only in guest memory, so whatever reaches it first stages the whole
+    // page again from there: a draw's read (Track), an upload (TextureNeedsMirror) or a bind (BindPages: a CPU write staged
+    // over part of it, a GPU write).
+    std::unique_ptr<std::atomic<u64>[]> dropped;    // bitmap over mirror pages
+    std::unique_ptr<std::atomic<u64>[]> tex_pages;  // bitmap over mirror pages: read by texture uploads (class 1 when bound)
+    std::function<bool(u64, u64)> droppable;        // live: GuestMemory::Droppable (SetDroppable): nothing in it is offered every frame or queued
+    std::function<bool(u64, u64)> readable;         // live: GuestMemory::Readable (SetReadable)
+    bool TakeDropped(u64 i) {  // true for the one caller that takes the mark: it stages the page again
+        if (!dropped) return false;
+        const u64 bit = 1ull << (i & 63);
+        return (dropped[i >> 6].load(std::memory_order_relaxed) & bit) && (dropped[i >> 6].fetch_and(~bit, std::memory_order_acq_rel) & bit);
+    }
+    void MarkTexturePages(u64 p0, u64 p1) {
+        for (u64 p = p0; p < p1; ++p)
+            if (const u64 bit = 1ull << (p & 63); !(tex_pages[p >> 6].load(std::memory_order_relaxed) & bit)) tex_pages[p >> 6].fetch_or(bit, std::memory_order_relaxed);
+    }
+    void RestagePage(u64 i);  // stages mirror page i again from guest memory (its readable 4 KB pages)
     u32 reclaim_level = 0, reclaim_logged = 0;      // 0 room, 1 within an eighth of the budget, 2 over it (looked up every 16 frames)
-    u64 reclaim_cursor = 0, reclaimed_pages = 0, returned_bytes = 0;
+    u64 reclaim_cursor = 0, reclaimed_pages = 0, reclaimed_texture_pages = 0, returned_bytes = 0;
+    std::atomic<u64> restaged_pages{0};
     void Reclaim();
     std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)
     // 4 KB piece -> content hash | 1 (0: never written), to skip unchanged uploads. Guest addresses below 32 GB; the
@@ -400,7 +463,9 @@ struct Renderer::Impl {
     size_t sent = 0;  // pending entries already copied to their chunk's VRAM twin (Send)
     u32 stage_at = 0;
     u64 stage_used = 0;
-    const u8* Stage(u64 addr, const u8* src, u64 n, u64* hash = nullptr);  // the staged copy
+    // The staged copy. `invalidate` false: the block hashes of [addr, addr + n) are known stale already (a dropped page's, from
+    // a recording thread: InvalidateBlocks looks up a table another thread's Write may be growing).
+    const u8* Stage(u64 addr, const u8* src, u64 n, u64* hash = nullptr, bool invalidate = true);
     Pending AllocateStage(u64 n);  // stage_lock held; reserves bytes without scheduling an upload
     void QueueStage(Pending p);    // stage_lock held; schedules only changed bytes
     void RecordSend(VkCommandBuffer c);  // copies the bytes staged since the last send to their chunks' VRAM twins

@@ -49,16 +49,20 @@ u32 Renderer::Impl::PressureAge() {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
         vkGetPhysicalDeviceMemoryProperties2(pd, &query);
-        bool pressed = true;
-        for (u32 h = 0; h < mem.memoryHeapCount; ++h)
+        bool pressed = true, over = false;
+        for (u32 h = 0; h < mem.memoryHeapCount; ++h) {
             if (budget_heaps >> h & 1 && budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 <= budget.heapBudget[h]) pressed = false;
+            if (budget_heaps >> h & 1 && budget.heapUsage[h] > budget.heapBudget[h]) over = true;
+        }
+        budget_over = over;
         // On entering pressure, the empty blocks FreeImage kept as reserve go back too.
         if (!budget_pressure.exchange(pressed, std::memory_order_relaxed) && pressed) ReclaimEmptyImageBlocks();
     }
-    if (!age && budget_pressure && frame % 16 == 0) age = 16;
+    if (!age && budget_pressure && frame % 16 == 0) age = budget_over ? 4 : 16;
     static bool logged = false;  // the Submit thread's alone
     if (age && !logged)
-        logged = true, Gow3::Log(std::format("Renderer: memory pressure ({}): textures unused for {} frames are evicted early", age == 4 ? "an allocation failed" : "heap budget", age));
+        logged = true, Gow3::Log(std::format("Renderer: memory pressure ({}): textures unused for {} frames are evicted early",
+                                             budget_over ? "over the heap budget" : age == 4 ? "an allocation failed" : "heap budget", age));
     return age;
 }
 
@@ -219,7 +223,9 @@ bool Renderer::Impl::SetupMirror(std::string& error) {
         const u64 pages = mirror_size / page;
         page_used.reset(new std::atomic<u32>[pages]{});
         page_slot.assign(pages, 0), pinned.assign(bound.size(), 0);
-        Gow3::Log("Renderer: guest mirror pages unused for a while give their memory back when video memory nears its budget");
+        dropped.reset(new std::atomic<u64>[bound.size()]{}), tex_pages.reset(new std::atomic<u64>[bound.size()]{});
+        Gow3::Log("Renderer: guest mirror pages unused for a while give their memory back when video memory nears its budget; "
+                  "texture sources have chunks of their own and go after their upload");
     }
     return true;
 }
@@ -400,28 +406,39 @@ VkDeviceMemory Renderer::Impl::AllocateChunk(u64& size) {
 // keeps the backstop block, which every such page shares, so nothing may be written there (the callers skip those writes);
 // `missing` gets those pages, page-aligned and merged.
 bool Renderer::Impl::BindPages(u64 lo, u64 hi, std::vector<Span>* missing) {
-    std::scoped_lock bind(bind_lock);
+    std::vector<u64> restage;  // dropped pages bound here: their bytes are staged again (after the lock)
     bool all = true;
-    for (u64 p = lo / page * page, end = std::min(hi, mirror_size); p < end; p += page) {
-        const u64 i = p / page;
-        if (page_used) {
-            page_used[i].store(frame, std::memory_order_relaxed);
-            if (!missing) pinned[i / 64] |= 1ull << i % 64;  // a GPU write (only Flush passes `missing`): kept from Reclaim
-        }
-        u64& word = bound[i / 64];
-        const u64 bit = 1ull << (i % 64);
-        if (word & bit) continue;
-        u32 chunk;
-        u64 offset;
-        if (!free_slots.empty()) {  // a slot Reclaim freed
-            chunk = free_slots.back() >> 16, offset = u64(free_slots.back() & 0xFFFF) * page;
-            free_slots.pop_back();
-        } else {
-            if (chunk_used + page > chunk_cap) {
+    {
+        std::scoped_lock bind(bind_lock);
+        for (u64 p = lo / page * page, end = std::min(hi, mirror_size); p < end; p += page) {
+            const u64 i = p / page;
+            if (page_used) {
+                page_used[i].store(frame, std::memory_order_relaxed);
+                if (!missing) pinned[i / 64] |= 1ull << i % 64;  // a GPU write (only Flush passes `missing`): kept from Reclaim
+            }
+            u64& word = bound[i / 64];
+            const u64 bit = 1ull << (i % 64);
+            if (word & bit) continue;
+            // Texture sources and the rest fill chunks of their own: a freed slot of the page's class, its chunk being filled, a
+            // new one, and only when the driver refuses that, a slot the other class freed.
+            const u32 cls = tex_pages && (tex_pages[i / 64].load(std::memory_order_relaxed) & bit) ? 1 : 0;
+            u32 chunk = ~0u;
+            u64 offset = 0;
+            const auto take = [&](u32 k) {
+                chunk = free_slots[k].back() >> 16, offset = u64(free_slots[k].back() & 0xFFFF) * page;
+                free_slots[k].pop_back();
+            };
+            if (!free_slots[cls].empty()) {
+                take(cls);
+            } else if (fill[cls] == ~0u || fill_used[cls] + page > fill_cap[cls]) {
                 u64 size = chunk_size;
                 // After a refusal the pages left in this range would need the same chunk: none is asked for again.
-                VkDeviceMemory m = all ? AllocateChunk(size) : VK_NULL_HANDLE;
-                if (!m) {
+                if (VkDeviceMemory m = all ? AllocateChunk(size) : VK_NULL_HANDLE) {
+                    fill[cls] = u32(chunks.size()), fill_used[cls] = 0, fill_cap[cls] = size;
+                    chunks.push_back(m), chunk_live.push_back(0), chunk_bytes.push_back(size), chunk_class.push_back(u8(cls)), mirror_chunks += size;
+                } else if (!free_slots[cls ^ 1].empty()) {
+                    take(cls ^ 1);
+                } else {
                     all = false;
                     alloc_pressure.store(true, std::memory_order_relaxed);
                     if (!missing) break;
@@ -429,30 +446,41 @@ bool Renderer::Impl::BindPages(u64 lo, u64 hi, std::vector<Span>* missing) {
                     else missing->push_back({p, p + page});
                     continue;
                 }
-                chunks.push_back(m), chunk_live.push_back(0), chunk_bytes.push_back(size), chunk_used = 0, chunk_cap = size, mirror_chunks += size;
             }
-            chunk = u32(chunks.size() - 1), offset = chunk_used, chunk_used += page;
-        }
-        word |= bit;
-        ++chunk_live[chunk];
-        if (page_used) page_slot[i] = chunk << 16 | u32(offset / page);
-        const VkDeviceMemory m = chunks[chunk];
-        if (const auto u = unbinds.find(p); u != unbinds.end()) {  // unbound by Reclaim this frame: that bind takes the slot instead
-            pending_binds[u->second].memory = m, pending_binds[u->second].memoryOffset = offset;
-            unbinds.erase(u);
-        } else if (!pending_binds.empty() && pending_binds.back().resourceOffset + pending_binds.back().size == p &&
-                   pending_binds.back().memory == m && pending_binds.back().memoryOffset + pending_binds.back().size == offset) {
-            pending_binds.back().size += page;
-        } else {
-            pending_binds.push_back({p, page, m, offset, 0});
+            if (chunk == ~0u) chunk = fill[cls], offset = fill_used[cls], fill_used[cls] += page;
+            word |= bit;
+            ++chunk_live[chunk];
+            if (page_used) page_slot[i] = chunk << 16 | u32(offset / page);
+            if (TakeDropped(i)) restage.push_back(i);
+            const VkDeviceMemory m = chunks[chunk];
+            if (const auto u = unbinds.find(p); u != unbinds.end()) {  // unbound by Reclaim this frame: that bind takes the slot instead
+                pending_binds[u->second].memory = m, pending_binds[u->second].memoryOffset = offset;
+                unbinds.erase(u);
+            } else if (!pending_binds.empty() && pending_binds.back().resourceOffset + pending_binds.back().size == p &&
+                       pending_binds.back().memory == m && pending_binds.back().memoryOffset + pending_binds.back().size == offset) {
+                pending_binds.back().size += page;
+            } else {
+                pending_binds.push_back({p, page, m, offset, 0});
+            }
         }
     }
+    for (const u64 i : restage) RestagePage(i);
     return all;
 }
 
-// Mirror pages unused for a while give their memory back while video memory is near or over its budget (see page_used):
-// 900 frames unused within an eighth of the budget, 120 over it, at most 256 pages (16 MB) a frame (each costs a protection
-// change). GPU writes, pages offered every frame and pages waiting for their copy stay.
+// A dropped page's bytes, again from guest memory: each readable 4 KB page, with its hash (so an unchanged offer later is
+// skipped). Staged now, they reach the mirror at the start of the frame, before any draw, upload or GPU write there.
+void Renderer::Impl::RestagePage(u64 i) {
+    const u64 lo = i * page, hi = std::min(lo + page, std::min(mirror_size, kPieces << 12));
+    for (u64 a = lo; a < hi; a += 0x1000)
+        if (!readable || readable(a, 0x1000)) Stage(a, reinterpret_cast<const u8*>(a), 0x1000, &written[a >> 12], false);  // Reclaim invalidated them
+    restaged_pages.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Mirror pages unused for a while give their memory back while video memory is near or over its budget (see page_used).
+// Texture sources (class 1) go 120 frames after their last upload within an eighth of the budget, 16 over it; the rest after
+// 900 and 120. At most 256 pages (16 MB) a frame. GPU writes (their bytes are only in the mirror) and pages offered every frame
+// or waiting for their copy stay. A dropped page keeps its tracking (see `dropped`), and a chunk left empty is freed.
 void Renderer::Impl::Reclaim() {
     if (!page_used) return;
     std::scoped_lock bind(bind_lock);
@@ -470,14 +498,15 @@ void Renderer::Impl::Reclaim() {
                                                         : budget.heapUsage[h] + mem.memoryHeaps[h].size / 8 > budget.heapBudget[h] ? 1u : 0u);
     }
     if (!reclaim_level || chunks.empty()) return;
-    const u32 idle = reclaim_level == 2 ? 120 : 900;
+    const u32 idle[2]{reclaim_level == 2 ? 120u : 900u, reclaim_level == 2 ? 16u : 120u};
     const u64 words = bound.size();
     std::vector<u64> freed;  // mirror page indices released this frame (ascending per pass)
     for (u64 n = 0; n < words && freed.size() < 256; ++n, reclaim_cursor = (reclaim_cursor + 1) % words) {
         for (u64 bits = bound[reclaim_cursor] & ~pinned[reclaim_cursor]; bits && freed.size() < 256; bits &= bits - 1) {
             const u64 i = reclaim_cursor * 64 + std::countr_zero(bits), p = i * page;
-            if (frame - page_used[i].load(std::memory_order_relaxed) < idle) continue;
-            if (!release(p, p + page)) {  // offered every frame or waiting for its copy: looked at again later
+            const u32 slot = page_slot[i], c = slot >> 16, cls = chunk_class[c];
+            if (frame - page_used[i].load(std::memory_order_relaxed) < idle[cls]) continue;
+            if (droppable && !droppable(p, p + page)) {  // offered every frame or waiting for its copy: looked at again later
                 page_used[i].store(frame, std::memory_order_relaxed);
                 continue;
             }
@@ -486,12 +515,14 @@ void Renderer::Impl::Reclaim() {
             unbinds[p] = pending_binds.size();
             pending_binds.push_back({p, page, backstop, backstop ? p % backstop_size : 0, 0});  // the backstop, or none (residency)
             bound[i / 64] &= ~(1ull << i % 64);
-            const u32 slot = page_slot[i], c = slot >> 16;
-            free_slots.push_back(slot), freed.push_back(i);
-            if (--chunk_live[c] == 0 && c + 1 != chunks.size()) {  // emptied (not the chunk still being filled): back to the driver
+            dropped[i / 64].fetch_or(1ull << i % 64, std::memory_order_release);
+            freed.push_back(i), reclaimed_texture_pages += cls;
+            if (--chunk_live[c] == 0 && c != fill[0] && c != fill[1]) {  // emptied (not a chunk still being filled): back to the driver
                 dying_chunks.push_back({frame, chunks[c]}), chunks[c] = VK_NULL_HANDLE;
                 mirror_chunks -= chunk_bytes[c], returned_bytes += chunk_bytes[c];
-                std::erase_if(free_slots, [c](u32 s) { return s >> 16 == c; });
+                std::erase_if(free_slots[cls], [c](u32 s) { return s >> 16 == c; });
+            } else {
+                free_slots[cls].push_back(slot);
             }
         }
     }
@@ -503,14 +534,19 @@ void Renderer::Impl::Reclaim() {
     }
     if (frame - reclaim_logged >= 600 || !reclaim_logged) {
         reclaim_logged = frame | 1;
-        Gow3::Log(std::format("Renderer: video memory {} its budget: {} guest mirror pages unused for {} frames released so far, {} MB "
-                              "given back to the driver; mirror {} MB",
-                              reclaim_level == 2 ? "over" : "near", reclaimed_pages, idle, returned_bytes >> 20, mirror_chunks.load() >> 20));
+        u64 texture_bytes = 0;
+        for (size_t k = 0; k < chunks.size(); ++k)
+            if (chunks[k] && chunk_class[k]) texture_bytes += chunk_bytes[k];
+        Gow3::Log(std::format("Renderer: video memory {} its budget: {} guest mirror pages dropped so far ({} texture sources), {} staged again, {} MB "
+                              "given back to the driver; mirror {} MB, {} MB of it texture sources",
+                              reclaim_level == 2 ? "over" : "near", reclaimed_pages, reclaimed_texture_pages, restaged_pages.load(std::memory_order_relaxed),
+                              returned_bytes >> 20, mirror_chunks.load() >> 20, texture_bytes >> 20));
     }
 }
 
 void Renderer::ReclaimMirror() { d->Reclaim(); }
-void Renderer::SetRelease(std::function<bool(std::uint64_t lo, std::uint64_t hi)> release) { d->release = std::move(release); }
+void Renderer::SetDroppable(std::function<bool(std::uint64_t lo, std::uint64_t hi)> droppable) { d->droppable = std::move(droppable); }
+void Renderer::SetReadable(std::function<bool(std::uint64_t lo, std::uint64_t hi)> readable) { d->readable = std::move(readable); }
 
 // Staged bytes that could not reach the mirror (their pages got no memory): their hashes are forgotten, so the next offer
 // stages them again, and they wait in `lost` for RestageLost.
@@ -587,14 +623,14 @@ void Renderer::Impl::QueueStage(Pending p) {
         pending.push_back(p);
 }
 
-const u8* Renderer::Impl::Stage(u64 addr, const u8* src, u64 n, u64* hash) {
+const u8* Renderer::Impl::Stage(u64 addr, const u8* src, u64 n, u64* hash, bool invalidate) {
     std::scoped_lock lock(stage_lock);
     auto p = AllocateStage(n);
     if (p.chunk == ~0u) {
         Note("staging buffer allocation failed");
         return nullptr;
     }
-    InvalidateBlocks(addr, n);
+    if (invalidate) InvalidateBlocks(addr, n);
     u8* const copy = stage[p.chunk].ptr + p.src;
     if (hash) *hash = Gpu::PieceHash::Copy(copy, src, n);
     else std::memcpy(copy, src, n);
@@ -651,7 +687,7 @@ void Renderer::Impl::Flush(VkCommandBuffer c) {
         const bool dev = i < sent && HasTwin(chunk);  // a chunk without its VRAM twin (no memory for it) copies from the host
         copies.clear();
         for (; i < pending.size() && pending[i].chunk == chunk && (i < sent && HasTwin(chunk)) == dev; ++i) {
-            const Pending& p = pending[i];
+            const Pending p = pending[i];  // a copy: binding a dropped page stages it again, which grows `pending`
             if (boom_on) boom_up[slot].push_back(p);
             missing.clear();
             if (BindPages(p.addr, p.addr + p.size, &missing)) {
@@ -937,8 +973,10 @@ void Renderer::Impl::TrimFrameBuffers() {
     }
     if ((rb.size > kRbReserve || rb_dev.size > kRbReserve) && rb_quiet >= limit) FreeBuffer(rb), FreeBuffer(rb_dev), rb_quiet = 0;
 }
-std::string Renderer::MemoryBudget() const {
-    const Impl& r = *d;
+std::string Renderer::MemoryBudget() const { return d->BudgetText(); }
+
+std::string Renderer::Impl::BudgetText() const {
+    const Impl& r = *this;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, r.budget_heaps ? &budget : nullptr};
     vkGetPhysicalDeviceMemoryProperties2(r.pd, &query);
@@ -1367,6 +1405,14 @@ bool Release(u64 lo, u64 hi) {
         p = q;
     }
     std::erase_if(closed, [&](u64 page) { return page >= first && page < end; });
+    return true;
+}
+
+// The renderer's mirror may drop the memory behind [lo, hi) (Renderer::Impl::Reclaim) while the tracking stays: no page in
+// it is offered every frame or waits for its copy (dirty, dynamic, region).
+bool Droppable(u64 lo, u64 hi) {
+    for (u64 p = lo / kPage, end = std::min((hi + kPage - 1) / kPage, kPages); p < end; ++p)
+        if (const Kind k = KindOf(p); k == Dirty || k == Dynamic || k == Region) return false;
     return true;
 }
 

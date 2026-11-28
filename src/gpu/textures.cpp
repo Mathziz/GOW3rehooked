@@ -2388,9 +2388,9 @@ void Renderer::Impl::Check(GuestTex& g) {
     TempTimer temp_timer{temp_check_ns, temp_checks};
 #ifndef GOW3_OFFLINE
     const u64 video_serial = Gow3::GpuThread::VideoFrameVersion(g.base);
-    const bool staged = video_serial ? false : Track(g.base, g.base + g.size);
+    const bool staged = video_serial ? false : Track(g.base, g.base + g.size, true);
 #else
-    const bool staged = Track(g.base, g.base + g.size);
+    const bool staged = Track(g.base, g.base + g.size, true);
 #endif
     auto d = std::upper_bound(dirty.begin(), dirty.end(), std::pair{g.base + g.size, 0ull});
     // The last frame's GPU writes count when made in another image (its own already holds them), and the earlier ones
@@ -2416,6 +2416,7 @@ void Renderer::Impl::Check(GuestTex& g) {
     Gow3::GpuThread::TraceVideoTexture(g.base, frame, u32(upload) | (u32(staged) << 1) | (u32(cpu) << 2));
 #endif
     if (upload) {
+        TextureNeedsMirror(g.base, g.base + g.size);  // the upload reads the mirror: its pages stay, dropped ones are staged again
         uploads.push_back(&g), g.synced = frame_seq;
         // Those reach the mirror in the prologue, before the uploads; a CPU write over one replaces it.
         auto by_cpu = [&](const GpuWrite& w) {
@@ -2470,6 +2471,7 @@ void Renderer::Impl::Resync(GuestTex& g) {
             for (size_t k = 0; k < seen; ++k)
                 if (over(gpu_writes[k]) && gpu_writes[k].seq > synced) TempCopy("RS", g, TempWriter(gpu_writes[k], g));
         if (need > synced) {  // the block's own writes come after these
+            TextureNeedsMirror(g.base, g.base + g.size);
             for (size_t k = 0; k < seen; ++k)
                 if (const GpuWrite& w = gpu_writes[k]; w.lazy && over(w) && w.seq > synced) block_now->lazy.push_back({w, learn(w)});
             block_now->resync.push_back({&g, need}), synced = need;
@@ -2487,6 +2489,7 @@ void Renderer::Impl::Resync(GuestTex& g) {
                     if (!fenced) Barrier(cmd), fenced = true;
                     Materialize(cmd, x, learn(x));
                 }
+            TextureNeedsMirror(g.base, g.base + g.size);
             std::vector<GuestTex*> one{&g};
             Upload(cmd, one, nullptr, 0, table_ps);
             synced = write_seq;

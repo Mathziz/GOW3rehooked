@@ -19,7 +19,8 @@ void SetRegions(const std::vector<Range>& regions);   // per-frame regions: neve
 // Queued pages and `offer` -> renderer. Returns the pages CPU writes queued (write faults) since the last frame.
 u32 BeginFrame(Gpu::Renderer& renderer, const std::vector<Range>& offer);
 bool Track(Gpu::Renderer& renderer, u64 lo, u64 hi);  // Renderer::SetTracker
-bool Release(u64 lo, u64 hi);  // Renderer::SetRelease: [lo, hi) forgotten (tracked again at its next draw); false: in use, kept
+bool Release(u64 lo, u64 hi);  // [lo, hi) forgotten (tracked again at its next draw); false: in use, kept
+bool Droppable(u64 lo, u64 hi);  // Renderer::SetDroppable: the mirror may drop [lo, hi) (nothing in it offered every frame or queued)
 void Restage(u64 lo, u64 hi);                         // Renderer::SetRestage: [lo, hi) is offered again (the mirror lost it)
 u64 Store(u64 addr, const void* data, u64 size);      // GPU readback into guest memory, returns piece hash
 bool Readable(u64 addr, u64 size);                    // committed and readable (descriptor and program reads)

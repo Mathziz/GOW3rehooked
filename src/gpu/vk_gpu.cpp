@@ -377,6 +377,11 @@ bool Renderer::Init(const External& e, std::string& error) {
 void Renderer::SetTracker(std::function<bool(std::uint64_t, std::uint64_t)> track) { d->track = std::move(track); }
 void Renderer::SetReadback(std::function<std::uint64_t(std::uint64_t, const void*, std::uint64_t)> readback) { d->readback = std::move(readback); }
 void Renderer::SetQueries(std::uint64_t lo, std::uint64_t hi) { d->query_lo = lo, d->query_hi = hi; }
+void Renderer::SetShadows(bool on) {
+    d->shadows_off = !on;
+    if (!on) Gow3::Log("Renderer: shadows off: the sun's shadow maps are neither drawn nor applied");
+}
+
 void Renderer::SetAnisotropy(unsigned level) {
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(d->pd, &properties);
@@ -460,14 +465,16 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         stats.trace_lines.push_back(std::format("op {:x} prim {:x} n {} mode {} cb0 {:x} pitch {:x} slice {:x} view {:x} info {:x} attr {:x} col_fmt {:x} "
                                           "mask {:x} z {:x} zinfo {:x} zsize {:x} dc {:x} vte {:x} vp {} {} {} {} {} {} scr {:x} {:x} gen {:x} {:x} "
                                           "vps {:x} {:x} win {:x} {:x} {:x} clip {:x} su {:x} sinfo {:x} sctl {:x} sref {:x} {:x} rc {:x} blend {:x} "
-                                          "bc {} {} {} {} a2m {:x} vs {:x} ps {:x}",
+                                          "bc {} {} {} {} a2m {:x} vs {:x} ps {:x} vh {:016x} ph {:016x}",
                                           op, prim, op == 0x2D ? b[0] : op == 0x27 ? b[3] : b[2], mode, ctx[0x318], ctx[0x319], ctx[0x31A], ctx[0x31B],
                                           ctx[0x31C], ctx[0x31D], ctx[0x1C5], ctx[0x08E], ctx[0x014], ctx[0x010], ctx[0x016], depth_control, ctx[0x206],
                                           F(ctx[0x10F]), F(ctx[0x110]), F(ctx[0x111]), F(ctx[0x112]), F(ctx[0x113]), F(ctx[0x114]), ctx[0x00C], ctx[0x00D],
                                           ctx[0x090], ctx[0x091], ctx[0x094], ctx[0x095], ctx[0x080], ctx[0x081], ctx[0x082], ctx[0x204], ctx[0x205],
                                           ctx[0x011], ctx[0x10B], ctx[0x10C], ctx[0x10D], ctx[0x000], ctx[0x1E0], F(ctx[0x105]), F(ctx[0x106]),
                                           F(ctx[0x107]), F(ctx[0x108]), ctx[0x2DC],
-                                          (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8, (u64)(sh[0x08] | (u64)sh[0x09] << 32) << 8));
+                                          (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8, (u64)(sh[0x08] | (u64)sh[0x09] << 32) << 8,
+                                          // The programs' OrbShdr hashes: the same in every run, unlike their addresses (the frame map).
+                                          OrbShaderHash((u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8, cpu), OrbShaderHash((u64)(sh[0x08] | (u64)sh[0x09] << 32) << 8, cpu)));
     if (draw_seq++ > stats.stop) return;
     draw_rts.clear();
     if (mode > 1) return Count(stats.skipped), Note(std::format("CB_COLOR_CONTROL mode {} skipped", mode));
@@ -535,6 +542,12 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         }
     }
     if (rw == ~0u) return Count(stats.skipped), Note("draw without attachments skipped");
+    // Shadows off: a shadow caster (depth only, into the atlas the projection samples) is not drawn; its clears still are.
+    if (shadows_off && depth && z_write && !color_count && !db_clear && ShadowAtlas(depth->base)) {
+        if (shadow_skips.fetch_add(1, std::memory_order_relaxed) == 0)
+            Gow3::Log(std::format("Renderer: shadows off: casters into the atlas at {:#x} skipped", depth->base));
+        return Count(stats.skipped);
+    }
 
     // Restrict early tests to shaders without guest side effects, depth exports or dynamic discard.
     const u64 ps_addr = (u64)(sh[0x08] | (u64)sh[0x09] << 32) << 8;
@@ -726,6 +739,12 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         ps_table.push_back(blend_element);
         draw_rts.push_back({color[0]->t.img, true});
         color_view[0] = VK_NULL_HANDLE;  // written by the PS through its storage view, not as an attachment
+    }
+    // The sun's shadow projection: its atlas (T# 2) is learned, for the casters above; with shadows off it is not drawn (the
+    // shadow channel keeps the clear it starts from, lit).
+    if (shadow_quad && ps && !blend_mode && ShadowProjection(prep.pkey, prep.in, ps_table, prep.desc)) {
+        LearnShadowAtlas(((u64)prep.desc[2][0] | (u64)(prep.desc[2][1] & 0x3F) << 32) << 8);
+        if (shadows_off) return stores.clear(), Count(stats.skipped);
     }
     const ShaderRef gs = rect && !rect_vs ? RectGs(vs_mask) : ShaderRef{};
     // No PS program: the draw only touches depth/stencil (color writes masked below).
@@ -1133,7 +1152,9 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
 // one write-back barrier pair.
 void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     const u64 addr = (u64)(sh[0x20C] | (u64)sh[0x20D] << 32) << 8;
-    if (stats.trace) stats.trace_lines.push_back(std::format("dispatch {} {} {} threads {} {} {} cs {:x}", b[0], b[1], b[2], sh[0x207], sh[0x208], sh[0x209], addr));
+    if (stats.trace)
+        stats.trace_lines.push_back(std::format("dispatch {} {} {} threads {} {} {} cs {:x} ch {:016x}", b[0], b[1], b[2], sh[0x207], sh[0x208], sh[0x209], addr,
+                                                OrbShaderHash(addr, cpu)));
     if (draw_seq++ > stats.stop) return;
     draw_rts.clear(), reads.clear(), twins.clear();
     if (!Identify(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], false, prep))
@@ -1270,6 +1291,35 @@ void Renderer::Impl::RecordBlocks(u32 rec) {
     in_worker = false, synced_here = nullptr, horizon = ~size_t(0);
 }
 
+void Renderer::Impl::QueueError(const char* where, VkResult res) {
+    static std::mutex lock;
+    static std::vector<const char*> seen;
+    {
+        std::scoped_lock l(lock);
+        if (std::find(seen.begin(), seen.end(), where) != seen.end()) return;
+        seen.push_back(where);
+    }
+    Gow3::Log(std::format("Renderer: {} failed ({}) at frame {}; video memory {}", where, (int)res, frame, BudgetText()));
+}
+
+void Renderer::Impl::RelieveMemory() {
+    u32 freed = 0;
+    {
+        std::scoped_lock bind(bind_lock);
+        // Chunks emptied two frames before the one waited for: their pages left them in binds that frame's predecessor waited for.
+        for (size_t k = 0; k < dying_chunks.size();)
+            if (dying_chunks[k].first + 1 < flight.frame)
+                vkFreeMemory(dev, dying_chunks[k].second, nullptr), dying_chunks[k] = dying_chunks.back(), dying_chunks.pop_back(), ++freed;
+            else
+                ++k;
+    }
+    const bool blocks = ReclaimEmptyImageBlocks();
+    static bool logged = false;
+    if (!logged)
+        logged = true, Gow3::Log(std::format("Renderer: the GPU has not finished frame {} after 2 s (video memory {}); {} emptied mirror chunks "
+                                             "and {} empty texture blocks went back to the driver", flight.frame, BudgetText(), freed, blocks ? "the" : "no"));
+}
+
 void Renderer::Impl::Retire() {
     if (!flight.busy) {
         DrainRetiredElements();
@@ -1277,7 +1327,14 @@ void Renderer::Impl::Retire() {
     }
     const auto temp_t0 = DiagNow();
     frame_phase.store("waiting for the GPU to finish the frame before", std::memory_order_relaxed);
-    temp_call = "fence", TempLost("fence", vkWaitForFences(dev, 1, &flight.fence, VK_TRUE, ~0ull)), temp_call = nullptr;
+    // In seconds: a frame the GPU has not finished after two (video memory over its budget, the driver paging) gets the memory
+    // nothing in flight uses given back, which may be what it waits for.
+    temp_call = "fence";
+    VkResult waited;
+    for (u32 seconds = 0; (waited = vkWaitForFences(dev, 1, &flight.fence, VK_TRUE, 1'000'000'000ull)) == VK_TIMEOUT;)
+        if (++seconds == 2) RelieveMemory();
+    TempLost("fence", waited), temp_call = nullptr;
+    if (waited != VK_SUCCESS) QueueError("fence wait", waited);
     GOW3_DIAG temp_fence_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - temp_t0).count();
     vkResetFences(dev, 1, &flight.fence);
     flight.busy = false;
@@ -1754,10 +1811,13 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     }
     const auto temp_tail = DiagNow();
     frame_phase.store("submitting uploads", std::memory_order_relaxed);
+    VkResult xfer_result = VK_SUCCESS;
     if (need_xfer) {
         const VkSubmitInfo xi{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &r.xfer_cmd, 1, &r.copied};
         std::scoped_lock lock(*r.xfer_lock);
-        temp_call = "xfer submit", r.TempLost("xfer submit", vkQueueSubmit(r.xfer, 1, &xi, VK_NULL_HANDLE)), temp_call = nullptr;
+        temp_call = "xfer submit", xfer_result = vkQueueSubmit(r.xfer, 1, &xi, VK_NULL_HANDLE), temp_call = nullptr;
+        r.TempLost("xfer submit", xfer_result);
+        if (xfer_result != VK_SUCCESS) r.QueueError("upload submit", xfer_result);
     }
     // This frame goes to the GPU before the wait for the frame before (the frame in flight, which records nothing more),
     // so the GPU goes on to it without a gap. The frame's fence: the readback's, which waits for the frame.
@@ -1769,7 +1829,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     VkPipelineStageFlags wait_stages[2]{};
     VkSemaphore waits[2]{};
     u32 wait_count = 0;
-    if (need_xfer) {
+    if (need_xfer && xfer_result == VK_SUCCESS) {  // a failed upload submit signals nothing: the frame would wait for good
         waits[wait_count] = r.copied;
         wait_stages[wait_count++] =
             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -1779,6 +1839,8 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         wait_stages[wait_count++] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     }
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, wait_count, waits, wait_stages, 2, both, rb_async ? 1u : 0u, &r.rendered};
+    VkResult submitted = VK_SUCCESS;
+    bool signaled = true;  // the frame's fence will be signaled (else Retire must not wait for it)
     {
         std::scoped_lock lock(*r.queue_lock);
         if (has_binds) {
@@ -1787,18 +1849,33 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
             bsi.bufferBindCount = 1, bsi.pBufferBinds = &bi;
             bsi.signalSemaphoreCount = 1, bsi.pSignalSemaphores = &r.bound_sem;
             frame_phase.store("binding guest memory pages", std::memory_order_relaxed);
+            VkResult bound = VK_SUCCESS;
             Impl::Stalled(r.stall_binds, r.stall_bind_ns, [&] {
-                temp_call = "bind sparse", r.TempLost("bind sparse", vkQueueBindSparse(r.queue, 1, &bsi, VK_NULL_HANDLE)), temp_call = nullptr;  // TEMP fault
+                temp_call = "bind sparse", bound = vkQueueBindSparse(r.queue, 1, &bsi, VK_NULL_HANDLE), temp_call = nullptr;  // TEMP fault
             });
+            r.TempLost("bind sparse", bound);
+            if (bound != VK_SUCCESS) {
+                // Nothing signals the semaphore then. The pages keep the backstop block, whatever reaches them is zeroed next frame.
+                r.QueueError("binding guest memory pages", bound);
+                si.waitSemaphoreCount = --wait_count, r.backstop_dirty = true;
+            }
             r.pending_binds.clear(), r.unbinds.clear();
         }
         frame_phase.store("submitting the frame", std::memory_order_relaxed);
-        temp_call = "submit", r.TempLost("submit", vkQueueSubmit(r.queue, 1, &si, rb_async ? VK_NULL_HANDLE : r.fence)), temp_call = nullptr;
+        temp_call = "submit", submitted = vkQueueSubmit(r.queue, 1, &si, rb_async ? VK_NULL_HANDLE : r.fence), temp_call = nullptr;
+        r.TempLost("submit", submitted);
+        if (submitted != VK_SUCCESS) {
+            r.QueueError("frame submit", submitted);
+            if (!rb_async) signaled = vkQueueSubmit(r.queue, 0, nullptr, r.fence) == VK_SUCCESS;  // the fence at least, after the work before
+        }
     }
     if (rb_async) {
         const VkPipelineStageFlags rb_wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        const VkSubmitInfo ri{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 1, &r.rendered, &rb_wait_stage, 1, &r.rb_cmd};
-        temp_call = "readback submit", r.TempLost("readback submit", vkQueueSubmit(r.rbq, 1, &ri, r.fence)), temp_call = nullptr;
+        // The frame's semaphore only when the frame went: a readback that waits for nothing still signals the fence.
+        const VkSubmitInfo ri{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, submitted == VK_SUCCESS ? 1u : 0u, &r.rendered, &rb_wait_stage, 1, &r.rb_cmd};
+        temp_call = "readback submit", submitted = vkQueueSubmit(r.rbq, 1, &ri, r.fence), temp_call = nullptr;
+        r.TempLost("readback submit", submitted);
+        if (submitted != VK_SUCCESS) r.QueueError("readback submit", submitted), signaled = vkQueueSubmit(r.rbq, 0, nullptr, r.fence) == VK_SUCCESS;
     }
     const auto temp_submitted = DiagNow();
     r.Retire();
@@ -1841,7 +1918,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     }
     r.NoteFrameBuffers();
     r.SwapFrame();
-    r.flight.busy = true, r.flight.queries = (u32)r.query_blocks.size(), r.flight.frame = r.frame;
+    r.flight.busy = signaled, r.flight.queries = signaled ? (u32)r.query_blocks.size() : 0, r.flight.frame = r.frame;
     r.stage_at = 0, r.stage_used = 0;  // the retired frame's staging chunks
     r.TrimFrameBuffers();
     GOW3_DIAG r.stats.record_ms = ms(t_begin, t_recorded), r.stats.gpu_ms = retire_ms;

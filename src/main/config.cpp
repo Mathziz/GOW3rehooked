@@ -25,7 +25,7 @@ bool Boolean(std::string_view value, bool& out) {
 
 constexpr std::array<std::string_view, 3> DisplayModes{"windowed", "borderless", "fullscreen"};
 constexpr std::array<std::string_view, 3> VSyncModes{"fifo", "mailbox", "off"};
-constexpr std::array<std::string_view, 2> AntiAliasingModes{"none", "cmaa2"};
+constexpr std::array<std::string_view, 3> AntiAliasingModes{"none", "fxaa", "cmaa2"};
 constexpr std::array<std::string_view, 2> ScalingFilters{"bilinear", "fsr1"};
 constexpr std::array<std::string_view, 2> ShaderModes{"sync", "async"};
 constexpr std::array<std::string_view, 2> ShaderMechanisms{"jit", "aot"};
@@ -100,6 +100,8 @@ Config LoadConfig(const std::filesystem::path& path) {
             valid = Boolean(value, config.nvidia_reflex);
         } else if (key == "anti_aliasing") {
             valid = Choice(value, config.anti_aliasing, AntiAliasingModes);
+        } else if (key == "shadows") {
+            if (value == "on" || value == "off") config.shadows = value == "on", valid = true;
         } else if (key == "scaling_filter") {
             if (value == "none" || value == "nearest") config.scaling_filter = ScalingFilter::Bilinear, valid = true;
             else valid = Choice(value, config.scaling_filter, ScalingFilters);
@@ -228,6 +230,7 @@ void SaveMenuConfig(const std::filesystem::path& path, const Config& config) {
         {"vsync", std::string(VSyncModes[size_t(config.vsync)])},
         {"nvidia_reflex", flag(config.nvidia_reflex)}, {"msaa", std::to_string(config.msaa)}, {"anisotropy", std::to_string(config.anisotropy)},
         {"anti_aliasing", std::string(AntiAliasingModes[size_t(config.anti_aliasing)])}, {"scaling_filter", std::string(ScalingFilters[size_t(config.scaling_filter)])},
+        {"shadows", config.shadows ? "on" : "off"},
         {"skip_intro", flag(config.skip_intro)},
         {"skip_videos", flag(config.skip_videos)}, {"cinematics_4k", flag(config.cinematics_4k)},
         {"button_icons", std::string(ButtonIconStyles[size_t(config.button_icons)])},

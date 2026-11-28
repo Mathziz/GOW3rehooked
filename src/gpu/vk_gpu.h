@@ -145,6 +145,7 @@ public:
     bool Init(bool validation, std::string& error);  // own instance and device; defined only by tools/framecap
     bool Init(const External& device, std::string& error);
     void SetAnisotropy(unsigned level);
+    void SetShadows(bool on);  // off: the sun's shadow casters and their projection are skipped
     void SetMotionBlurFrameTime(float seconds);
 
     // ---- Guest memory, occlusion queries and display surfaces ----
@@ -167,7 +168,8 @@ public:
     // Live: guest bytes the mirror could not take (no video memory for their pages) are handed to `restage` to be offered
     // again; RestageLost, before each frame's offer, does it when due.
     void SetRestage(std::function<void(std::uint64_t lo, std::uint64_t hi)> restage);
-    void SetRelease(std::function<bool(std::uint64_t lo, std::uint64_t hi)> release);  // GuestMemory::Release (mirror reclaim)
+    void SetDroppable(std::function<bool(std::uint64_t lo, std::uint64_t hi)> droppable);  // GuestMemory::Droppable (mirror reclaim)
+    void SetReadable(std::function<bool(std::uint64_t lo, std::uint64_t hi)> readable);    // GuestMemory::Readable (dropped pages staged again)
     void ReclaimMirror();  // frame start (GPU thread): idle mirror pages give their memory back when video memory is short
     void RestageLost();
     // Live linear readback: after each Submit, the bytes of every guest range the GPU wrote (storage images, linear

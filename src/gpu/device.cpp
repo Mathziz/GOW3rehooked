@@ -713,7 +713,7 @@ void Renderer::Impl::LoadDeviceFunctions() {
     // An 8 GB APU reports ~6.8 GiB of heaps (carve-out + shared); 16 GB ones ~10 GiB.
     compact_memory = integrated ? total_heap <= (8ull << 30) : mem.memoryHeaps[vram_heap].size <= (4ull << 30);
     if (compact_memory) {
-        chunk_size = chunk_used = 64ull << 20;
+        chunk_size = 64ull << 20;
         image_block_size = 64ull << 20;
         image_reserve_blocks = 1;
         scratch_reserve = 32ull << 20;
@@ -725,7 +725,7 @@ void Renderer::Impl::LoadDeviceFunctions() {
     // less of the last one unused, and a frame slot's staging has one 16 MB VRAM twin (a frame stages a few MB; the chunks a
     // level load adds are copied from the host).
     if (!integrated && mem.memoryHeaps[vram_heap].size <= (2560ull << 20)) {
-        chunk_size = chunk_used = 32ull << 20;
+        chunk_size = 32ull << 20;
         stage_chunk_size = 16ull << 20;
         stage_twins = 1;
     }

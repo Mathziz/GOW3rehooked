@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// FXAA (the Quality variant of Timothy Lottes' algorithm, written for this port): the display buffer's encoded colors in, the
+// smoothed image out. Edges are found by local luma contrast. Along each edge the search runs both ways to its ends, and the
+// pixel takes the color half a pixel across, by its distance to the nearer end.
+// Tuned against the blur FXAA is known for: no sub-pixel term (it softened every high-contrast texel, the usual blur), a
+// higher contrast threshold, and a pixel moves only toward a real edge end, at most half a pixel. Everything else is copied
+// as it is, so texture detail stays.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;  // linear filtering, clamped
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+
+const float kEdgeThreshold = 0.166;     // contrast to the local maximum below which a pixel is left alone
+const float kEdgeThresholdMin = 0.0625;  // and absolute contrast (GOW3's darks)
+const int kSteps = 10;
+const float kStep[kSteps] = float[](1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+
+float Luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+float LumaAt(vec2 uv) { return Luma(textureLod(src, uv, 0.0).rgb); }
+
+void main() {
+    ivec2 size = textureSize(src, 0);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) return;
+    vec2 rcp = 1.0 / vec2(size);
+    vec2 uv = (vec2(p) + 0.5) * rcp;
+    vec3 center = textureLod(src, uv, 0.0).rgb;
+    float lumaM = Luma(center);
+    float lumaN = Luma(textureLodOffset(src, uv, 0.0, ivec2(0, -1)).rgb);
+    float lumaS = Luma(textureLodOffset(src, uv, 0.0, ivec2(0, 1)).rgb);
+    float lumaW = Luma(textureLodOffset(src, uv, 0.0, ivec2(-1, 0)).rgb);
+    float lumaE = Luma(textureLodOffset(src, uv, 0.0, ivec2(1, 0)).rgb);
+    float rangeMax = max(max(max(lumaN, lumaS), max(lumaW, lumaE)), lumaM);
+    float rangeMin = min(min(min(lumaN, lumaS), min(lumaW, lumaE)), lumaM);
+    float range = rangeMax - rangeMin;
+    if (range < max(kEdgeThresholdMin, rangeMax * kEdgeThreshold)) {
+        imageStore(dst, p, vec4(center, 1.0));
+        return;
+    }
+    float lumaNW = Luma(textureLodOffset(src, uv, 0.0, ivec2(-1, -1)).rgb);
+    float lumaNE = Luma(textureLodOffset(src, uv, 0.0, ivec2(1, -1)).rgb);
+    float lumaSW = Luma(textureLodOffset(src, uv, 0.0, ivec2(-1, 1)).rgb);
+    float lumaSE = Luma(textureLodOffset(src, uv, 0.0, ivec2(1, 1)).rgb);
+    float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;
+    float lumaNESE = lumaNE + lumaSE, lumaNWNE = lumaNW + lumaNE, lumaNWSW = lumaNW + lumaSW, lumaSWSE = lumaSW + lumaSE;
+    // Second differences across the three rows and the three columns: a horizontal edge varies down the columns.
+    float edgeHorz = abs(-2.0 * lumaW + lumaNWSW) + 2.0 * abs(-2.0 * lumaM + lumaNS) + abs(-2.0 * lumaE + lumaNESE);
+    float edgeVert = abs(-2.0 * lumaS + lumaSWSE) + 2.0 * abs(-2.0 * lumaM + lumaWE) + abs(-2.0 * lumaN + lumaNWNE);
+    bool horzSpan = edgeHorz >= edgeVert;
+    // The side of the edge the pixel blends toward: the neighbor across it with the larger step.
+    if (!horzSpan) {
+        lumaN = lumaW;
+        lumaS = lumaE;
+    }
+    float lengthSign = horzSpan ? rcp.y : rcp.x;
+    float gradientN = lumaN - lumaM, gradientS = lumaS - lumaM;
+    bool pairN = abs(gradientN) >= abs(gradientS);
+    float gradient = max(abs(gradientN), abs(gradientS));
+    if (pairN) lengthSign = -lengthSign;
+    float lumaNN = (pairN ? lumaN : lumaS) + lumaM;  // twice the luma half a pixel across, on the edge
+    // Search along the edge, both ways, from the line half a pixel across, until the luma there leaves the edge's.
+    vec2 posB = uv;
+    vec2 offNP = horzSpan ? vec2(rcp.x, 0.0) : vec2(0.0, rcp.y);
+    if (horzSpan) posB.y += lengthSign * 0.5;
+    else posB.x += lengthSign * 0.5;
+    vec2 posN = posB - offNP * kStep[0], posP = posB + offNP * kStep[0];
+    float gradientScaled = gradient * 0.25;
+    bool lumaMLTZero = lumaM - lumaNN * 0.5 < 0.0;
+    float lumaEndN = LumaAt(posN) - lumaNN * 0.5, lumaEndP = LumaAt(posP) - lumaNN * 0.5;
+    bool doneN = abs(lumaEndN) >= gradientScaled, doneP = abs(lumaEndP) >= gradientScaled;
+    if (!doneN) posN -= offNP * kStep[1];
+    if (!doneP) posP += offNP * kStep[1];
+    for (int i = 2; i < kSteps && !(doneN && doneP); ++i) {
+        if (!doneN) lumaEndN = LumaAt(posN) - lumaNN * 0.5;
+        if (!doneP) lumaEndP = LumaAt(posP) - lumaNN * 0.5;
+        doneN = doneN || abs(lumaEndN) >= gradientScaled;
+        doneP = doneP || abs(lumaEndP) >= gradientScaled;
+        if (!doneN) posN -= offNP * kStep[i];
+        if (!doneP) posP += offNP * kStep[i];
+    }
+    float dstN = horzSpan ? uv.x - posN.x : uv.y - posN.y;
+    float dstP = horzSpan ? posP.x - uv.x : posP.y - uv.y;
+    bool directionN = dstN < dstP;
+    // Only an end where the luma crosses to the other side of the edge's is a real one.
+    bool goodSpan = directionN ? (lumaEndN < 0.0) != lumaMLTZero : (lumaEndP < 0.0) != lumaMLTZero;
+    float offset = goodSpan ? 0.5 - min(dstN, dstP) / (dstN + dstP) : 0.0;
+    if (offset <= 0.0) {
+        imageStore(dst, p, vec4(center, 1.0));
+        return;
+    }
+    if (horzSpan) uv.y += offset * lengthSign;
+    else uv.x += offset * lengthSign;
+    imageStore(dst, p, vec4(textureLod(src, uv, 0.0).rgb, 1.0));
+}

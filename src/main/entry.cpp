@@ -134,10 +134,13 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
 #endif
         const auto config = LoadConfig(app / PortDir::Settings / "config.cfg");
         Extras::LoadFromConfig(config);
-        GpuThread::Configure(config.anisotropy);
-        if (DebugEnabled()) Log(std::format("Configuration: {} at {:.2f} fps, skip intro {}, skip videos {}, mode {}",
+        GpuThread::Configure(config.anisotropy, config.shadows);
+        if (DebugEnabled()) Log(std::format("Configuration: {} at {:.2f} fps, skip intro {}, skip videos {}, mode {}; MSAA {}x, post effects {}, "
+                        "texture filtering {}x, shadows {}, scaler {}",
                         Resolutions[config.resolution].name, GameFrameRate(config.fps), config.skip_intro, config.skip_videos,
-                        static_cast<int>(config.display_mode)));
+                        static_cast<int>(config.display_mode), config.msaa,
+                        config.anti_aliasing == AntiAliasing::Cmaa2 ? "CMAA2" : config.anti_aliasing == AntiAliasing::Fxaa ? "FXAA" : "off",
+                        config.anisotropy, config.shadows ? "on" : "off", config.scaling_filter == ScalingFilter::Fsr1 ? "FSR 1" : "bilinear"));
         // By Common::FS::PathType; data this game does not use stays under the guest home, which nothing creates (its
         // sys_modules and custom_modules are only looked up for user-provided modules).
         const auto home = std::filesystem::path(PortDir::Home);
