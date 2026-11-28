@@ -1199,10 +1199,14 @@ void Renderer::Impl::CopyDepthCompanion(VkCommandBuffer c) {
     }
     if (!z) return;
     if (!comp) {
+        // In VRAM, system memory only if that fails: the GoW3 AA follows silhouettes texel by texel, each step waiting on
+        // the last, and from system memory those reads crossed PCIe one after another (with the companion there, the frames
+        // of a 750 Ti waited 4 ms longer than the GPU's own work: 18.4 against 14.8 ms before the silhouette search). Half
+        // precision keeps the three of a 1440p game at 22 MB.
         constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        Tex img = vram_spill ? HostImage(fmt, z->w, z->h, usage, VK_IMAGE_ASPECT_COLOR_BIT) : Tex{};
-        const bool host = img.img != VK_NULL_HANDLE;
-        if (!host) img = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, fmt, z->w, z->h, 1, 1, VK_SAMPLE_COUNT_1_BIT, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, true);
+        Tex img = MakeImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, fmt, z->w, z->h, 1, 1, VK_SAMPLE_COUNT_1_BIT, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, true);
+        const bool host = !img.img && vram_spill;
+        if (host) img = HostImage(fmt, z->w, z->h, usage, VK_IMAGE_ASPECT_COLOR_BIT);
         Companion made{img, ~0u, z->w, z->h, fmt, false};
         if (!made.t.img) return Note("depth companion image failed");
         const VkImageMemoryBarrier init{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -1230,9 +1234,8 @@ void Renderer::Impl::CopyDepthCompanion(VkCommandBuffer c) {
     comp->frame = frame, comp->ready = true;
 }
 
-// An image in a memory type of another heap than VRAM's that is not host-visible (NVIDIA's system memory types for images),
-// for what a frame reads once: a depth companion, 18 MB at 1440p, three of them, is VRAM a 2 GB card needs for the game.
-// Empty when the image takes no such type.
+// An image in a memory type of another heap than VRAM's that is not host-visible (NVIDIA's system memory types for images):
+// where a depth companion goes when VRAM has no room for it. Empty when the image takes no such type.
 Renderer::Impl::Tex Renderer::Impl::HostImage(VkFormat fmt, u32 w, u32 h, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
     Tex t{.usage = usage};
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};

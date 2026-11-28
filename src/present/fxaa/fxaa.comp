@@ -75,7 +75,7 @@ const float kMaxBlend = 0.5;  // at most half a pixel from its neighbors
 layout(constant_id = 0) const float kSilhouette = 1.0;
 layout(constant_id = 1) const int kRun = 16;
 layout(constant_id = 2) const float kMix = 0.0;
-const float kTouch = 0.004;   // below this luma range the neighbors are one color: nothing to blend
+const float kTouch = 0.008;   // below this luma range (2 of 255) a blend moves the pixel by 1 of 255 at most: not looked at
 ivec2 dsize;
 bool Inside(ivec2 q) { return all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, dsize)); }
 float Inv(ivec2 q) { return 1.0 / max(texelFetch(depth, clamp(q, ivec2(0), dsize - 1), 0).r, 1e-6); }
@@ -139,6 +139,7 @@ bool Silhouette(ivec2 p, vec3 c, vec3 cN, vec3 cS, vec3 cW, vec3 cE, out vec3 re
     bool jN = Inside(p + up) && by > kJump * max(wc, wu) && abs(wc - 2.0 * wu + Inv(p + 2 * up)) > kJump * max(wc, wu);
     bool jS = Inside(p + down) && by > kJump * max(wc, wd) && abs(wc - 2.0 * wd + Inv(p + 2 * down)) > kJump * max(wc, wd);
     if (!(jN || jS || jW || jE)) return false;
+    if (kSilhouette <= 0.0) return true;  // over MSAA 4x: silhouettes stay as its resolve left them, unsearched
     vec3 accH = vec3(0.0), accV = vec3(0.0);
     float wH = 0.0, wV = 0.0, lenH = 0.0, lenV = 0.0, len, a;
     if (jN) { a = Coverage(p, up, right, len); if (a > 0.0) { accH += a * (cN - c); wH += a; lenH = max(lenH, len); } }

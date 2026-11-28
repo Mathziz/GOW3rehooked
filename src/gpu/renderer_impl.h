@@ -621,7 +621,7 @@ struct Renderer::Impl {
     std::map<u64, std::vector<Companion>> companions;  // by color target base; earlier sizes kept (the presenter may hold their views)
     void NoteLastDraw(const Target& color0);
     void CopyDepthCompanion(VkCommandBuffer c);
-    Tex HostImage(VkFormat fmt, u32 w, u32 h, VkImageUsageFlags usage, VkImageAspectFlags aspect);  // out of VRAM (vram_spill)
+    Tex HostImage(VkFormat fmt, u32 w, u32 h, VkImageUsageFlags usage, VkImageAspectFlags aspect);  // out of VRAM (a companion VRAM has no room for)
     // width | height << 16 from the NOP hint after the CB / DB setup (0: none)
     static inline thread_local u32 cb_extent[8]{}, db_extent = 0;
     VkSampleCountFlags msaa_samples = VK_SAMPLE_COUNT_1_BIT;  // sample counts supported across color, depth, stencil and sampled views
