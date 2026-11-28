@@ -9,6 +9,7 @@
 !/.gitignore
 !/CMakeLists.txt
 !/README.md
+!/README.pt-BR.md
 !/build-fast.ps1
 !/build-fast.sh
 !/debug.ps1
