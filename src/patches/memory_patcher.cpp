@@ -128,6 +128,11 @@ void ApplyGamePatches(Core::Module& eboot, const Config& config) {
     }
     value(0x3cd918, 0x50000000, resolution.arena << 24);
     if (config.msaa != 2) value(0x3cdcd0, 1, std::countr_zero(config.msaa));
+    // Shadow map size, 2048, next to the MSAA level in the display settings (0x013cdccc): the cascade setup reads it every frame
+    // (getter 01f1090: each view's viewport is the size minus 4, and 0171800 keeps it for the projection's texel math), and the
+    // display settings take it at startup (01f0b30, 01f1900). Medium and Low draw the maps at 1536 and 1024.
+    if (config.shadows == ShadowQuality::Medium || config.shadows == ShadowQuality::Low)
+        value(0x3cdccc, 2048, config.shadows == ShadowQuality::Low ? 1024 : 1536);
     if (config.fps != 60) { // Keep swing normalization at the original 59.94 Hz for every other rate.
         patches.push_back({0x08ff0a, {0x48, 0x8d, 0x05, 0x6f, 0xdd, 0x33, 0x00}, {0x48, 0x8d, 0x05, 0xf3, 0xdd, 0x2c, 0x00}});
         // The timing helper alone reads these constants. Preserve its original maximum delta, 4/59.94 s.

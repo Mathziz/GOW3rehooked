@@ -986,13 +986,14 @@ struct Setting {
 constexpr std::string_view resolutions[]{"480p", "720p", "1080p", "1440p", "1800p", "4K"}, frame_rates[]{"30 FPS", "40 FPS", "60 FPS", "120 FPS", "240 FPS", "480 FPS"},
     display_modes[]{"Windowed", "Borderless", "Exclusive"}, vsync_modes[]{"FIFO", "Mailbox", "Off"}, on_off[]{"Off", "On"},
     msaa[]{"Off", "2x", "4x"}, filtering[]{"Trilinear", "4x", "8x", "16x"}, anti_aliasing[]{"Off", "FXAA", "CMAA2"},
+    shadow_levels[]{"Off", "Low", "Medium", "High"},
     scalers[]{"Bilinear / Bilinear", "FSR 1 / Lanczos 2"},
     compilation[]{"Sync", "Async"}, mechanisms[]{"JIT", "AOT"}, button_icons[]{"Auto", "PlayStation", "Keyboard"};
 Setting settings[OptionCount]{
     {"Resolution", resolutions, 2, 201}, {"Frame Rate", frame_rates, 2, 206}, {"Display Mode", display_modes, 1, 237},
     {"VRR", on_off, 0, 80}, {"VSync", vsync_modes, 0, 106}, {"NVIDIA Reflex", on_off, 0, 260},
     {"MSAA", msaa, 1, 106}, {"Texture Filtering", filtering, 0, 319}, {"Post Effects", anti_aliasing, 0, 235},
-    {"Scaler", scalers, 0, 116}, {"Shadows", on_off, 1, 158},
+    {"Scaler", scalers, 0, 116}, {"Shadows", shadow_levels, 3, 158},
     {"Skip Opening Logos", on_off, 0, 350}, {"Skip Videos with X", on_off, 0, 330}, {"4K Cinematics", on_off, 0, 260},
     {"Button Icons", button_icons, 0, 236},
     {"Shader Mechanism", mechanisms, 0, 338}, {"Shader Recompilation", compilation, 0, 400}, {"Lazy AOT", on_off, 0, 175}
@@ -1022,7 +1023,7 @@ float ValueWidth(std::string_view value) {
         {"30 FPS", 120}, {"40 FPS", 121}, {"60 FPS", 120}, {"120 FPS", 133}, {"240 FPS", 141}, {"480 FPS", 142},  // digits + an estimated 77 for " FPS"
         {"Windowed", 196}, {"Borderless", 209}, {"Exclusive", 180}, {"FIFO", 84}, {"Mailbox", 153},
         {"Off", 67}, {"On", 57}, {"2x", 42}, {"4x", 43}, {"8x", 43}, {"16x", 57},
-        {"Trilinear", 178}, {"CMAA2", 129}, {"FXAA", 104}, {"Bilinear / Bilinear", 344}, {"FSR 1 / Lanczos 2", 305},
+        {"Trilinear", 178}, {"CMAA2", 129}, {"FXAA", 104}, {"Low", 81}, {"Medium", 150}, {"High", 88}, {"Bilinear / Bilinear", 344}, {"FSR 1 / Lanczos 2", 305},
         {"Sync", 92}, {"Async", 114}, {"JIT", 50}, {"AOT", 77}, {"Auto", 92}, {"PlayStation", 222}, {"Keyboard", 196},
     };
     const auto it = std::ranges::find(widths, value, &std::pair<std::string_view, float>::first);
@@ -1087,7 +1088,7 @@ Config SelectedConfig() {
     config.anisotropy = AnisotropyLevels[settings[Filtering].index];
     config.anti_aliasing = AntiAliasing(settings[PostEffects].index);
     config.scaling_filter = ScalingFilter(settings[Scaler].index);
-    config.shadows = settings[ShadowsOption].index == 1;
+    config.shadows = ShadowQuality(settings[ShadowsOption].index);
     config.skip_intro = settings[SkipIntro].index;
     config.skip_videos = settings[SkipVideos].index;
     config.cinematics_4k = settings[Cinematics4K].index;
@@ -1110,7 +1111,7 @@ void Configure(const Config& config) {
     settings[Filtering].index = u32(std::ranges::find(AnisotropyLevels, config.anisotropy) - AnisotropyLevels.begin());
     settings[PostEffects].index = u32(config.anti_aliasing);
     settings[Scaler].index = u32(config.scaling_filter);
-    settings[ShadowsOption].index = config.shadows ? 1 : 0;
+    settings[ShadowsOption].index = u32(config.shadows);
     settings[SkipIntro].index = config.skip_intro;
     settings[SkipVideos].index = config.skip_videos;
     settings[Cinematics4K].index = config.cinematics_4k;

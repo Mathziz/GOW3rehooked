@@ -26,6 +26,7 @@ bool Boolean(std::string_view value, bool& out) {
 constexpr std::array<std::string_view, 3> DisplayModes{"windowed", "borderless", "fullscreen"};
 constexpr std::array<std::string_view, 3> VSyncModes{"fifo", "mailbox", "off"};
 constexpr std::array<std::string_view, 3> AntiAliasingModes{"none", "fxaa", "cmaa2"};
+constexpr std::array<std::string_view, 4> ShadowQualities{"off", "low", "medium", "high"};
 constexpr std::array<std::string_view, 2> ScalingFilters{"bilinear", "fsr1"};
 constexpr std::array<std::string_view, 2> ShaderModes{"sync", "async"};
 constexpr std::array<std::string_view, 2> ShaderMechanisms{"jit", "aot"};
@@ -101,7 +102,8 @@ Config LoadConfig(const std::filesystem::path& path) {
         } else if (key == "anti_aliasing") {
             valid = Choice(value, config.anti_aliasing, AntiAliasingModes);
         } else if (key == "shadows") {
-            if (value == "on" || value == "off") config.shadows = value == "on", valid = true;
+            if (value == "on") config.shadows = ShadowQuality::High, valid = true;
+            else valid = Choice(value, config.shadows, ShadowQualities);
         } else if (key == "scaling_filter") {
             if (value == "none" || value == "nearest") config.scaling_filter = ScalingFilter::Bilinear, valid = true;
             else valid = Choice(value, config.scaling_filter, ScalingFilters);
@@ -218,6 +220,7 @@ void SaveMenuConfig(const std::filesystem::path& path, const Config& config) {
         std::ranges::find(MsaaLevels, config.msaa) == MsaaLevels.end() ||
         unsigned(config.display_mode) >= DisplayModes.size() || unsigned(config.vsync) >= VSyncModes.size() ||
         unsigned(config.scaling_filter) >= ScalingFilters.size() || unsigned(config.anti_aliasing) >= AntiAliasingModes.size() ||
+        unsigned(config.shadows) >= ShadowQualities.size() ||
         unsigned(config.shader_recompilation) >= ShaderModes.size() ||
         unsigned(config.shader_mechanism) >= ShaderMechanisms.size() ||
         unsigned(config.button_icons) >= ButtonIconStyles.size() ||
@@ -230,7 +233,7 @@ void SaveMenuConfig(const std::filesystem::path& path, const Config& config) {
         {"vsync", std::string(VSyncModes[size_t(config.vsync)])},
         {"nvidia_reflex", flag(config.nvidia_reflex)}, {"msaa", std::to_string(config.msaa)}, {"anisotropy", std::to_string(config.anisotropy)},
         {"anti_aliasing", std::string(AntiAliasingModes[size_t(config.anti_aliasing)])}, {"scaling_filter", std::string(ScalingFilters[size_t(config.scaling_filter)])},
-        {"shadows", config.shadows ? "on" : "off"},
+        {"shadows", std::string(ShadowQualities[size_t(config.shadows)])},
         {"skip_intro", flag(config.skip_intro)},
         {"skip_videos", flag(config.skip_videos)}, {"cinematics_4k", flag(config.cinematics_4k)},
         {"button_icons", std::string(ButtonIconStyles[size_t(config.button_icons)])},

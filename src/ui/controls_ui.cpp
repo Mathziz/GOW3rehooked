@@ -133,7 +133,7 @@ constexpr Help help[]{
     {"Graphics", "Texture Filtering", "Trilinear is the original. 4x to 16x anisotropic keeps textures sharp at steep angles, at a small GPU cost."},
     {"Graphics", "Post Effects", "FXAA is the lightest: it smooths jagged edges at a tiny GPU cost and softens textures a little. CMAA2 keeps textures sharper, at a small GPU cost."},
     {"Graphics", "Scaler", "How the image is resized to your display. Bilinear is the fastest. FSR 1 (enlarging) and Lanczos 2 (shrinking) keep more detail."},
-    {"Graphics", "Shadows", "On is the original. Off removes the sun's shadows, a large GPU saving on weaker graphics cards."},
+    {"Graphics", "Shadows", "High is the original. Medium and Low draw the shadow maps at 1536 and 1024 instead of 2048: faster, with softer edges. Off removes the sun's shadows, the largest GPU saving."},
     {"Other", "Skip Opening Logos", "Starts the game at the title menu."},
     {"Other", "Skip Videos with X", "Press Cross to skip any video or cutscene."},
     {"Other", "4K Cinematics", "Plays your own 4K versions of the cinematics: files with the original names (OPENINGINT.BSF, for example) in the EXEC/CINEMATICS/4K folder. The others play as they are."},

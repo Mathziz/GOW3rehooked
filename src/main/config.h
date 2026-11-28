@@ -10,6 +10,8 @@ namespace Gow3 {
 enum class DisplayMode { Windowed, Borderless, Fullscreen };
 enum class VSync { Fifo, Mailbox, Off }; // swapchain present mode
 enum class AntiAliasing { None, Fxaa, Cmaa2 };
+// High: the game's 2048 shadow maps; Medium and Low: 1536 and 1024 (memory_patcher.cpp); Off: none drawn (the renderer).
+enum class ShadowQuality { Off, Low, Medium, High };
 enum class ScalingFilter { Bilinear, Fsr1 };
 enum class ShaderRecompilation { Sync, Async };
 enum class ShaderMechanism { Jit, Aot };
@@ -77,7 +79,7 @@ struct Config {
     VSync vsync = VSync::Fifo;
     bool nvidia_reflex = false;
     AntiAliasing anti_aliasing = AntiAliasing::None;
-    bool shadows = true;                    // false: the sun's shadow maps are neither drawn nor applied
+    ShadowQuality shadows = ShadowQuality::High;
     ScalingFilter scaling_filter = ScalingFilter::Bilinear;
     ShaderRecompilation shader_recompilation = ShaderRecompilation::Async;
     ShaderMechanism shader_mechanism = ShaderMechanism::Aot;
